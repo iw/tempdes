@@ -1,0 +1,54 @@
+# A large Cassandra-backed cluster. Temporal 1.31.0 forces the shard IO semaphore to 1 on
+# Cassandra, so per-shard write throughput is bounded by LWT latency; numHistoryShards (4096) sets
+# the ceiling. Good for sweeps:
+#   tempdes sweep examples/scenarios/cassandra-large.yaml --rows history=6,9,12 --cols load=0.5,1,1.5
+name: cassandra-4096
+seed: 13
+warmup: 15s
+duration: 30s
+
+cluster:
+  num_history_shards: 4096
+  replicas: { frontend: 6, history: 9, matching: 6, worker: 2 }
+  resources:
+    frontend: { cpu: 4 }
+    history: { cpu: 8 }
+    matching: { cpu: 4 }
+  persistence:
+    store: cassandra
+    capacity: 512
+
+dynamic_config:
+  frontend.rps: [{ value: 30000 }]
+  frontend.namespaceRPS: [{ value: 30000 }]
+  history.rps: [{ value: 20000 }]
+  matching.rps: [{ value: 20000 }]
+  history.persistenceMaxQPS: [{ value: 30000 }]
+  matching.persistenceMaxQPS: [{ value: 10000 }]
+  matching.numTaskqueueReadPartitions: [{ value: 16 }]
+  matching.numTaskqueueWritePartitions: [{ value: 16 }]
+
+namespaces:
+  - name: fulfilment
+
+workers:
+  - name: fulfilment-workers
+    namespace: fulfilment
+    task_queue: fulfilment
+    processes: 40
+    workflow_pollers: 16
+    activity_pollers: 16
+    workflow_slots: 500
+    activity_slots: 500
+
+workflows:
+  - type: ShipmentWorkflow
+    namespace: fulfilment
+    task_queue: fulfilment
+    start_rate: 1000/s
+    starters: 16
+    steps:
+      - activity: { count: 1, duration: { p50: 25ms, p99: 200ms } }
+      - activity: { count: 3, parallel: true, duration: { p50: 40ms, p99: 300ms } }
+      - timer: 5s
+      - activity: { count: 1, duration: { p50: 20ms, p99: 150ms } }

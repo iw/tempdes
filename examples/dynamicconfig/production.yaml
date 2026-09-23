@@ -1,0 +1,37 @@
+# A production-style Temporal dynamic config (the file mounted at
+# /etc/temporal/config/dynamicconfig/*.yaml or the Helm chart's server.dynamicConfig block).
+# Validate it with:  tempdes dc validate examples/dynamicconfig/production.yaml
+
+frontend.rps:
+  - value: 6000
+frontend.namespaceRPS:
+  - value: 4000
+    constraints:
+      namespace: payments
+  - value: 2400
+frontend.namespaceCount:
+  - value: 2000
+history.rps:
+  - value: 6000
+matching.rps:
+  - value: 4000
+history.persistenceMaxQPS:
+  - value: 12000
+matching.numTaskqueueReadPartitions:
+  - value: 8
+    constraints:
+      namespace: payments
+      taskQueueName: payments-activities
+  - value: 4
+matching.numTaskqueueWritePartitions:
+  - value: 8
+    constraints:
+      namespace: payments
+      taskQueueName: payments-activities
+  - value: 4
+history.hostLevelCacheMaxSize:
+  - value: 256000
+limit.historyCount.error:
+  - value: 51200
+system.enableActivityEagerExecution:
+  - value: true

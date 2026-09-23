@@ -1,0 +1,53 @@
+name: Model accuracy
+description: The simulation disagrees with what a real Temporal 1.31 cluster does
+labels: [model]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Evidence from real clusters is the most valuable input tempdes can get. Share what you can.
+        Aggregated metrics are enough, and you don't need to include anything identifying.
+  - type: textarea
+    id: difference
+    attributes:
+      label: What differs?
+      description: >-
+        What tempdes predicts, and what your cluster shows. Include the Temporal metric names and
+        values, for example `persistence_latency` p99 or `service_errors_resource_exhausted` by
+        cause.
+    validations:
+      required: true
+  - type: textarea
+    id: mechanism
+    attributes:
+      label: Suspected mechanism
+      description: >-
+        Which Temporal behaviour do you think is missing or wrong? Links to the Temporal source at
+        `v1.31.0` (file and line) help a lot.
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario
+      description: The scenario YAML that approximates your cluster and workload.
+      render: yaml
+  - type: textarea
+    id: observations
+    attributes:
+      label: Observed metrics
+      description: An observations file (see `tempdes metrics template`) or PromQL results.
+      render: yaml
+  - type: dropdown
+    id: store
+    attributes:
+      label: Persistence store
+      options:
+        - PostgreSQL
+        - MySQL
+        - Cassandra
+        - SQLite
+        - Other
+  - type: input
+    id: temporal
+    attributes:
+      label: Temporal server version
+      placeholder: "1.31.0"

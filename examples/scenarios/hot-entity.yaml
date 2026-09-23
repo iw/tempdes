@@ -1,0 +1,59 @@
+# Entity workflows (one per shopping cart) fed by signals. A few "celebrity" carts receive most
+# of the signal traffic: every signal takes the cart's workflow lock and a write on its shard,
+# so those carts saturate regardless of how many history pods you run.
+#
+#   tempdes run examples/scenarios/hot-entity.yaml
+#   tempdes sweep examples/scenarios/hot-entity.yaml --rows history=4,8 --cols history.shardIOConcurrency=1,4
+name: cart-entities
+seed: 11
+warmup: 20s
+duration: 60s
+
+cluster:
+  num_history_shards: 512
+  replicas: { frontend: 3, history: 4, matching: 3, worker: 1 }
+  resources:
+    history: { cpu: 4 }
+  persistence:
+    store: postgresql
+    capacity: 200
+    max_conns: { frontend: 20, history: 60, matching: 30, worker: 10 }
+  visibility:
+    store: elasticsearch
+
+dynamic_config:
+  history.shardIOConcurrency:
+    - value: 1
+
+namespaces:
+  - name: commerce
+
+workers:
+  - name: cart-workers
+    namespace: commerce
+    task_queue: carts
+    processes: 8
+    workflow_pollers: 16
+    activity_pollers: 16
+    workflow_slots: 500
+    activity_slots: 500
+
+workflows:
+  - type: CartWorkflow
+    namespace: commerce
+    task_queue: carts
+    start_rate: 50/s
+    wft_processing: { p50: 2ms, p99: 10ms }
+    steps:
+      - wait_signal: { count: 3, timeout: 30s }
+      - activity: { count: 1, duration: { p50: 20ms, p99: 150ms } }   # checkout
+
+load:
+  signals:
+    - workflow_type: CartWorkflow          # ordinary carts
+      rate: 150/s
+      target: running
+    - workflow_type: CartWorkflow          # three celebrity carts: 200 signals/s each
+      rate: 600/s
+      target: hot
+      hot_workflows: 3

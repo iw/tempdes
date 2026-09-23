@@ -1,0 +1,31 @@
+# cargo-deny: https://embarkstudios.github.io/cargo-deny/
+# Run with `cargo deny check` (CI runs it on every change and weekly).
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec vulnerabilities and unsound crates fail the check, as do yanked versions. Unmaintained
+# crates only fail for direct dependencies, which are the ones we can replace.
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# Every crate must be available under licenses from this list (tempdes itself is
+# MIT OR Apache-2.0).
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

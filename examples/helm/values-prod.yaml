@@ -1,0 +1,47 @@
+# Excerpt of a temporalio/helm-charts values file as deployed on EKS.
+server:
+  replicaCount: 3
+  config:
+    persistence:
+      defaultStore: default
+      visibilityStore: visibility
+      numHistoryShards: 2048
+      datastores:
+        default:
+          sql:
+            pluginName: postgres12
+            driverName: postgres12
+            databaseName: temporal
+            connectAddr: "temporal.cluster-abc.eu-west-1.rds.amazonaws.com:5432"
+            maxConns: 40
+            maxIdleConns: 40
+  dynamicConfig:
+    frontend.namespaceRPS:
+      - value: 4000
+    matching.rps:
+      - value: 4000
+    history.rps:
+      - value: 6000
+    matching.numTaskqueueReadPartitions:
+      - value: 8
+        constraints: { namespace: orders, taskQueueName: orders }
+    matching.numTaskqueueWritePartitions:
+      - value: 8
+        constraints: { namespace: orders, taskQueueName: orders }
+  frontend:
+    replicaCount: 3
+    resources:
+      requests: { cpu: 1500m, memory: 2Gi }
+      limits: { cpu: "2", memory: 2Gi }
+  history:
+    replicaCount: 6
+    resources:
+      limits: { cpu: "4", memory: 8Gi }
+  matching:
+    replicaCount: 3
+    resources:
+      limits: { cpu: 2500m, memory: 2Gi }
+  worker:
+    replicaCount: 1
+    resources:
+      limits: { cpu: "1", memory: 1Gi }

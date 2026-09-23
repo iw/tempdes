@@ -1,0 +1,47 @@
+# Scaling history from 3 to 5 pods under load. Moved shards are closed on their old owner and
+# re-acquired (GetOrCreateShard + UpdateShard, history.acquireShardConcurrency at a time);
+# requests wait meanwhile and the new owner starts with a cold mutable-state cache.
+name: history-scale-out
+seed: 21
+warmup: 20s
+duration: 90s
+
+cluster:
+  num_history_shards: 1024
+  replicas: { frontend: 3, history: 3, matching: 3, worker: 1 }
+  resources:
+    history: { cpu: 4 }
+  persistence:
+    store: postgresql
+    capacity: 160
+    max_conns: { frontend: 20, history: 50, matching: 30, worker: 10 }
+
+dynamic_config:
+  matching.rps: [{ value: 4000 }]
+  history.rps: [{ value: 6000 }]
+
+namespaces:
+  - name: orders
+
+workers:
+  - name: order-workers
+    namespace: orders
+    task_queue: orders
+    processes: 10
+    workflow_pollers: 12
+    activity_pollers: 12
+
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 250/s
+    steps:
+      - activity: { count: 1, duration: { p50: 30ms, p99: 250ms } }
+      - timer: 20s
+      - activity: { count: 1, duration: { p50: 20ms, p99: 150ms } }
+
+events:
+  - at: 50s
+    label: kubectl scale deployment temporal-history --replicas=5
+    replicas: { history: 5 }

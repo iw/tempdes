@@ -1,0 +1,298 @@
+//! End-to-end checks: each example scenario must surface the hotspot it was built to show, and
+//! the simulator must be deterministic and respond to replica / dynamic config changes in the
+//! expected direction.
+
+use std::path::Path;
+
+use tempdes::config::dynamic::{Constraints, DcValue};
+use tempdes::config::scenario::Scenario;
+use tempdes::report::{self, RunResult, Severity};
+use tempdes::run::{self, Overrides};
+
+fn simulate(file: &str, ov: Overrides) -> RunResult {
+    let sc = Scenario::load(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/scenarios")
+            .join(file),
+    )
+    .expect("scenario loads");
+    let p = run::prepare(&sc, &ov, None).expect("parameters resolve");
+    let out = run::run_params(p);
+    report::analyze(&out.ctx, &out.info, None)
+}
+
+fn short() -> Overrides {
+    Overrides {
+        warmup_s: Some(8.0),
+        duration_s: Some(20.0),
+        ..Default::default()
+    }
+}
+
+fn has(r: &RunResult, category: &str, sev: Severity) -> bool {
+    r.hotspots
+        .iter()
+        .any(|h| h.category == category && h.severity <= sev)
+}
+
+fn categories(r: &RunResult) -> Vec<String> {
+    r.hotspots
+        .iter()
+        .map(|h| format!("{:?} {} {}", h.severity, h.category, h.title))
+        .collect()
+}
+
+#[test]
+fn baseline_is_healthy_and_keeps_up() {
+    let r = simulate("baseline.yaml", short());
+    assert!(
+        !r.hotspots.iter().any(|h| h.severity == Severity::Critical),
+        "unexpected critical hotspots: {:#?}",
+        categories(&r)
+    );
+    let w = &r.workflows[0];
+    assert!(
+        (w.started_per_s - w.offered_start_rate).abs() / w.offered_start_rate < 0.1,
+        "started {}",
+        w.started_per_s
+    );
+    assert!(
+        w.completed_per_s > 0.8 * w.offered_start_rate,
+        "completed {}",
+        w.completed_per_s
+    );
+    // e2e ≈ activities + 2s timer
+    assert!(
+        w.e2e.p50_ms > 2_000.0 && w.e2e.p50_ms < 3_500.0,
+        "e2e p50 {}",
+        w.e2e.p50_ms
+    );
+    assert_eq!(w.wft_timeouts, 0);
+}
+
+#[test]
+fn simulation_is_deterministic() {
+    let a = simulate("baseline.yaml", short());
+    let b = simulate("baseline.yaml", short());
+    assert_eq!(a.sim_steps, b.sim_steps);
+    assert_eq!(
+        a.workflows[0].completed_per_s,
+        b.workflows[0].completed_per_s
+    );
+    assert_eq!(a.apis[0].latency.p99_ms, b.apis[0].latency.p99_ms);
+    let c = simulate(
+        "baseline.yaml",
+        Overrides {
+            seed: Some(99),
+            ..short()
+        },
+    );
+    assert_ne!(
+        a.sim_steps, c.sim_steps,
+        "a different seed should change the trajectory"
+    );
+}
+
+#[test]
+fn hot_entities_saturate_their_workflow_lock() {
+    let r = simulate("hot-entity.yaml", short());
+    assert!(
+        has(&r, "workflow-lock", Severity::Critical),
+        "{:#?}",
+        categories(&r)
+    );
+    assert_eq!(
+        r.hotspots[0].category,
+        "workflow-lock",
+        "{:#?}",
+        categories(&r)
+    );
+    assert!(r.history.lock_timeouts > 0);
+    let hot = &r.history.hot_workflows[0];
+    assert!(hot.util > 0.9, "hot workflow lock {}", hot.util);
+}
+
+#[test]
+fn global_namespace_budget_throttles_polls_first() {
+    let r = simulate("frontend-throttling.yaml", short());
+    assert!(
+        r.limits
+            .iter()
+            .any(|l| l.limiter == "frontend.namespaceRPS" && l.rejected > 0),
+        "{:#?}",
+        r.limits
+    );
+    // P1 calls (Start/Respond) are protected; the rejections land on polls (P4)
+    let start = r
+        .apis
+        .iter()
+        .find(|a| a.api == "StartWorkflowExecution")
+        .unwrap();
+    assert!(start.errors.is_empty(), "{:?}", start.errors);
+    let polls_rejected: u64 = r
+        .apis
+        .iter()
+        .filter(|a| a.api.starts_with("Poll"))
+        .flat_map(|a| a.errors.values())
+        .sum();
+    assert!(polls_rejected > 0);
+    assert_eq!(
+        r.hotspots[0].category,
+        "rate-limit",
+        "{:#?}",
+        categories(&r)
+    );
+}
+
+#[test]
+fn small_database_is_the_root_cause() {
+    let r = simulate("db-bound.yaml", short());
+    assert!(
+        r.persistence.utilization > 0.9,
+        "db {}",
+        r.persistence.utilization
+    );
+    assert_eq!(r.hotspots[0].category, "database", "{:#?}", categories(&r));
+    assert!(has(&r, "connection-pool", Severity::Critical));
+}
+
+#[test]
+fn aligned_schedules_are_rate_limited() {
+    let r = simulate(
+        "schedules.yaml",
+        Overrides {
+            warmup_s: Some(5.0),
+            duration_s: Some(130.0),
+            ..Default::default()
+        },
+    );
+    let s = r.schedules.as_ref().expect("schedule results");
+    assert!(s.rate_limited > 0);
+    assert!(
+        s.action_delay.p99_ms > 30_000.0,
+        "delay p99 {}",
+        s.action_delay.p99_ms
+    );
+    assert!(
+        has(&r, "schedules", Severity::Warning),
+        "{:#?}",
+        categories(&r)
+    );
+}
+
+#[test]
+fn scale_out_moves_shards_and_blocks_briefly() {
+    let r = simulate(
+        "scale-out.yaml",
+        Overrides {
+            warmup_s: Some(20.0),
+            duration_s: Some(45.0),
+            ..Default::default()
+        },
+    );
+    assert!(
+        r.history.shard_moves > 100,
+        "moves {}",
+        r.history.shard_moves
+    );
+    assert!(r.history.shard_unavailable.p99_ms > 500.0);
+    assert_eq!(r.config.replicas["history"], 5);
+}
+
+#[test]
+fn more_history_replicas_lower_history_cpu() {
+    let mut ov = short();
+    ov.start_rate_scale = Some(2.0);
+    ov.replicas = vec![("history".into(), 2)];
+    let two = simulate("baseline.yaml", ov.clone());
+    ov.replicas = vec![("history".into(), 6)];
+    let six = simulate("baseline.yaml", ov);
+    let cpu = |r: &RunResult| {
+        r.services
+            .iter()
+            .find(|s| s.service == "history")
+            .unwrap()
+            .cpu_max
+    };
+    assert!(
+        cpu(&six) < cpu(&two) * 0.6,
+        "2 pods {} vs 6 pods {}",
+        cpu(&two),
+        cpu(&six)
+    );
+}
+
+#[test]
+fn dynamic_config_override_takes_effect() {
+    let mut ov = short();
+    ov.dc.push((
+        "frontend.namespaceRPS".into(),
+        DcValue::Int(100),
+        Constraints {
+            namespace: Some("orders".into()),
+            ..Default::default()
+        },
+    ));
+    let r = simulate("baseline.yaml", ov);
+    assert!(
+        r.limits
+            .iter()
+            .any(|l| l.limiter == "frontend.namespaceRPS"),
+        "{:#?}",
+        r.limits
+    );
+    assert!(
+        r.config.effective_dynamic_config["frontend.namespaceRPS"].contains("100"),
+        "{}",
+        r.config.effective_dynamic_config["frontend.namespaceRPS"]
+    );
+}
+
+#[test]
+fn cassandra_ignores_shard_io_concurrency() {
+    let mut ov = short();
+    ov.dc.push((
+        "history.shardIOConcurrency".into(),
+        DcValue::Int(4),
+        Constraints::default(),
+    ));
+    ov.start_rate_scale = Some(0.1);
+    let r = simulate("cassandra-large.yaml", ov);
+    assert_eq!(r.history.shard_io_concurrency, 1);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("Cassandra")),
+        "{:#?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn limiter_headroom_is_reported_before_rejections() {
+    let r = simulate("baseline.yaml", short());
+    let h = r
+        .hotspots
+        .iter()
+        .find(|h| h.category == "headroom")
+        .unwrap_or_else(|| panic!("no headroom hotspot: {:#?}", categories(&r)));
+    assert!(h.resource.starts_with("matching.rps"), "{}", h.resource);
+    assert!(
+        !r.limits
+            .iter()
+            .any(|l| l.limiter == "matching.rps" && l.rejected > 0),
+        "matching.rps should not reject yet: {:#?}",
+        r.limits
+    );
+    // pods expose the utilisation that drove the warning
+    let matching = r.services.iter().find(|s| s.service == "matching").unwrap();
+    let worst = matching
+        .pods
+        .iter()
+        .flat_map(|p| p.limit_util.iter())
+        .filter(|(n, _)| n == "matching.rps")
+        .map(|(_, u)| *u)
+        .fold(0.0, f64::max);
+    assert!(
+        (0.7..1.0).contains(&worst),
+        "matching.rps utilisation {worst}"
+    );
+}

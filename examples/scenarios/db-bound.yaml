@@ -1,0 +1,51 @@
+# A modest Aurora PostgreSQL instance behind a high-throughput cluster. Server-side rate limits
+# are raised and workers are well provisioned, so the database and the per-pod SQL connection
+# pools (static config maxConns) become the bottleneck.
+name: orders-db-bound
+seed: 3
+warmup: 20s
+duration: 45s
+
+cluster:
+  num_history_shards: 2048
+  replicas: { frontend: 4, history: 6, matching: 4, worker: 1 }
+  resources:
+    frontend: { cpu: 2 }
+    history: { cpu: 8 }
+    matching: { cpu: 4 }
+  persistence:
+    store: postgresql
+    capacity: 40                   # ~db.r6g.2xlarge worth of concurrent statements
+    max_conns: { frontend: 20, history: 20, matching: 20, worker: 10 }
+    latency:
+      UpdateWorkflowExecution: { p50: 2.5ms, p99: 12ms }
+
+dynamic_config:
+  frontend.rps: [{ value: 20000 }]
+  frontend.namespaceRPS: [{ value: 20000 }]
+  history.rps: [{ value: 20000 }]
+  matching.rps: [{ value: 20000 }]
+
+namespaces:
+  - name: orders
+
+workers:
+  - name: order-workers
+    namespace: orders
+    task_queue: orders
+    processes: 20
+    workflow_pollers: 16
+    activity_pollers: 16
+    workflow_slots: 500
+    activity_slots: 500
+
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 450/s
+    starters: 8
+    steps:
+      - activity: { count: 1, duration: { p50: 30ms, p99: 250ms } }
+      - activity: { count: 2, parallel: true, duration: { p50: 60ms, p99: 400ms } }
+      - activity: { count: 1, duration: { p50: 20ms, p99: 150ms } }

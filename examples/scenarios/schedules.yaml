@@ -1,0 +1,46 @@
+# 2,000 schedules that all fire at the top of every minute ("0 * * * *"). Temporal 1.31.0 runs
+# every schedule of a namespace on the per-namespace worker (worker.perNamespaceWorkerCount
+# hosts) and shares one start-rate bucket of worker.schedulerNamespaceStartWorkflowRPS (30/s):
+# the last schedule in each burst starts about a minute late.
+name: nightly-reports-schedules
+seed: 9
+warmup: 10s
+duration: 150s
+
+cluster:
+  num_history_shards: 512
+  replicas: { frontend: 3, history: 3, matching: 3, worker: 2 }
+  persistence:
+    store: postgresql
+    capacity: 120
+    max_conns: { frontend: 20, history: 50, matching: 30, worker: 10 }
+
+dynamic_config:
+  worker.schedulerNamespaceStartWorkflowRPS:
+    - value: 30.0
+      constraints: { namespace: reports }
+
+namespaces:
+  - name: reports
+
+workers:
+  - name: report-workers
+    namespace: reports
+    task_queue: reports
+    processes: 4
+    workflow_pollers: 8
+    activity_pollers: 8
+
+workflows:
+  - type: ReportWorkflow
+    namespace: reports
+    task_queue: reports
+    steps:
+      - activity: { count: 1, duration: { p50: 200ms, p99: 2s } }
+
+schedules:
+  - namespace: reports
+    count: 2000
+    interval: 1m
+    aligned: true
+    workflow_type: ReportWorkflow

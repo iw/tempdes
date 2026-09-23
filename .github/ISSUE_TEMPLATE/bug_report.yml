@@ -1,0 +1,50 @@
+name: Bug report
+description: tempdes crashes, rejects valid input, or produces a wrong or confusing report
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem. If the simulation runs but disagrees with
+        what your cluster does, the **Model accuracy** template asks for the details that help most.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      render: shell
+      placeholder: tempdes run examples/scenarios/baseline.yaml -r history=6
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario and inputs
+      description: >-
+        The scenario YAML, plus any dynamic config or observations files it uses. Remove anything
+        you don't want to share.
+      render: yaml
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The error, the panic message with `RUST_BACKTRACE=1`, or the relevant part of the report.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: tempdes version
+      description: The output of `tempdes --version`. If you built from source, add `git rev-parse --short HEAD`.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: macOS 15 (arm64), Rust 1.98.1

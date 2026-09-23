@@ -1,0 +1,55 @@
+# A namespace with a cluster-wide RPS budget (frontend.globalNamespaceRPS) spread over four
+# frontends. Each frontend gets 1/4 of the budget, but SDK connections are sticky, so the
+# frontend holding the most connections throttles while others idle. The namespace limiter is a
+# priority limiter: Start/Respond (P1) reserve tokens from polls (P4), so pollers starve first.
+name: payments-frontend-budget
+seed: 5
+warmup: 20s
+duration: 60s
+
+cluster:
+  num_history_shards: 1024
+  replicas: { frontend: 4, history: 4, matching: 3, worker: 1 }
+  resources:
+    frontend: { cpu: 2 }
+    history: { cpu: 4 }
+  persistence:
+    store: mysql
+    capacity: 200
+    max_conns: { frontend: 20, history: 50, matching: 30, worker: 10 }
+
+dynamic_config:
+  frontend.globalNamespaceRPS:
+    - value: 2400
+      constraints: { namespace: payments }
+  frontend.namespaceBurstRatio:
+    - value: 1.5
+      constraints: { namespace: payments }
+  matching.rps:
+    - value: 3000
+  history.rps:
+    - value: 6000
+
+namespaces:
+  - name: payments
+
+workers:
+  - name: payment-workers
+    namespace: payments
+    task_queue: payments
+    processes: 5
+    workflow_pollers: 8
+    activity_pollers: 12
+    workflow_slots: 400
+    activity_slots: 400
+
+workflows:
+  - type: PaymentWorkflow
+    namespace: payments
+    task_queue: payments
+    start_rate: 120/s
+    starters: 3
+    steps:
+      - activity: { count: 1, duration: { p50: 40ms, p99: 300ms } }     # authorize
+      - activity: { count: 2, parallel: true, duration: { p50: 25ms, p99: 200ms } }   # capture + ledger
+      - activity: { count: 1, duration: { p50: 15ms, p99: 90ms } }      # notify

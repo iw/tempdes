@@ -1,0 +1,46 @@
+name: Registry
+
+# data/dynamicconfig-<version>.json must be exactly what gen-dc-registry produces from the
+# Temporal release it describes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "data/**"
+      - "src/config/dynamic.rs"
+      - "src/config/registry_gen.rs"
+      - "src/bin/gen-dc-registry.rs"
+      - ".github/workflows/registry.yml"
+  pull_request:
+    paths:
+      - "data/**"
+      - "src/config/dynamic.rs"
+      - "src/config/registry_gen.rs"
+      - "src/bin/gen-dc-registry.rs"
+      - ".github/workflows/registry.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TEMPORAL_VERSION: "1.31.0"
+
+jobs:
+  check:
+    name: registry matches Temporal source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - name: Fetch Temporal v${{ env.TEMPORAL_VERSION }}
+        run: >-
+          git clone --quiet --depth 1 --branch "v${TEMPORAL_VERSION}"
+          https://github.com/temporalio/temporal "${RUNNER_TEMP}/temporal"
+      - name: Compare with data/dynamicconfig-${{ env.TEMPORAL_VERSION }}.json
+        run: >-
+          cargo run --locked --bin gen-dc-registry --
+          "${RUNNER_TEMP}/temporal" --check "data/dynamicconfig-${TEMPORAL_VERSION}.json"

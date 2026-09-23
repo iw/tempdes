@@ -1,0 +1,38 @@
+[package]
+name = "tempdes"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+description = "Discrete-event simulator that surfaces hotspots in Temporal 1.31.0 clusters on EKS"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/iw/tempdes"
+homepage = "https://github.com/iw/tempdes"
+readme = "README.md"
+keywords = ["temporal", "simulation", "discrete-event", "capacity-planning", "kubernetes"]
+categories = ["simulation", "command-line-utilities", "development-tools"]
+default-run = "tempdes"
+exclude = ["/.github", "/out"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = "1.3"
+serde_json = "1"
+clap = { version = "4.6", features = ["derive"] }
+anyhow = "1"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,29 @@
+# Common dynamic config mistakes that Temporal 1.31.0 silently ignores.
+#   tempdes dc validate examples/dynamicconfig/with-mistakes.yaml
+
+# typo in the key: the server logs "unregistered key" and ignores it
+history.shardIoConcurency:
+  - value: 4
+
+# float for an integer setting: conversion fails, the default (1200) is used
+frontend.namespaceCount:
+  - value: 2500.0
+
+# namespace constraint on a global setting: never matches
+frontend.rps:
+  - value: 8000
+    constraints:
+      namespace: payments
+
+# task queue constraint on a namespace-scoped setting: never matches
+frontend.namespaceRPS:
+  - value: 5000
+    constraints:
+      namespace: payments
+      taskQueueName: payments
+
+# write partitions greater than read partitions strand tasks
+matching.numTaskqueueWritePartitions:
+  - value: 16
+matching.numTaskqueueReadPartitions:
+  - value: 8

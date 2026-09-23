@@ -1,0 +1,84 @@
+# Observed production metrics for the orders cluster (weekday peak, 15 minute window).
+# Collected with the queries printed by `tempdes metrics queries --window 15m`.
+#
+#   tempdes run examples/scenarios/baseline.yaml -o examples/metrics/observed.yaml
+description: orders cluster, Tuesday 10:00-10:15 UTC
+window: 15m
+
+metrics:
+  # workload: scales the scenario's start rate to what production sees
+  - name: service_requests
+    labels: { service_name: frontend, operation: StartWorkflowExecution }
+    rate: 180/s
+
+  # database service times (p50/p90/p99 from persistence_latency histograms)
+  - name: persistence_latency
+    labels: { operation: UpdateWorkflowExecution }
+    p50: 3.4ms
+    p90: 7.9ms
+    p99: 24ms
+  - name: persistence_latency
+    labels: { operation: CreateWorkflowExecution }
+    p50: 4.8ms
+    p99: 29ms
+  - name: persistence_latency
+    labels: { operation: GetWorkflowExecution }
+    quantiles: { 0.5: 1.3ms, 0.9: 3.1ms, 0.99: 11ms }
+  - name: persistence_latency
+    labels: { operation: AppendHistoryNodes }
+    p50: 1.8ms
+    p99: 12ms
+  - name: persistence_latency
+    labels: { operation: ReadHistoryBranch }
+    p50: 2.2ms
+    p99: 15ms
+  - name: persistence_latency
+    labels: { operation: GetTransferTasks }
+    buckets: { "0.001": 5210, "0.002": 18020, "0.005": 26310, "0.01": 27950, "0.02": 28460, "0.05": 28560, "+Inf": 28570 }
+
+  # CPU calibration: history cores used (cAdvisor) and the history request mix
+  - name: container_cpu_usage_seconds_total
+    labels: { container: temporal-history }
+    rate: 3.9
+  - name: service_requests
+    labels: { service_name: history, operation: RecordWorkflowTaskStarted }
+    rate: 1050/s
+  - name: service_requests
+    labels: { service_name: history, operation: RespondWorkflowTaskCompleted }
+    rate: 1050/s
+  - name: service_requests
+    labels: { service_name: history, operation: RecordActivityTaskStarted }
+    rate: 720/s
+  - name: service_requests
+    labels: { service_name: history, operation: RespondActivityTaskCompleted }
+    rate: 720/s
+  - name: service_requests
+    labels: { service_name: history, operation: StartWorkflowExecution }
+    rate: 180/s
+  - name: task_requests
+    labels: { task_type: TransferActiveTaskWorkflowTask }
+    rate: 1030/s
+  - name: task_requests
+    labels: { task_type: TransferActiveTaskActivityTask }
+    rate: 720/s
+  - name: task_requests
+    labels: { task_type: TimerActiveTaskWorkflowTaskTimeout }
+    rate: 1850/s
+
+  # validation only
+  - name: service_latency
+    labels: { service_name: frontend, operation: StartWorkflowExecution }
+    p99: 31ms
+  - name: service_latency
+    labels: { service_name: frontend, operation: RespondWorkflowTaskCompleted }
+    p99: 27ms
+  - name: cache_requests
+    labels: { cache_type: mutablestate }
+    rate: 4100/s
+  - name: cache_miss
+    labels: { cache_type: mutablestate }
+    rate: 190/s
+  - name: poll_success
+    rate: 1760/s
+  - name: poll_success_sync
+    rate: 1370/s

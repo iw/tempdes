@@ -1,0 +1,36 @@
+# Deployment taken from a Helm values file; only the workload and database capacity are
+# described here. CLI overrides still apply:
+#   tempdes run examples/scenarios/from-helm.yaml -r history=8
+name: orders-from-helm
+seed: 17
+warmup: 20s
+duration: 45s
+
+cluster:
+  helm_values: ../helm/values-prod.yaml
+  persistence:
+    store: postgresql          # replaced by the chart's store kind
+    capacity: 160
+
+namespaces:
+  - name: orders
+
+workers:
+  - name: order-workers
+    namespace: orders
+    task_queue: orders
+    processes: 12
+    workflow_pollers: 16
+    activity_pollers: 16
+
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 300/s
+    starters: 6
+    steps:
+      - activity: { count: 1, duration: { p50: 30ms, p99: 250ms } }
+      - activity: { count: 2, parallel: true, duration: { p50: 60ms, p99: 400ms } }
+      - timer: 2s
+      - activity: { count: 1, duration: { p50: 20ms, p99: 150ms } }

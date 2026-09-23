@@ -1,0 +1,71 @@
+# Baseline: an order-processing workload on a modest EKS deployment.
+#
+#   tempdes run examples/scenarios/baseline.yaml
+#   tempdes sweep examples/scenarios/baseline.yaml \
+#       --rows history=3,6,9 --cols history.shardIOConcurrency=1,2,4
+name: orders-baseline
+description: >
+  Sequential-activity order workflow at 150 starts/s on 3 frontend, 3 history, 3 matching and
+  1 worker-service pods backed by Aurora PostgreSQL.
+seed: 7
+warmup: 20s
+duration: 60s
+
+cluster:
+  num_history_shards: 512          # static: persistence.numHistoryShards
+  replicas:
+    frontend: 3
+    history: 3
+    matching: 3
+    worker: 1
+  resources:                       # per-pod CPU limit (GOMAXPROCS)
+    frontend: { cpu: 2 }
+    history:  { cpu: 4 }
+    matching: { cpu: 2 }
+    worker:   { cpu: 1 }
+  network:
+    client_rtt: 2ms
+    internal_rtt: 0.5ms
+  persistence:
+    store: postgresql
+    max_conns: { frontend: 20, history: 50, matching: 30, worker: 10 }
+    capacity: 160                  # concurrent DB operations before queueing
+    latency:
+      UpdateWorkflowExecution: { p50: 3ms, p99: 14ms }
+      CreateWorkflowExecution: { p50: 4ms, p99: 18ms }
+  visibility:
+    store: elasticsearch
+
+# Temporal dynamic config (same format as the server's dynamicconfig YAML)
+dynamic_config:
+  history.shardIOConcurrency:
+    - value: 1
+  frontend.namespaceRPS:
+    - value: 2400
+
+namespaces:
+  - name: orders
+
+workers:
+  - name: order-workers
+    namespace: orders
+    task_queue: orders
+    processes: 6
+    workflow_pollers: 10
+    activity_pollers: 16
+    workflow_slots: 200
+    activity_slots: 200
+    sticky_cache_size: 5000
+
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 150/s
+    starters: 4
+    wft_processing: { p50: 2ms, p99: 12ms }
+    steps:
+      - activity: { count: 1, duration: { p50: 30ms, p99: 250ms } }   # reserve inventory
+      - activity: { count: 2, parallel: true, duration: { p50: 60ms, p99: 400ms } }  # charge + notify
+      - timer: 2s
+      - activity: { count: 1, duration: { p50: 20ms, p99: 150ms } }   # ship

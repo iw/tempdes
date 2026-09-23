@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/iw/tempdes/security/advisories/new
+    about: Please report security issues privately, not in a public issue.
+  - name: Questions about Temporal itself
+    url: https://community.temporal.io
+    about: For questions about Temporal (rather than this simulator), ask the Temporal community.

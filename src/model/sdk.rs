@@ -1,0 +1,856 @@
+//! SDK side: client connections, retry policy, worker processes (pollers, slots, sticky cache),
+//! workflow task processing (the workflow "program" interpreter) and activity execution.
+
+use crate::sim::executor::{Time, now, sleep, spawn};
+use crate::sim::sync::Permit;
+
+use super::frontend;
+use super::history::{self, ActTaskInfo, Commands, HISTORY_PAGE, ProgState, StartOrigin, WftInfo};
+use super::infra::*;
+use super::matching::{self, Polled};
+use super::params::{SCHEDULER_WF_TYPE, StepP};
+use super::queues::history_call;
+use super::types::*;
+use super::world::*;
+
+/// Which connection a request uses.
+#[derive(Clone, Copy, Debug)]
+pub enum Conn {
+    Client(usize),
+    Worker(usize),
+}
+
+/// Current frontend pod for a connection, reconnecting on GOAWAY (max connection age ±10%) or
+/// when the pod is gone. New connections land on a uniformly random live frontend (NLB / kube
+/// Service), so connection imbalance persists until connections age out.
+pub fn conn_pod(ctx: &Ctx, conn: Conn) -> PodId {
+    let t = now();
+    let (cur, exp) = match conn {
+        Conn::Client(i) => {
+            let c = &ctx.clients.borrow()[i];
+            (c.conn, c.conn_expires)
+        }
+        Conn::Worker(i) => {
+            let w = &ctx.workers.borrow()[i];
+            (w.conn, w.conn_expires)
+        }
+    };
+    let alive = ctx.pods.borrow().get(cur).map(|p| p.alive).unwrap_or(false);
+    if alive && t < exp {
+        return cur;
+    }
+    let live = ctx.live_pods(Service::Frontend);
+    let pod = live[ctx.rand_index(live.len())];
+    let age = ctx.p.k.keepalive_max_conn_age as f64 * (0.9 + 0.2 * ctx.rand());
+    let exp = t + age as Time;
+    {
+        let mut pods = ctx.pods.borrow_mut();
+        if let Some(fe) = pods.get_mut(cur).and_then(|p| p.fe.as_mut()) {
+            fe.connections = fe.connections.saturating_sub(1);
+        }
+        if let Some(fe) = pods[pod].fe.as_mut() {
+            fe.connections += 1;
+        }
+    }
+    match conn {
+        Conn::Client(i) => {
+            let mut c = ctx.clients.borrow_mut();
+            c[i].conn = pod;
+            c[i].conn_expires = exp;
+        }
+        Conn::Worker(i) => {
+            let mut w = ctx.workers.borrow_mut();
+            w[i].conn = pod;
+            w[i].conn_expires = exp;
+        }
+    }
+    pod
+}
+
+/// SDK retry policy (Go SDK style): transient errors back off from 100ms, ResourceExhausted
+/// from 1s, both doubling up to 10s, within an overall expiration.
+#[derive(Clone, Copy, Debug)]
+pub struct Retry {
+    pub expiration: Time,
+    pub max_attempts: u32,
+}
+
+impl Retry {
+    pub const DEFAULT: Retry = Retry {
+        expiration: 10_000_000,
+        max_attempts: 50,
+    };
+    pub const NONE: Retry = Retry {
+        expiration: 0,
+        max_attempts: 1,
+    };
+}
+
+fn retryable(e: Err) -> bool {
+    matches!(
+        e,
+        Err::ResourceExhausted(..)
+            | Err::Unavailable
+            | Err::DeadlineExceeded
+            | Err::ShardOwnershipLost
+    )
+}
+
+/// Issue an API call from the SDK through the frontend, with retries. Records the
+/// client-observed latency.
+pub async fn sdk_call<T, F, Fut>(
+    ctx: &Ctx,
+    conn: Conn,
+    ns: usize,
+    api: Api,
+    retry: Retry,
+    extra_cpu: f64,
+    body: F,
+) -> Res<T>
+where
+    F: Fn(Ctx, PodId) -> Fut,
+    Fut: std::future::Future<Output = Res<T>>,
+{
+    let t0 = now();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let fe = conn_pod(ctx, conn);
+        client_hop(ctx).await;
+        let r = frontend::handle(ctx, fe, ns, api, extra_cpu, &body).await;
+        client_hop(ctx).await;
+        match r {
+            Ok(v) => {
+                ctx.m.borrow_mut().client[api.idx()].record(now() - t0, None);
+                return Ok(v);
+            }
+            Err(e)
+                if retryable(e)
+                    && attempt < retry.max_attempts
+                    && now() - t0 < retry.expiration =>
+            {
+                let d = match e {
+                    Err::ResourceExhausted(..) => backoff(ctx, 1_000_000, 2.0, 10_000_000, attempt),
+                    _ => backoff(ctx, 100_000, 2.0, 10_000_000, attempt),
+                };
+                sleep(d).await;
+            }
+            Err(e) => {
+                ctx.m.borrow_mut().client[api.idx()].record(now() - t0, Some(e));
+                return Err(e);
+            }
+        }
+    }
+}
+
+// --- worker processes -----------------------------------------------------------------------------
+
+/// Start all pollers of a worker process.
+pub fn start_worker(ctx: &Ctx, wk: usize) {
+    let (fleet, sys) = {
+        let w = &ctx.workers.borrow()[wk];
+        (w.fleet, ctx.p.fleets[w.fleet].system)
+    };
+    let f = &ctx.p.fleets[fleet];
+    let _ = sys;
+    for i in 0..f.wf_pollers {
+        let c = ctx.clone();
+        spawn(async move { wft_poller(c, wk, i).await });
+    }
+    for _ in 0..f.act_pollers {
+        let c = ctx.clone();
+        spawn(async move { activity_poller(c, wk).await });
+    }
+}
+
+async fn wft_poller(ctx: Ctx, wk: usize, idx: u32) {
+    // stagger start
+    sleep((ctx.rand() * 200_000.0) as Time).await;
+    let (fleet, slots) = {
+        let w = &ctx.workers.borrow()[wk];
+        (w.fleet, w.wft_slots.clone())
+    };
+    let f = ctx.p.fleets[fleet].clone();
+    let tq = f.tq;
+    let sticky_enabled = f.sticky_cache > 0;
+    let _ = idx;
+    let mut failures = 0u32;
+    loop {
+        let permit = slots.acquire().await;
+        // Go SDK: poll the sticky queue when it reported a backlog, or when there are no more
+        // outstanding sticky polls than regular ones (internal_task_pollers.go).
+        let sticky = {
+            let mut ws = ctx.workers.borrow_mut();
+            let w = &mut ws[wk];
+            let s =
+                sticky_enabled && (w.sticky_backlog > 0 || w.pending_sticky <= w.pending_regular);
+            if s {
+                w.pending_sticky += 1;
+            } else {
+                w.pending_regular += 1;
+            }
+            s
+        };
+        let sticky_worker = sticky.then_some(wk);
+        let deadline = now() + f.poll_timeout;
+        let r = sdk_call(
+            &ctx,
+            Conn::Worker(wk),
+            f.ns,
+            Api::PollWorkflowTaskQueue,
+            Retry::NONE,
+            0.0,
+            move |c, fe| async move {
+                matching_poll(&c, fe, tq, TqKind::Workflow, sticky_worker, deadline).await
+            },
+        )
+        .await;
+        {
+            let backlog = if sticky {
+                let pid = ctx.matching.borrow().sticky.get(&wk).copied();
+                pid.map(|p| ctx.matching.borrow().parts[p].backlog_len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let mut ws = ctx.workers.borrow_mut();
+            let w = &mut ws[wk];
+            if sticky {
+                w.pending_sticky = w.pending_sticky.saturating_sub(1);
+                w.sticky_backlog = backlog;
+            } else {
+                w.pending_regular = w.pending_regular.saturating_sub(1);
+            }
+        }
+        match r {
+            Ok(Some(Polled::Wft(info))) => {
+                failures = 0;
+                let c = ctx.clone();
+                spawn(async move { process_wft(c, wk, info, permit).await });
+            }
+            Ok(_) => {
+                failures = 0;
+                drop(permit);
+            }
+            Err(e) => {
+                drop(permit);
+                failures += 1;
+                let d = match e {
+                    Err::ResourceExhausted(..) => {
+                        backoff(&ctx, 1_000_000, 2.0, 10_000_000, failures)
+                    }
+                    _ => backoff(&ctx, 200_000, 2.0, 10_000_000, failures),
+                };
+                sleep(d).await;
+            }
+        }
+    }
+}
+
+async fn activity_poller(ctx: Ctx, wk: usize) {
+    sleep((ctx.rand() * 200_000.0) as Time).await;
+    let (fleet, slots) = {
+        let w = &ctx.workers.borrow()[wk];
+        (w.fleet, w.act_slots.clone())
+    };
+    let f = ctx.p.fleets[fleet].clone();
+    let tq = f.tq;
+    let mut failures = 0u32;
+    loop {
+        let permit = slots.acquire().await;
+        let deadline = now() + f.poll_timeout;
+        let r = sdk_call(
+            &ctx,
+            Conn::Worker(wk),
+            f.ns,
+            Api::PollActivityTaskQueue,
+            Retry::NONE,
+            0.0,
+            move |c, fe| async move {
+                matching_poll(&c, fe, tq, TqKind::Activity, None, deadline).await
+            },
+        )
+        .await;
+        match r {
+            Ok(Some(Polled::Act(info))) => {
+                failures = 0;
+                let c = ctx.clone();
+                spawn(async move { process_activity(c, wk, info, permit).await });
+            }
+            Ok(_) => {
+                failures = 0;
+                drop(permit);
+            }
+            Err(e) => {
+                drop(permit);
+                failures += 1;
+                let d = match e {
+                    Err::ResourceExhausted(..) => {
+                        backoff(&ctx, 1_000_000, 2.0, 10_000_000, failures)
+                    }
+                    _ => backoff(&ctx, 200_000, 2.0, 10_000_000, failures),
+                };
+                sleep(d).await;
+            }
+        }
+    }
+}
+
+/// Frontend → matching poll with the matching client's retry (polls retried up to 1 min).
+async fn matching_poll(
+    ctx: &Ctx,
+    fe: PodId,
+    tq: usize,
+    kind: TqKind,
+    sticky: Option<usize>,
+    deadline: Time,
+) -> Res<Option<Polled>> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let r = matching::poll(ctx, fe, tq, kind, sticky, deadline).await;
+        match r {
+            Err(e) if retryable(e) && now() + 2_000_000 < deadline && attempt < 5 => {
+                sleep(backoff(ctx, 1_000_000, 2.0, 10_000_000, attempt)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Worker-side CPU time for workflow tasks (worker process CPU if bounded).
+async fn worker_compute(ctx: &Ctx, wk: usize, us: f64) {
+    let (host_pod, end) = {
+        let mut ws = ctx.workers.borrow_mut();
+        let w = &mut ws[wk];
+        match (&mut w.cpu, w.host_pod) {
+            (_, Some(pod)) => (Some(pod), None),
+            (Some(cpu), None) => (None, Some(cpu.schedule(us))),
+            (None, None) => (None, None),
+        }
+    };
+    if let Some(pod) = host_pod {
+        cpu(ctx, pod, us).await;
+    } else if let Some(end) = end {
+        crate::sim::executor::sleep_until(end).await;
+    } else {
+        sleep(us.round() as Time).await;
+    }
+}
+
+/// Decide the next commands for a workflow from its program and the WFT snapshot.
+pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
+    let tp = &ctx.p.wf_types[info.wf_type];
+    let mut prog: ProgState = info.prog;
+    let snap = info.snap;
+    let mut cmds = Commands::default();
+    let mut la_time = 0.0;
+    if entity {
+        prog.signals_consumed = snap.signals_received;
+        cmds.new_prog = prog;
+        return (cmds, 0.0);
+    }
+    let mut completed_in_step = snap.completed_in_step;
+    let mut timer_fired = snap.timer_fired;
+    let mut children_done = snap.children_done;
+    let mut rng = ctx.rng.borrow_mut();
+    loop {
+        let Some(step) = tp.steps.get(prog.step) else {
+            cmds.complete = true;
+            prog.done = true;
+            break;
+        };
+        let advance = |prog: &mut ProgState| {
+            prog.step += 1;
+            prog.step_started = false;
+            prog.step_scheduled = 0;
+        };
+        match step {
+            StepP::Activity {
+                count,
+                parallel,
+                tq,
+                ..
+            } => {
+                if !prog.step_started {
+                    prog.step_started = true;
+                    let n = if *parallel { *count } else { 1 };
+                    prog.step_scheduled = n;
+                    cmds.schedule_activities.push((prog.step, *tq, n));
+                    break;
+                }
+                if completed_in_step >= *count {
+                    advance(&mut prog);
+                    completed_in_step = 0;
+                    timer_fired = false;
+                    children_done = 0;
+                    continue;
+                }
+                if !*parallel
+                    && completed_in_step >= prog.step_scheduled
+                    && prog.step_scheduled < *count
+                {
+                    prog.step_scheduled += 1;
+                    cmds.schedule_activities.push((prog.step, *tq, 1));
+                }
+                break;
+            }
+            StepP::LocalActivity { count, duration } => {
+                for _ in 0..*count {
+                    la_time += duration.sample(&mut rng);
+                }
+                cmds.markers += count;
+                advance(&mut prog);
+                completed_in_step = 0;
+                timer_fired = false;
+                children_done = 0;
+                continue;
+            }
+            StepP::Timer(d) => {
+                if !prog.step_started {
+                    prog.step_started = true;
+                    cmds.start_timer = Some(d.sample_us(&mut rng).max(1_000));
+                    break;
+                }
+                if timer_fired {
+                    advance(&mut prog);
+                    completed_in_step = 0;
+                    timer_fired = false;
+                    children_done = 0;
+                    continue;
+                }
+                break;
+            }
+            StepP::Child { wf_type, count } => {
+                if !prog.step_started {
+                    prog.step_started = true;
+                    cmds.start_children = Some((*wf_type, *count));
+                    break;
+                }
+                if children_done >= *count {
+                    advance(&mut prog);
+                    completed_in_step = 0;
+                    timer_fired = false;
+                    children_done = 0;
+                    continue;
+                }
+                break;
+            }
+            StepP::WaitSignal { count, timeout } => {
+                if snap.signals_received.saturating_sub(prog.signals_consumed) >= *count {
+                    prog.signals_consumed += count;
+                    advance(&mut prog);
+                    completed_in_step = 0;
+                    timer_fired = false;
+                    children_done = 0;
+                    continue;
+                }
+                if !prog.step_started {
+                    prog.step_started = true;
+                    if let Some(t) = timeout {
+                        cmds.start_timer = Some(*t);
+                    }
+                    break;
+                }
+                if timeout.is_some() && timer_fired {
+                    advance(&mut prog);
+                    completed_in_step = 0;
+                    timer_fired = false;
+                    children_done = 0;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    let _ = (completed_in_step, timer_fired, children_done);
+    cmds.new_prog = prog;
+    (cmds, la_time)
+}
+
+/// Process a workflow task on worker `wk`, then keep processing inline follow-up tasks.
+pub async fn process_wft(ctx: Ctx, wk: usize, first: WftInfo, permit: Permit) {
+    let mut info = first;
+    let fleet = ctx.workers.borrow()[wk].fleet;
+    let f = ctx.p.fleets[fleet].clone();
+    loop {
+        let (entity, ns, closed) = {
+            let wfs = ctx.wfs.borrow();
+            match wfs.get(info.wf, info.wgen) {
+                Some(w) => (w.entity, w.ns, w.status == WfStatus::Closed),
+                None => (false, 0, true),
+            }
+        };
+        if closed {
+            break;
+        }
+        let tp = &ctx.p.wf_types[info.wf_type];
+        // sticky cache
+        let key = {
+            let wfs = ctx.wfs.borrow();
+            wfs.get(info.wf, info.wgen).map(|w| w.key).unwrap_or(0)
+        };
+        let hit = if f.sticky_cache > 0 {
+            let mut ws = ctx.workers.borrow_mut();
+            ws[wk].sticky_cache.access(key).0
+        } else {
+            false
+        };
+        let mut compute = tp.wft_processing.sample(&mut ctx.rng.borrow_mut());
+        if !(info.sticky && hit) {
+            // full replay; fetch remaining history pages
+            let missing = if info.sticky {
+                info.total_events
+            } else {
+                info.total_events.saturating_sub(info.events_in_response)
+            };
+            let pages = missing.div_ceil(HISTORY_PAGE);
+            if pages > 0 {
+                let (wf, wgen) = (info.wf, info.wgen);
+                let shard = ctx.wf_shard(wf, wgen);
+                if let Some(shard) = shard {
+                    let _ = sdk_call(
+                        &ctx,
+                        Conn::Worker(wk),
+                        ns,
+                        Api::GetWorkflowExecutionHistory,
+                        Retry::DEFAULT,
+                        0.0,
+                        move |c, _fe| async move {
+                            history_call(&c, shard, |c2, hp| {
+                                let c2 = c2.clone();
+                                async move {
+                                    history::get_history(
+                                        &c2,
+                                        hp,
+                                        wf,
+                                        wgen,
+                                        pages,
+                                        false,
+                                        now() + 10_000_000,
+                                    )
+                                    .await
+                                }
+                            })
+                            .await
+                            .map(|_| ())
+                        },
+                    )
+                    .await;
+                    ctx.m.borrow_mut().wf[info.wf_type].history_pages_fetched += u64::from(pages);
+                }
+            }
+            compute += tp.replay_per_event * f64::from(info.total_events);
+            let mut m = ctx.m.borrow_mut();
+            if info.sticky {
+                m.wf[info.wf_type].sticky_misses += 1;
+            } else {
+                m.wf[info.wf_type].nonsticky_wfts += 1;
+            }
+        } else {
+            ctx.m.borrow_mut().wf[info.wf_type].sticky_hits += 1;
+        }
+        // scheduler (system) workflows run their own logic
+        if tp.name == SCHEDULER_WF_TYPE {
+            let cmds = scheduler_decide(&ctx, wk, &info).await;
+            let r = respond_wft(&ctx, wk, ns, info, cmds).await;
+            match r {
+                Ok(Some(next)) => {
+                    info = next;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        let (mut cmds, la_time) = decide(&ctx, &info, entity);
+        if la_time > 0.0 {
+            sleep(la_time.round() as Time).await;
+        }
+        worker_compute(&ctx, wk, compute).await;
+        if f.sticky_cache > 0 && !cmds.complete {
+            cmds.sticky_worker = Some(wk);
+        }
+        if cmds.complete && f.sticky_cache > 0 {
+            ctx.workers.borrow_mut()[wk].sticky_cache.remove(key);
+        }
+        // eager activities: only for activities on this worker's task queue, if slots free
+        let mut eager_permits = Vec::new();
+        if f.eager_activities && ctx.p.namespaces[ns].enable_eager_activity {
+            let slots = ctx.workers.borrow()[wk].act_slots.clone();
+            let mut want: u32 = cmds
+                .schedule_activities
+                .iter()
+                .filter(|(_, tq, _)| *tq == f.tq)
+                .map(|x| x.2)
+                .sum();
+            want = want.min(3); // SDK caps eager activities per workflow task
+            for _ in 0..want {
+                match slots.try_acquire(1) {
+                    Some(p) => eager_permits.push(p),
+                    None => break,
+                }
+            }
+            cmds.eager_activities = eager_permits.len() as u32;
+        }
+        let result = respond_wft_full(&ctx, wk, ns, info, cmds).await;
+        match result {
+            Ok(res) => {
+                for (act, p) in res.eager.into_iter().zip(eager_permits) {
+                    let c = ctx.clone();
+                    spawn(async move { process_activity(c, wk, act, p).await });
+                }
+                match res.new_wft {
+                    Some(next) => {
+                        info = next;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    drop(permit);
+}
+
+async fn respond_wft_full(
+    ctx: &Ctx,
+    wk: usize,
+    ns: usize,
+    info: WftInfo,
+    cmds: Commands,
+) -> Res<history::RespondResult> {
+    let Some(shard) = ctx.wf_shard(info.wf, info.wgen) else {
+        return Err(Err::NotFound);
+    };
+    let ncmd = cmds.schedule_activities.len()
+        + usize::from(cmds.start_timer.is_some())
+        + usize::from(cmds.complete);
+    sdk_call(
+        ctx,
+        Conn::Worker(wk),
+        ns,
+        Api::RespondWorkflowTaskCompleted,
+        Retry::DEFAULT,
+        ctx.p.costs.frontend_per_command * ncmd as f64,
+        move |c, _fe| {
+            let cmds = cmds.clone();
+            async move {
+                history_call(&c, shard, |c2, hp| {
+                    let c2 = c2.clone();
+                    let cmds = cmds.clone();
+                    async move {
+                        history::respond_wft_completed(&c2, hp, info, cmds, now() + 10_000_000)
+                            .await
+                    }
+                })
+                .await
+            }
+        },
+    )
+    .await
+}
+
+async fn respond_wft(
+    ctx: &Ctx,
+    wk: usize,
+    ns: usize,
+    info: WftInfo,
+    cmds: Commands,
+) -> Res<Option<WftInfo>> {
+    respond_wft_full(ctx, wk, ns, info, cmds)
+        .await
+        .map(|r| r.new_wft)
+}
+
+/// Execute an activity task: run for its duration (heartbeating), then respond.
+pub async fn process_activity(ctx: Ctx, wk: usize, info: ActTaskInfo, permit: Permit) {
+    let (duration, heartbeat, failure_rate) =
+        match ctx.p.wf_types[info.wf_type].steps.get(info.step) {
+            Some(StepP::Activity {
+                duration,
+                heartbeat,
+                failure_rate,
+                ..
+            }) => (
+                duration.sample_us(&mut ctx.rng.borrow_mut()),
+                *heartbeat,
+                *failure_rate,
+            ),
+            _ => (1_000, None, 0.0),
+        };
+    let ns = ctx.p.wf_types[info.wf_type].ns;
+    let Some(shard) = ctx.wf_shard(info.wf, info.wgen) else {
+        drop(permit);
+        return;
+    };
+    let end = now() + duration;
+    if let Some(hb) = heartbeat {
+        while now() + hb < end {
+            sleep(hb).await;
+            let _ = sdk_call(
+                &ctx,
+                Conn::Worker(wk),
+                ns,
+                Api::RecordActivityTaskHeartbeat,
+                Retry::DEFAULT,
+                0.0,
+                move |c, _fe| async move {
+                    history_call(&c, shard, |c2, hp| {
+                        let c2 = c2.clone();
+                        async move { history::heartbeat(&c2, hp, info, now() + 10_000_000).await }
+                    })
+                    .await
+                },
+            )
+            .await;
+        }
+    }
+    crate::sim::executor::sleep_until(end).await;
+    let failed = ctx.rand() < failure_rate;
+    let api = if failed {
+        Api::RespondActivityTaskFailed
+    } else {
+        Api::RespondActivityTaskCompleted
+    };
+    let _ = sdk_call(
+        &ctx,
+        Conn::Worker(wk),
+        ns,
+        api,
+        Retry::DEFAULT,
+        0.0,
+        move |c, _fe| async move {
+            history_call(&c, shard, |c2, hp| {
+                    let c2 = c2.clone();
+                    async move {
+                        history::respond_activity(&c2, hp, info, failed, now() + 10_000_000).await
+                    }
+                })
+                .await
+        },
+    )
+    .await;
+    drop(permit);
+}
+
+// --- scheduler workflows (worker service, per-namespace worker) -----------------------------------
+
+/// Scheduler workflow task: start due actions through the per-(namespace, host) start-rate
+/// limiter (`worker.schedulerNamespaceStartWorkflowRPS`). Short waits (≤
+/// `worker.schedulerLocalActivitySleepLimit`) sleep inside the local activity; longer ones
+/// return RateLimited and the workflow sleeps on a timer.
+async fn scheduler_decide(ctx: &Ctx, wk: usize, info: &WftInfo) -> Commands {
+    let (host, ns) = {
+        let w = &ctx.workers.borrow()[wk];
+        (w.host_pod, ctx.p.fleets[w.fleet].ns)
+    };
+    let host = host.unwrap_or(0);
+    cpu(ctx, host, ctx.p.costs.worker_scheduler_wft).await;
+    let state = {
+        let wfs = ctx.wfs.borrow();
+        wfs.get(info.wf, info.wgen).and_then(|w| w.schedule)
+    };
+    let Some(state) = state else {
+        // schedule state not attached yet (first task raced the creation): check again shortly
+        return Commands {
+            new_prog: info.prog,
+            start_timer: Some(1_000_000),
+            ..Default::default()
+        };
+    };
+    let (sched, due, next_fire, waiting) = (
+        state.sched,
+        state.due_actions,
+        state.next_fire,
+        state.waiting_rate_limit,
+    );
+    let sp = ctx.p.schedules[sched].clone();
+    let mut cmds = Commands {
+        new_prog: info.prog,
+        ..Default::default()
+    };
+    let mut retry_at = None;
+    let mut done = 0;
+    let mut still_waiting = false;
+    for _ in 0..due {
+        // token from the namespace bucket on this host (share of the namespace limit)
+        let delay = if waiting && done == 0 {
+            0
+        } else {
+            let share = 1.0 / ctx.p.namespaces[ns].per_ns_worker_count.max(1) as f64;
+            let rate = ctx.p.namespaces[ns].scheduler_start_rps * share;
+            let mut b = ctx.schedule_buckets.borrow_mut();
+            let bucket = b
+                .entry((ns, host))
+                .or_insert_with(|| super::ratelimit::TokenBucket::new(rate, rate.ceil().max(1.0)));
+            bucket.reserve_delay()
+        };
+        if delay > ctx.p.namespaces[ns].scheduler_la_sleep_limit {
+            ctx.m.borrow_mut().schedule_rate_limited += 1;
+            retry_at = Some(now() + delay);
+            still_waiting = true;
+            break;
+        }
+        if delay > 0 {
+            sleep(delay).await;
+        }
+        // StartWorkflowExecution through the frontend from the worker service
+        let target = sp.wf_type;
+        let key = history::alloc_key(ctx);
+        let tns = ctx.p.wf_types[target].ns;
+        let shard = history::shard_for(ctx, tns, target, key);
+        let r = sdk_call(
+            ctx,
+            Conn::Worker(wk),
+            tns,
+            Api::StartWorkflowExecution,
+            Retry::DEFAULT,
+            0.0,
+            move |c, _fe| async move {
+                history_call(&c, shard, |c2, hp| {
+                    let c2 = c2.clone();
+                    async move {
+                        history::start_workflow(
+                            &c2,
+                            hp,
+                            shard,
+                            key,
+                            target,
+                            StartOrigin::Schedule,
+                            false,
+                            now() + 10_000_000,
+                        )
+                        .await
+                    }
+                })
+                .await
+            },
+        )
+        .await;
+        if r.is_ok() {
+            done += 1;
+            let mut m = ctx.m.borrow_mut();
+            m.schedule_actions += 1;
+            // delay relative to the nominal fire time of this action
+            let nominal = next_fire.saturating_sub(sp.interval * u64::from(due - done + 1));
+            m.schedule_delay.record(now().saturating_sub(nominal));
+        }
+    }
+    cmds.actions_done = done;
+    {
+        let mut wfs = ctx.wfs.borrow_mut();
+        if let Some(w) = wfs.get_mut(info.wf, info.wgen)
+            && let Some(s) = w.schedule.as_mut()
+        {
+            s.waiting_rate_limit = still_waiting;
+        }
+    }
+    let wake = match retry_at {
+        Some(r) => r.min(next_fire),
+        None => next_fire,
+    };
+    cmds.start_timer = Some(wake.saturating_sub(now()).max(1_000));
+    cmds.markers = done;
+    cmds
+}
