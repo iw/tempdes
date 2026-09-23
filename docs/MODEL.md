@@ -283,6 +283,9 @@ knobs.
 * **Causal ranking.** After detection, a causal pass re-ranks results:
   * when polls are rejected, the frontend or matching limiter that rejects them outranks the
     worker schedule-to-start latency and the matching backlog they cause;
+  * a `history.rps`, `matching.rps` or persistence limit that rejects calls outranks the
+    schedule-to-start latency, backlog, timeouts, throttled queue tasks and API symptoms that
+    its retries cause;
   * database saturation outranks the shard, lock, connection-pool and dispatch symptoms it
     causes;
   * the shard rule attributes a hot shard to the one workflow whose lock drives it.
