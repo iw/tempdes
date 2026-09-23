@@ -431,3 +431,40 @@ fn load_multiplier_scales_the_calibrated_workload() {
     assert!(run::validation_obs(&heavy, Some(&cal_heavy.obs)).is_none());
     assert!(run::validation_obs(&base, Some(&cal_base.obs)).is_some());
 }
+
+#[test]
+fn persistence_limit_utilisation_counts_only_charged_calls() {
+    // At 150 wf/s each history pod makes ~3,900 persistence calls/s, ~3,000 of them charged to
+    // the limiter (AppendHistoryNodes rides inside Create/UpdateWorkflowExecution). A 3,600/s
+    // limit therefore has room: no rejections, and the reported use stays below 100%.
+    let mut ov = short();
+    ov.dc.push((
+        "history.persistenceMaxQPS".into(),
+        DcValue::Int(3600),
+        Constraints::default(),
+    ));
+    let r = simulate("baseline.yaml", ov);
+    assert!(
+        !r.limits
+            .iter()
+            .any(|l| l.limiter == "history.persistenceMaxQPS"),
+        "{:#?}",
+        r.limits
+    );
+    let history = r.services.iter().find(|s| s.service == "history").unwrap();
+    for p in &history.pods {
+        let util = p
+            .limit_util
+            .iter()
+            .find(|(n, _)| n == "history.persistenceMaxQPS")
+            .map(|(_, u)| *u)
+            .unwrap();
+        let all_calls = p.persistence_per_s / 3600.0;
+        assert!(
+            util < 1.0 && util > 0.5,
+            "{}: persistence limit use {util}",
+            p.name
+        );
+        assert!(util < all_calls * 0.9, "{}: {util} vs {all_calls}", p.name);
+    }
+}

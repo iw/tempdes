@@ -83,6 +83,7 @@ impl Caller {
 /// priority limiter rejects it (Temporal does not wait for a token).
 pub async fn persist(ctx: &Ctx, pod: PodId, op: PersistOp, caller: Caller) -> Res<()> {
     if op.rate_limited() {
+        ctx.m.borrow_mut().persist_limited_pod(pod);
         let ok = {
             let mut pods = ctx.pods.borrow_mut();
             pods[pod]

@@ -100,6 +100,10 @@ pub struct Metrics {
     pub matching: Vec<Vec<OpStats>>,
     pub persist: Vec<OpStats>,
     pub persist_by_pod: Vec<u64>,
+    /// calls offered to each pod's persistence rate limiter (`<service>.persistenceMaxQPS`),
+    /// rejected ones included. AppendHistoryNodes is not charged: it is part of the
+    /// Create/UpdateWorkflowExecution call.
+    pub persist_limited_by_pod: Vec<u64>,
     pub persist_conn_wait: [Histogram; 4],
     pub vis_persist: Vec<OpStats>,
     pub tasks: Vec<TaskStats>,
@@ -164,6 +168,13 @@ impl Metrics {
             self.persist_by_pod.resize(pod + 1, 0);
         }
         self.persist_by_pod[pod] += 1;
+    }
+
+    pub fn persist_limited_pod(&mut self, pod: PodId) {
+        if self.persist_limited_by_pod.len() <= pod {
+            self.persist_limited_by_pod.resize(pod + 1, 0);
+        }
+        self.persist_limited_by_pod[pod] += 1;
     }
 
     pub fn task_pod(&mut self, pod: PodId) {

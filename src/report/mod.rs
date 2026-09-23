@@ -492,7 +492,8 @@ pub fn analyze(ctx: &Ctx, info: &RunInfo, obs: Option<&Observations>) -> RunResu
             }
             let pq = pod.persist_limiter.rate();
             if pq > 0.0 {
-                let n = m.persist_by_pod.get(id).copied().unwrap_or(0) as f64;
+                // calls the limiter charges (not AppendHistoryNodes), rejected ones included
+                let n = m.persist_limited_by_pod.get(id).copied().unwrap_or(0) as f64;
                 limit_util.push((format!("{}.persistenceMaxQPS", svc.as_str()), n / dur / pq));
             }
             if let Some(fe) = &pod.fe {
