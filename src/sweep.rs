@@ -339,7 +339,11 @@ pub fn cmd_sweep(
                         }
                         let p = run::prepare(&sc, &ov, cal.as_ref())?;
                         let out = run::run_params(p);
-                        let mut r = report::analyze(&out.ctx, &out.info, obs.as_ref());
+                        let mut r = report::analyze(
+                            &out.ctx,
+                            &out.info,
+                            run::validation_obs(&ov, obs.as_ref()),
+                        );
                         r.label = ov.label();
                         Ok(Cell::from_result(
                             ri,

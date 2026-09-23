@@ -328,6 +328,11 @@ In the calibrated example, history CPU is 4.01 simulated vs 3.90 observed, sync 
 Turn individual calibrations off in the scenario with
 `calibration: { persistence_latency: false, cpu: false, workload: false }`.
 
+`--load` and sweep `load=` columns multiply the calibrated workload. For example,
+`-o observed.yaml --load 1.5` simulates 1.5× the observed start rate. CPU calibration still comes
+from a pilot run at the observed load. The comparison with observed metrics is skipped, because
+the simulated workload is no longer the observed one.
+
 ## Reading the report
 
 The report opens with a headline, followed by ranked hotspots. Each hotspot has:

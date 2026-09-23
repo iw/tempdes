@@ -62,7 +62,7 @@ pub struct CommonArgs {
     /// Random seed (overrides the scenario).
     #[arg(long)]
     seed: Option<u64>,
-    /// Multiply all start and signal rates.
+    /// Multiply all start and signal rates (with --observed: the calibrated, observed rates).
     #[arg(long = "load")]
     load: Option<f64>,
     /// How SDK clients reach the frontends: pinned, round_robin or proxy (overrides
@@ -248,7 +248,8 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<ExitCode> {
         params.duration / 1_000_000
     );
     let out = run::run_params(params);
-    let result = crate::report::analyze(&out.ctx, &out.info, obs.as_ref());
+    let result =
+        crate::report::analyze(&out.ctx, &out.info, run::validation_obs(&ov, obs.as_ref()));
     print!("{}", crate::report::text::render(&result, a.verbose));
     if let Some(p) = &a.json {
         std::fs::write(p, serde_json::to_string_pretty(&result)?)?;

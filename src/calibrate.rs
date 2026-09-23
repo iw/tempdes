@@ -16,7 +16,16 @@ use crate::model::params::Params;
 use crate::model::types::*;
 use crate::util::units::{fmt_rate, fmt_us};
 
-pub fn apply(p: &mut Params, obs: &Observations, persistence_latency: bool, workload: bool) {
+/// Apply observations to `p`. With `workload`, start and signal rates are set to the observed
+/// rates times `load` (the `--load` / sweep `load=` multiplier), so a load multiplier scales
+/// the calibrated workload instead of being undone by it.
+pub fn apply(
+    p: &mut Params,
+    obs: &Observations,
+    persistence_latency: bool,
+    workload: bool,
+    load: f64,
+) {
     let mut notes = Vec::new();
     // --- persistence latency → DB service times ------------------------------------------------
     for op in PersistOp::ALL {
@@ -93,14 +102,15 @@ pub fn apply(p: &mut Params, obs: &Observations, persistence_latency: bool, work
             .map(|t| t.start_rate)
             .sum();
         if scen > 0.0 && obs_rate > 0.0 {
-            let k = obs_rate / scen;
+            let k = obs_rate * load / scen;
             if (k - 1.0).abs() > 0.02 {
                 for t in p.wf_types.iter_mut().filter(|t| !t.system_scheduler) {
                     t.start_rate *= k;
                 }
                 notes.push(format!(
-                    "scaled workflow start rates x{k:.2} to match observed StartWorkflowExecution {}",
-                    fmt_rate(obs_rate)
+                    "scaled workflow start rates x{k:.2} to match observed StartWorkflowExecution {}{}",
+                    fmt_rate(obs_rate),
+                    load_note(load)
                 ));
             }
         }
@@ -112,13 +122,14 @@ pub fn apply(p: &mut Params, obs: &Observations, persistence_latency: bool, work
     if let Some(obs_rate) = obs.rate("service_requests", &sig) {
         let scen: f64 = p.signals.iter().map(|s| s.rate).sum();
         if scen > 0.0 && obs_rate > 0.0 {
-            let k = obs_rate / scen;
+            let k = obs_rate * load / scen;
             for s in &mut p.signals {
                 s.rate *= k;
             }
             notes.push(format!(
-                "scaled signal rates x{k:.2} to match observed {}",
-                fmt_rate(obs_rate)
+                "scaled signal rates x{k:.2} to match observed {}{}",
+                fmt_rate(obs_rate),
+                load_note(load)
             ));
         }
     }
@@ -126,6 +137,14 @@ pub fn apply(p: &mut Params, obs: &Observations, persistence_latency: bool, work
         notes.push(n.clone());
     }
     p.prov.notes.extend(notes);
+}
+
+fn load_note(load: f64) -> String {
+    if (load - 1.0).abs() > 1e-9 {
+        format!(" × load {load}")
+    } else {
+        String::new()
+    }
 }
 
 /// Observed CPU cores for a service (sum over pods).

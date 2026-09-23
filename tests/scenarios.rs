@@ -386,3 +386,48 @@ fn new_frontends_get_traffic_only_once_clients_find_them() {
     let rr = new_share(ClientLb::RoundRobin, "1m");
     assert!(rr > 0.2, "round robin share with a 1m max age: {rr}");
 }
+
+/// Calibrate `file` against `examples/metrics/observed.yaml` (StartWorkflowExecution 180/s).
+fn calibrate(file: &str, ov: &Overrides) -> (Scenario, run::Calibration) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sc = Scenario::load(&root.join("examples/scenarios").join(file)).expect("scenario loads");
+    let observed = root.join("examples/metrics/observed.yaml");
+    let obs = run::load_observations(&sc, &[observed.display().to_string()])
+        .expect("observations load")
+        .expect("observations given");
+    let cal = run::calibrate(&sc, ov, obs).expect("calibration");
+    (sc, cal)
+}
+
+#[test]
+fn load_multiplier_scales_the_calibrated_workload() {
+    let base = short();
+    let heavy = Overrides {
+        start_rate_scale: Some(1.5),
+        ..short()
+    };
+    let (sc, cal_base) = calibrate("baseline.yaml", &base);
+    let (_, cal_heavy) = calibrate("baseline.yaml", &heavy);
+    // the CPU pilot always simulates the observed load
+    assert_eq!(cal_base.cpu_scale, cal_heavy.cpu_scale);
+    assert!(cal_base.cpu_scale.iter().any(Option::is_some));
+
+    let offered = |ov: &Overrides, cal: &run::Calibration| {
+        let p = run::prepare(&sc, ov, Some(cal)).expect("parameters resolve");
+        let rate: f64 = p.wf_types.iter().map(|t| t.start_rate).sum();
+        (rate, p.prov.notes.clone())
+    };
+    let (observed, _) = offered(&base, &cal_base);
+    assert!(
+        (observed - 180.0).abs() < 0.5,
+        "calibrated start rate {observed}"
+    );
+    let (scaled, notes) = offered(&heavy, &cal_heavy);
+    assert!(
+        (scaled - 270.0).abs() < 0.5,
+        "--load 1.5 on top of calibration: {scaled}"
+    );
+    assert!(notes.iter().any(|n| n.contains("load ×1.5")), "{notes:#?}");
+    assert!(run::validation_obs(&heavy, Some(&cal_heavy.obs)).is_none());
+    assert!(run::validation_obs(&base, Some(&cal_base.obs)).is_some());
+}
