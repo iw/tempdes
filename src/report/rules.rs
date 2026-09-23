@@ -1368,7 +1368,9 @@ fn causal(c: &Ctx2<'_>, out: &mut [Hotspot]) {
             }
         }
     }
-    // 2. a saturated database slows every write and read: it is the root cause of the
+    // 2. internal limiters rejecting calls come before the delays they cause
+    rank_internal_limiters(out);
+    // 3. a saturated database slows every write and read: it is the root cause of the
     //    shard, lock, pool, latency and dispatch symptoms (unless polls are being throttled)
     if c.r.persistence.utilization >= c.crit {
         let symptom_max = out
@@ -1443,5 +1445,108 @@ fn headroom(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             knobs,
             score: 20.0 + worst * 20.0,
         });
+    }
+}
+
+/// Limiters inside the cluster: history and matching host RPS, and persistence QPS.
+fn is_internal_limiter(resource: &str) -> bool {
+    resource == "history.rps"
+        || resource == "matching.rps"
+        || resource.ends_with(".persistenceMaxQPS")
+}
+
+/// When `history.rps`, `matching.rps` or a persistence limit rejects calls, the retries and
+/// backoffs that follow show up as schedule-to-start latency, matching backlog, workflow task
+/// timeouts, throttled queue tasks and slow or failing API calls. Rank the limiter above those
+/// symptoms (within its severity) and point the symptoms at it.
+fn rank_internal_limiters(out: &mut [Hotspot]) {
+    const SYMPTOMS: [&str; 7] = [
+        "workers",
+        "matching-backlog",
+        "workflow-tasks",
+        "history-queue",
+        "api-latency",
+        "api-errors",
+        "throughput",
+    ];
+    let limiters: Vec<String> = out
+        .iter()
+        .filter(|h| h.category == "rate-limit" && is_internal_limiter(&h.resource))
+        .map(|h| h.resource.clone())
+        .collect();
+    if limiters.is_empty() {
+        return;
+    }
+    let symptom_max = out
+        .iter()
+        .filter(|h| SYMPTOMS.contains(&h.category.as_str()))
+        .map(|h| h.score)
+        .fold(0.0, f64::max);
+    for h in out
+        .iter_mut()
+        .filter(|h| h.category == "rate-limit" && is_internal_limiter(&h.resource))
+    {
+        h.score = h.score.max(symptom_max + 1.0);
+    }
+    for h in out.iter_mut().filter(|h| {
+        matches!(
+            h.category.as_str(),
+            "workers" | "matching-backlog" | "workflow-tasks"
+        ) && !h.detail.starts_with("Likely caused by")
+    }) {
+        h.detail = format!(
+            "Likely caused by rejected calls ({}): see that hotspot first. {}",
+            limiters.join(", "),
+            h.detail
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hotspot(severity: Severity, category: &str, resource: &str, score: f64) -> Hotspot {
+        Hotspot {
+            severity,
+            category: category.into(),
+            resource: resource.into(),
+            title: format!("{category} {resource}"),
+            detail: "detail".into(),
+            evidence: vec![],
+            metrics: vec![],
+            knobs: vec![],
+            score,
+        }
+    }
+
+    #[test]
+    fn internal_limiter_rejections_rank_above_their_symptoms() {
+        let mut out = vec![
+            hotspot(Severity::Critical, "workers", "OrderWorkflow", 80.0),
+            hotspot(Severity::Critical, "rate-limit", "history.rps", 63.6),
+            hotspot(Severity::Warning, "matching-backlog", "orders", 70.0),
+            hotspot(Severity::Warning, "cpu", "temporal-history-2", 75.0),
+        ];
+        rank_internal_limiters(&mut out);
+        let score = |cat: &str| out.iter().find(|h| h.category == cat).unwrap().score;
+        assert!(score("rate-limit") > score("workers"));
+        assert!(score("rate-limit") > score("matching-backlog"));
+        // not a symptom of a limiter: left alone
+        assert_eq!(score("cpu"), 75.0);
+        let workers = out.iter().find(|h| h.category == "workers").unwrap();
+        assert!(
+            workers
+                .detail
+                .starts_with("Likely caused by rejected calls (history.rps)")
+        );
+
+        // frontend limiters are handled with poll rejections, not here
+        let mut out = vec![
+            hotspot(Severity::Critical, "workers", "OrderWorkflow", 80.0),
+            hotspot(Severity::Critical, "rate-limit", "frontend.rps", 60.0),
+        ];
+        rank_internal_limiters(&mut out);
+        assert_eq!(out[1].score, 60.0);
     }
 }
