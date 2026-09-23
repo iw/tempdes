@@ -3,6 +3,7 @@
 //! show it in production plus the knobs (EKS replicas, dynamic config) that change it.
 
 use super::*;
+use crate::config::scenario::ClientLb;
 use crate::metrics::observed::Observations;
 use crate::util::units::{fmt_pct, fmt_rate, fmt_us};
 
@@ -65,6 +66,55 @@ impl Ctx2<'_> {
             Some(Severity::Warning)
         } else {
             None
+        }
+    }
+
+    /// The busiest live frontend, its requests/s and the mean over live frontends.
+    fn frontend_skew(&self) -> Option<(String, f64, f64)> {
+        let fe = self.r.services.iter().find(|s| s.service == "frontend")?;
+        let live: Vec<&PodResult> = fe.pods.iter().filter(|p| p.alive).collect();
+        if live.len() < 2 {
+            return None;
+        }
+        let mean = live.iter().map(|p| p.requests_per_s).sum::<f64>() / live.len() as f64;
+        let hot = live
+            .iter()
+            .max_by(|a, b| a.requests_per_s.total_cmp(&b.requests_per_s))?;
+        Some((hot.name.clone(), hot.requests_per_s, mean))
+    }
+
+    /// With pinned connections, a frontend's share of the traffic follows the connections it
+    /// happens to hold: evidence of the skew, and the client load balancing knob.
+    fn pinned_frontend_advice(&self) -> Option<(String, Knob)> {
+        if self.ctx.p.client_lb != ClientLb::Pinned {
+            return None;
+        }
+        let (hot, rps, mean) = self.frontend_skew()?;
+        (mean > 0.0 && rps / mean >= 1.15).then(|| {
+            (
+                format!(
+                    "{hot} serves {} against a frontend mean of {}: each SDK process pins its requests to one frontend",
+                    fmt_rate(rps),
+                    fmt_rate(mean)
+                ),
+                self.infra(
+                    "cluster.network.client_lb",
+                    "pinned".into(),
+                    "round_robin (gRPC client-side load balancing on a headless Service) or proxy spreads every process's requests over all frontends; see docs/EKS.md",
+                ),
+            )
+        })
+    }
+
+    /// How requests reach the frontends, for rule explanations.
+    fn frontend_spread(&self) -> &'static str {
+        match self.ctx.p.client_lb {
+            ClientLb::Pinned => {
+                "SDK connections are pinned, so the frontend holding the busiest connections throttles while others have room."
+            }
+            ClientLb::RoundRobin | ClientLb::Proxy => {
+                "Requests are spread over the frontends call by call, so every frontend is close to this limit: raise it or add frontends."
+            }
         }
     }
 }
@@ -264,10 +314,20 @@ fn cpu(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 "{} owns {} shards (mean {:.0}); shard placement comes from the ringpop hash ring ({} points/host).",
                 hot.name, hot.owned, owned_mean, c.ctx.p.k.ringpop_replica_points
             ),
-            "frontend" => format!(
-                "{} holds {} client connections (mean {:.1}); SDK connections stick to one frontend until GOAWAY at frontend.keepAliveMaxConnectionAge.",
-                hot.name, hot.owned, owned_mean
-            ),
+            "frontend" => match c.ctx.p.client_lb {
+                ClientLb::Pinned => format!(
+                    "{} holds {} client connections (mean {:.1}); SDK connections stick to one frontend until GOAWAY at frontend.keepAliveMaxConnectionAge.",
+                    hot.name, hot.owned, owned_mean
+                ),
+                ClientLb::RoundRobin => format!(
+                    "Clients rotate requests over every frontend they resolved, but a frontend added since a client last re-resolved DNS gets none of its traffic. Re-resolution happens when a connection reaches frontend.keepAliveMaxConnectionAge (at most every 30 s); {} is the busiest.",
+                    hot.name
+                ),
+                ClientLb::Proxy => format!(
+                    "The proxy spreads requests call by call; frontends added recently only get traffic after network.proxy_discovery. {} is the busiest.",
+                    hot.name
+                ),
+            },
             "matching" => format!(
                 "{} hosts {} task queue partitions (mean {:.1}); partitions are placed by hashing their routing key.",
                 hot.name, hot.owned, owned_mean
@@ -284,10 +344,15 @@ fn cpu(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 ),
             ];
             match svc {
-                "frontend" => knobs.push(c.knob(
-                    "frontend.keepAliveMaxConnectionAge",
-                    "shorter age rebalances connections sooner",
-                )),
+                "frontend" => {
+                    knobs.push(c.knob(
+                        "frontend.keepAliveMaxConnectionAge",
+                        "shorter age rebalances connections sooner",
+                    ));
+                    if let Some((_, knob)) = c.pinned_frontend_advice() {
+                        knobs.push(knob);
+                    }
+                }
                 "history" => knobs.push(c.knob(
                     "system.ringpopReplicaPoints",
                     "more points smooth shard placement (restart required)",
@@ -854,7 +919,7 @@ fn limits(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
         };
         let (detail, metrics, knobs): (String, Vec<&str>, Vec<Knob>) = match limiter.as_str() {
             "frontend.namespaceRPS" => (
-                "Per-frontend namespace rate limit. It is a priority limiter: Start/Signal/Respond (P1) reserve tokens from lower priorities, so polls (P4) are rejected first. With a global limit the share is global / #frontends, so a frontend holding more SDK connections throttles while others are idle.".into(),
+                format!("Per-frontend namespace rate limit. It is a priority limiter: Start/Signal/Respond (P1) reserve tokens from lower priorities, so polls (P4) are rejected first. With a global limit the share is global / #frontends. {}", c.frontend_spread()),
                 vec!["service_errors_resource_exhausted{resource_exhausted_cause=\"RESOURCE_EXHAUSTED_CAUSE_RPS_LIMIT\",resource_exhausted_scope=\"RESOURCE_EXHAUSTED_SCOPE_NAMESPACE\"}"],
                 vec![
                     c.knob("frontend.namespaceRPS", "per-instance namespace RPS"),
@@ -864,12 +929,12 @@ fn limits(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 ],
             ),
             "frontend.rps" => (
-                "Per-frontend host rate limit (all namespaces). Priority limiter: polls starve first.".into(),
+                format!("Per-frontend host rate limit (all namespaces). Priority limiter: polls starve first. {}", c.frontend_spread()),
                 vec!["service_errors_resource_exhausted{resource_exhausted_scope=\"RESOURCE_EXHAUSTED_SCOPE_SYSTEM\"}", "host_rps_limit"],
                 vec![c.knob("frontend.rps", "per-instance RPS"), c.knob("frontend.globalRPS", "cluster-wide"), c.replicas("frontend", "more frontends add host capacity")],
             ),
             "frontend.namespaceCount" => (
-                "Concurrent long-running requests (polls, queries) per namespace per API exceed the per-frontend quota. SDK pollers across all workers count here; the busiest frontend (most connections) hits it first.".into(),
+                format!("Concurrent long-running requests (polls, queries) per namespace per API exceed the per-frontend quota. SDK pollers across all workers count here. {}", c.frontend_spread()),
                 vec!["service_errors_resource_exhausted{resource_exhausted_cause=\"RESOURCE_EXHAUSTED_CAUSE_CONCURRENT_LIMIT\"}", "service_pending_requests"],
                 vec![c.knob("frontend.namespaceCount", "per instance per API"), c.knob("frontend.globalNamespaceCount", "cluster-wide / #frontends")],
             ),
@@ -904,13 +969,21 @@ fn limits(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             ),
             _ => ("Rate limited.".into(), vec![], vec![]),
         };
+        let mut knobs = knobs;
+        let mut evidence: Vec<String> = places.into_iter().take(6).collect();
+        if limiter.starts_with("frontend.")
+            && let Some((why, knob)) = c.pinned_frontend_advice()
+        {
+            evidence.insert(0, why);
+            knobs.push(knob);
+        }
         out.push(Hotspot {
             severity: sev,
             category: "rate-limit".into(),
             resource: limiter.clone(),
             title: format!("{limiter}: {n} rejections ({})", fmt_rate(per_s)),
             detail,
-            evidence: places.into_iter().take(6).collect(),
+            evidence,
             metrics: metrics.into_iter().map(String::from).collect(),
             knobs,
             score: 50.0 + per_s.min(1000.0) / 10.0,
@@ -1347,15 +1420,27 @@ fn headroom(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
         pods.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let worst = pods[0].1;
         let key = base.clone();
+        let mut evidence: Vec<String> = pods
+            .iter()
+            .take(6)
+            .map(|(n, u)| format!("{n}: {} of limit", fmt_pct(*u)))
+            .collect();
+        let mut knobs = vec![c.knob(&key, "raise the limit, or add pods to spread the load")];
+        if key.starts_with("frontend.")
+            && let Some((why, knob)) = c.pinned_frontend_advice()
+        {
+            evidence.insert(0, why);
+            knobs.push(knob);
+        }
         out.push(Hotspot {
             severity: Severity::Warning,
             category: "headroom".into(),
             resource: lim.clone(),
             title: format!("{lim} at {} of its limit on {}", fmt_pct(worst), pods[0].0),
             detail: "Offered requests are close to this pod's rate limit; a modest load increase (or a burst) will start ResourceExhausted rejections here before CPU or the database saturate. Temporal limiters are token buckets (burst 2x the rate for frontend/history/matching RPS, frontend.namespaceBurstRatio for namespaces, system.persistenceQPSBurstRatio for persistence), so short spikes pass but sustained load does not.".into(),
-            evidence: pods.iter().take(6).map(|(n, u)| format!("{n}: {} of limit", fmt_pct(*u))).collect(),
+            evidence,
             metrics: vec!["service_requests".into(), "service_errors_resource_exhausted".into()],
-            knobs: vec![c.knob(&key, "raise the limit, or add pods to spread the load")],
+            knobs,
             score: 20.0 + worst * 20.0,
         });
     }

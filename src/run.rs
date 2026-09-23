@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 
 use crate::config::dynamic::{Constraints, DcValue, DynamicConfig};
-use crate::config::scenario::{Replicas, Scenario};
+use crate::config::scenario::{ClientLb, Replicas, Scenario};
 use crate::metrics::observed::Observations;
 use crate::model::build::{self, RunInfo};
 use crate::model::params::Params;
@@ -20,6 +20,7 @@ pub struct Overrides {
     pub warmup_s: Option<f64>,
     pub seed: Option<u64>,
     pub start_rate_scale: Option<f64>,
+    pub client_lb: Option<ClientLb>,
 }
 
 impl Overrides {
@@ -32,6 +33,9 @@ impl Overrides {
         parts.extend(self.dc.iter().map(|(k, v, _)| format!("{k}={v}")));
         if let Some(s) = self.start_rate_scale {
             parts.push(format!("load×{s}"));
+        }
+        if let Some(lb) = self.client_lb {
+            parts.push(format!("client_lb={lb}"));
         }
         parts.join(" ")
     }
@@ -146,6 +150,9 @@ pub fn prepare(sc: &Scenario, ov: &Overrides, cal: Option<&Calibration>) -> anyh
     }
     if let Some(s) = ov.seed {
         sc.seed = s;
+    }
+    if let Some(lb) = ov.client_lb {
+        sc.cluster.network.client_lb = lb;
     }
     if let Some(k) = ov.start_rate_scale {
         for w in &mut sc.workflows {

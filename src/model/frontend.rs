@@ -84,6 +84,7 @@ pub fn frontend_state(
             concurrent_max: Default::default(),
             poll_lb: Default::default(),
             connections: 0,
+            ready_at: 0,
         },
     )
 }

@@ -297,6 +297,8 @@ pub struct ConfigSummary {
     pub max_conns: BTreeMap<String, u32>,
     pub effective_dynamic_config: BTreeMap<String, String>,
     pub cpu_cost_scale: BTreeMap<String, f64>,
+    /// how SDK clients reach the frontends (`cluster.network.client_lb`)
+    pub client_lb: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -868,6 +870,7 @@ pub fn analyze(ctx: &Ctx, info: &RunInfo, obs: Option<&Observations>) -> RunResu
             .iter()
             .map(|s| (s.as_str().to_string(), p.costs.scale[s.idx()]))
             .collect(),
+        client_lb: p.client_lb.as_str().to_string(),
     };
 
     let samples = m.samples.clone();

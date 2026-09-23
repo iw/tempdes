@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use tempdes::config::dynamic::{Constraints, DcValue};
-use tempdes::config::scenario::Scenario;
+use tempdes::config::scenario::{ClientLb, Scenario};
 use tempdes::report::{self, RunResult, Severity};
 use tempdes::run::{self, Overrides};
 
@@ -295,4 +295,94 @@ fn limiter_headroom_is_reported_before_rejections() {
         (0.7..1.0).contains(&worst),
         "matching.rps utilisation {worst}"
     );
+}
+
+/// Requests/s of the busiest live frontend over the mean.
+fn frontend_skew(r: &RunResult) -> f64 {
+    let fe = r.services.iter().find(|s| s.service == "frontend").unwrap();
+    let rps: Vec<f64> = fe
+        .pods
+        .iter()
+        .filter(|p| p.alive)
+        .map(|p| p.requests_per_s)
+        .collect();
+    rps.iter().copied().fold(0.0, f64::max) / (rps.iter().sum::<f64>() / rps.len() as f64)
+}
+
+fn frontend_rejections(r: &RunResult) -> u64 {
+    r.limits
+        .iter()
+        .filter(|l| l.limiter.starts_with("frontend."))
+        .map(|l| l.rejected)
+        .sum()
+}
+
+#[test]
+fn client_side_load_balancing_spreads_frontend_load() {
+    let pinned = simulate("frontend-lb.yaml", short());
+    assert!(
+        frontend_skew(&pinned) > 1.15,
+        "pinned skew {}",
+        frontend_skew(&pinned)
+    );
+    assert!(frontend_rejections(&pinned) > 0, "{:#?}", pinned.limits);
+    assert!(
+        pinned
+            .hotspots
+            .iter()
+            .any(|h| h.knobs.iter().any(|k| k.key == "cluster.network.client_lb")),
+        "the report should suggest client load balancing: {:#?}",
+        categories(&pinned)
+    );
+    for lb in [ClientLb::RoundRobin, ClientLb::Proxy] {
+        let r = simulate(
+            "frontend-lb.yaml",
+            Overrides {
+                client_lb: Some(lb),
+                ..short()
+            },
+        );
+        assert!(frontend_skew(&r) < 1.05, "{lb}: skew {}", frontend_skew(&r));
+        assert_eq!(frontend_rejections(&r), 0, "{lb}: {:#?}", r.limits);
+        assert_eq!(r.config.client_lb, lb.as_str());
+    }
+}
+
+#[test]
+fn new_frontends_get_traffic_only_once_clients_find_them() {
+    // share of frontend requests served by the pods added at 30s (ordinals 3..6)
+    let new_share = |lb: ClientLb, max_age: &str| {
+        let r = simulate(
+            "frontend-scale-out.yaml",
+            Overrides {
+                client_lb: Some(lb),
+                start_rate_scale: Some(0.25),
+                duration_s: Some(100.0),
+                dc: vec![(
+                    "frontend.keepAliveMaxConnectionAge".into(),
+                    DcValue::Str(max_age.into()),
+                    Constraints::default(),
+                )],
+                ..Default::default()
+            },
+        );
+        let fe = r.services.iter().find(|s| s.service == "frontend").unwrap();
+        let (mut new, mut all) = (0.0, 0.0);
+        for p in fe.pods.iter().filter(|p| p.alive) {
+            all += p.requests_per_s;
+            if p.name.ends_with("-3") || p.name.ends_with("-4") || p.name.ends_with("-5") {
+                new += p.requests_per_s;
+            }
+        }
+        new / all
+    };
+    // with the default 5m max connection age, clients keep their connections and resolved
+    // addresses through the whole window
+    assert!(new_share(ClientLb::Pinned, "5m") < 0.02);
+    assert!(new_share(ClientLb::RoundRobin, "5m") < 0.02);
+    // a proxy adds new pods after registration and health checks (15s)
+    assert!(new_share(ClientLb::Proxy, "5m") > 0.3);
+    // round robin clients re-resolve DNS when a connection reaches the max age
+    let rr = new_share(ClientLb::RoundRobin, "1m");
+    assert!(rr > 0.2, "round robin share with a 1m max age: {rr}");
 }

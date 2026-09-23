@@ -89,6 +89,10 @@ tempdes run examples/scenarios/baseline.yaml
 # change the two dimensions from the command line
 tempdes run examples/scenarios/baseline.yaml -r history=6 -d history.shardIOConcurrency=4
 
+# how clients reach the frontends: pinned connections, gRPC round robin or an L7 proxy
+tempdes sweep examples/scenarios/frontend-lb.yaml --rows frontend=3,4 \
+    --cols client_lb=pinned,round_robin,proxy
+
 # grid: replica counts down, dynamic config across
 tempdes sweep examples/scenarios/baseline.yaml --load 1.3 \
     --rows matching=3,4,6 --cols matching.rps=1200,2400 --html out/sweep.html
@@ -141,9 +145,10 @@ Replica counts change more than capacity. Each pod joins the ringpop hash ring u
   which also decides where the root partition sits.
 * **how rate limits are split.** Settings such as `frontend.globalNamespaceRPS` are divided
   across frontend pods.
-* **how SDK traffic spreads.** Each client and worker keeps one gRPC connection pinned to one
-  frontend pod until `frontend.keepAliveMaxConnectionAge` expires, so load is uneven across
-  frontends.
+* **how SDK traffic spreads.** By default each client and worker keeps one gRPC connection
+  pinned to one frontend pod until `frontend.keepAliveMaxConnectionAge` expires, so load is
+  uneven across frontends. `cluster.network.client_lb` can instead model gRPC client-side round
+  robin or an L7 proxy such as an ALB; see [docs/EKS.md](docs/EKS.md).
 
 To reproduce the exact placement of a live cluster, list the pods' real addresses in
 `cluster.member_addresses`.
@@ -178,8 +183,9 @@ These keys are resolved the way Temporal 1.31.0 resolves them:
 * **Durations.** `"30s"`, `"1h"` and bare seconds are accepted.
 
 CLI overrides use `-d key=value` and `-d 'key[namespace=orders,taskQueueName=q]=value'`.
-Sweep columns use `--cols key=v1,v2,v3`, and a pseudo-key `load=0.5,1,2` scales all start and
-signal rates.
+Sweep columns use `--cols key=v1,v2,v3`. Two pseudo-keys also work: `load=0.5,1,2` scales all
+start and signal rates, and `client_lb=pinned,round_robin,proxy` changes how clients reach the
+frontends.
 
 `tempdes dc validate FILE` checks a production dynamic config file against the 1.31.0 registry.
 It exits 1 when it finds problems. It catches:
@@ -372,7 +378,12 @@ cluster:
   replicas: { frontend: 3, history: 3, matching: 3, worker: 1 }
   resources: { frontend: { cpu: 2 }, history: { cpu: 4 }, matching: { cpu: 2 }, worker: { cpu: 1 } }
   member_addresses: { history: ["10.0.1.12:7234", "10.0.2.40:7234"] }   # optional, exact ring placement
-  network: { client_rtt: 2ms, internal_rtt: 0.5ms }
+  network:
+    client_rtt: 2ms
+    internal_rtt: 0.5ms
+    client_lb: pinned          # pinned | round_robin | proxy (docs/EKS.md)
+    proxy_latency: 1ms         # proxy only: added to every request
+    proxy_discovery: 15s       # proxy only: before a new frontend pod gets traffic
   persistence:
     store: postgresql          # postgresql | mysql | cassandra | sqlite
     max_conns: { frontend: 20, history: 50, matching: 30, worker: 10 }
@@ -458,6 +469,8 @@ Durations and latencies accept a constant (`5ms`), `{ p50, p99 }` for a lognorma
 | `scale-out.yaml` | History scaled from 3 to 5 pods mid-run: shard movement, the unavailability window and cold caches. |
 | `cassandra-large.yaml` | 4,096 shards on Cassandra at 1,000 wf/s, with shard IO forced to 1. Useful for sweeps. |
 | `from-helm.yaml` | Deployment read from a `temporalio/helm-charts` values file. |
+| `frontend-lb.yaml` | 270 wf/s on 3 frontends with default limits. Pinned SDK connections overload one frontend; `round_robin` or `proxy` spreads the load evenly. |
+| `frontend-scale-out.yaml` | Frontends scale from 3 to 6 mid-run. The new pods only get traffic once clients reconnect, re-resolve DNS or the proxy registers them. |
 
 ## What is modelled
 
@@ -468,7 +481,8 @@ source. In summary:
   * Shards: `farm.Fingerprint32(namespaceID + "_" + workflowID) % numHistoryShards + 1`,
     checked against go-farm test vectors.
   * History pods and matching partitions: ringpop hash ring placement.
-  * Clients: SDK connections pinned to frontend pods.
+  * Clients: SDK connections pinned to frontend pods, gRPC client-side round robin, or an L7
+    proxy (`cluster.network.client_lb`).
 * **Frontend.**
   * `frontend.rps` and namespace priority rate limiters: higher priorities reserve tokens from
     lower ones, so polls starve first.

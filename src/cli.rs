@@ -65,6 +65,10 @@ pub struct CommonArgs {
     /// Multiply all start and signal rates.
     #[arg(long = "load")]
     load: Option<f64>,
+    /// How SDK clients reach the frontends: pinned, round_robin or proxy (overrides
+    /// `cluster.network.client_lb`).
+    #[arg(long = "client-lb", value_name = "MODE")]
+    client_lb: Option<crate::config::scenario::ClientLb>,
 }
 
 #[derive(Args)]
@@ -143,6 +147,7 @@ pub fn parse_overrides(c: &CommonArgs) -> anyhow::Result<Overrides> {
         warmup_s: c.warmup,
         seed: c.seed,
         start_rate_scale: c.load,
+        client_lb: c.client_lb,
         ..Default::default()
     };
     for r in &c.replicas {

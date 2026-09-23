@@ -391,10 +391,11 @@ pub fn render_run_doc(r: &RunResult, fragment: bool) -> String {
     }
     let _ = write!(
         b,
-        "<span class=\"chip\"><b>{}</b> history shards</span><span class=\"chip\">{} · capacity <b>{}</b></span><span class=\"chip\">{:.0}s simulated after {:.0}s warm-up</span>",
+        "<span class=\"chip\"><b>{}</b> history shards</span><span class=\"chip\">{} · capacity <b>{}</b></span><span class=\"chip\">client LB <b>{}</b></span><span class=\"chip\">{:.0}s simulated after {:.0}s warm-up</span>",
         r.config.num_history_shards,
         esc(&r.persistence.store),
         r.persistence.capacity,
+        esc(&r.config.client_lb),
         r.duration_s,
         r.warmup_s
     );
@@ -461,6 +462,7 @@ pub fn render_run_doc(r: &RunResult, fragment: bool) -> String {
             let owns = match s.service.as_str() {
                 "history" => format!("{} shards", p.owned),
                 "matching" => format!("{} partitions", p.owned),
+                "frontend" if r.config.client_lb == "proxy" => "clients via proxy".to_string(),
                 "frontend" => format!("{} client connections", p.owned),
                 _ => format!("{} per-namespace workers", p.owned),
             };

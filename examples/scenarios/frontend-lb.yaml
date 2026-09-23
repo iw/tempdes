@@ -1,0 +1,85 @@
+# How SDK clients reach the frontends decides how evenly the frontends are loaded.
+# frontend.rps and frontend.namespaceRPS are per-pod limits. With pinned connections
+# (the default: one gRPC connection per SDK process through a Kubernetes Service or an
+# NLB), the pod that happens to hold the busiest connections throttles polls while the
+# others still have room. Compare the three modes:
+#
+#   tempdes sweep examples/scenarios/frontend-lb.yaml --rows frontend=3,4 \
+#       --cols client_lb=pinned,round_robin,proxy
+#
+# docs/EKS.md walks through the results and an EKS setup for each mode.
+name: frontend-lb
+description: >
+  Order workflow at 270 starts/s on 3 frontends with the default per-pod frontend limits
+  (2400/s): the cluster has room overall, but not on the busiest frontend.
+seed: 7
+warmup: 20s
+duration: 60s
+
+cluster:
+  num_history_shards: 512          # static: persistence.numHistoryShards
+  replicas:
+    frontend: 3
+    history: 3
+    matching: 6
+    worker: 1
+  resources:                       # per-pod CPU limit (GOMAXPROCS)
+    frontend: { cpu: 2 }
+    history:  { cpu: 4 }
+    matching: { cpu: 2 }
+    worker:   { cpu: 1 }
+  network:
+    client_rtt: 2ms
+    internal_rtt: 0.5ms
+    # How SDK clients and workers reach the frontend pods:
+    #   pinned       one gRPC connection per process through an L4 load balancer (the default)
+    #   round_robin  gRPC client-side load balancing: dns:/// target on a headless Service
+    #   proxy        per-request L7 balancing (ALB gRPC target group, Envoy, a service mesh)
+    client_lb: pinned
+    proxy_latency: 1ms     # proxy only: added to every request
+    proxy_discovery: 15s   # proxy only: registration + health checks before a new pod gets traffic
+  persistence:
+    store: postgresql
+    max_conns: { frontend: 20, history: 50, matching: 30, worker: 10 }
+    capacity: 160                  # concurrent DB operations before queueing
+    latency:
+      UpdateWorkflowExecution: { p50: 3ms, p99: 14ms }
+      CreateWorkflowExecution: { p50: 4ms, p99: 18ms }
+  visibility:
+    store: elasticsearch
+
+# Temporal dynamic config (same format as the server's dynamicconfig YAML)
+dynamic_config:
+  history.shardIOConcurrency:
+    - value: 1
+  frontend.namespaceRPS:
+    - value: 2400
+  matching.rps:
+    - value: 4000
+
+namespaces:
+  - name: orders
+
+workers:
+  - name: order-workers
+    namespace: orders
+    task_queue: orders
+    processes: 6
+    workflow_pollers: 10
+    activity_pollers: 16
+    workflow_slots: 200
+    activity_slots: 200
+    sticky_cache_size: 5000
+
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 270/s
+    starters: 4
+    wft_processing: { p50: 2ms, p99: 12ms }
+    steps:
+      - activity: { count: 1, duration: { p50: 30ms, p99: 250ms } }   # reserve inventory
+      - activity: { count: 2, parallel: true, duration: { p50: 60ms, p99: 400ms } }  # charge + notify
+      - timer: 2s
+      - activity: { count: 1, duration: { p50: 20ms, p99: 150ms } }   # ship

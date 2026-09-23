@@ -182,6 +182,16 @@ pub struct NetworkSpec {
     /// Round trip between Temporal pods.
     #[serde(default = "NetworkSpec::internal")]
     pub internal_rtt: Dur,
+    /// How SDK clients and workers spread their requests over the frontend pods.
+    #[serde(default)]
+    pub client_lb: ClientLb,
+    /// `proxy` only: latency the proxy adds to every request.
+    #[serde(default = "NetworkSpec::proxy_latency")]
+    pub proxy_latency: Dur,
+    /// `proxy` only: how long a new frontend pod waits for traffic (target registration and
+    /// health checks).
+    #[serde(default = "NetworkSpec::proxy_discovery")]
+    pub proxy_discovery: Dur,
 }
 
 impl NetworkSpec {
@@ -191,6 +201,12 @@ impl NetworkSpec {
     fn internal() -> Dur {
         Dur::from_ms(0.5)
     }
+    fn proxy_latency() -> Dur {
+        Dur::from_ms(1.0)
+    }
+    fn proxy_discovery() -> Dur {
+        Dur::from_secs(15.0)
+    }
 }
 
 impl Default for NetworkSpec {
@@ -198,6 +214,58 @@ impl Default for NetworkSpec {
         NetworkSpec {
             client_rtt: Self::client(),
             internal_rtt: Self::internal(),
+            client_lb: ClientLb::default(),
+            proxy_latency: Self::proxy_latency(),
+            proxy_discovery: Self::proxy_discovery(),
+        }
+    }
+}
+
+/// How SDK clients and workers reach the frontend pods.
+#[derive(Clone, Copy, Debug, Deserialize, serde::Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientLb {
+    /// One gRPC connection per process, placed by an L4 load balancer (a ClusterIP Service or
+    /// an NLB). Every request of the process goes to that pod until the connection receives
+    /// GOAWAY at `frontend.keepAliveMaxConnectionAge`.
+    #[default]
+    Pinned,
+    /// gRPC client-side load balancing: a `dns:///` target on a headless Service with the
+    /// `round_robin` policy. The process connects to every frontend pod DNS returns and rotates
+    /// requests over them.
+    RoundRobin,
+    /// Per-request balancing by an L7 proxy (an AWS ALB with a gRPC target group, Envoy, a
+    /// service mesh).
+    Proxy,
+}
+
+impl ClientLb {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClientLb::Pinned => "pinned",
+            ClientLb::RoundRobin => "round_robin",
+            ClientLb::Proxy => "proxy",
+        }
+    }
+}
+
+impl std::fmt::Display for ClientLb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ClientLb {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "pinned" => Ok(ClientLb::Pinned),
+            "round_robin" => Ok(ClientLb::RoundRobin),
+            "proxy" => Ok(ClientLb::Proxy),
+            other => Err(format!(
+                "unknown client load balancing {other:?} (expected pinned, round_robin or proxy)"
+            )),
         }
     }
 }

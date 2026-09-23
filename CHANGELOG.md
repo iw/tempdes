@@ -32,8 +32,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   self-contained HTML with time-series charts, a shard map and sweep heatmaps.
 - **`gen-dc-registry`.** Regenerates the dynamic config registry from a Temporal source checkout
   and checks it for drift.
-- **Examples.** Eight example scenarios, each reproducing a hotspot: baseline, hot entities,
-  frontend throttling, database-bound, aligned schedules, scale-out, large Cassandra cluster and
-  Helm import.
+- **Examples.** Ten example scenarios, each reproducing a hotspot: baseline, hot entities,
+  frontend throttling, database-bound, aligned schedules, scale-out, large Cassandra cluster,
+  Helm import, frontend load balancing and frontend scale-out.
+- **Client load balancing.** `cluster.network.client_lb` sets how SDK clients and workers
+  reach the frontend pods:
+  - `pinned`, the default: one connection per process;
+  - `round_robin`: gRPC client-side load balancing on a headless Service;
+  - `proxy`: per-request L7 balancing, such as an ALB or a service mesh.
+
+  It is also available as `--client-lb` and as a `client_lb=` sweep column. Frontend rate-limit
+  hotspots now show frontend load skew and suggest `client_lb` when connections are pinned.
+- **EKS guide.** [docs/EKS.md](docs/EKS.md) covers each option: a headless Service with SDK
+  settings, an ALB for external clients, and frontend connection-age and shutdown settings.
 
 [Unreleased]: https://github.com/iw/tempdes/commits/main

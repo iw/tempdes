@@ -1,7 +1,7 @@
 //! Construct the simulated cluster from resolved parameters, run it, and apply timeline events
 //! (replica changes → ring changes → shard / partition movement, dynamic config changes).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -338,6 +338,7 @@ pub fn build(p: Params) -> (Ctx, Executor) {
                 ordinal: ord,
                 conn: usize::MAX,
                 conn_expires: 0,
+                rr: RoundRobin::default(),
                 wft_slots: Semaphore::new(f.wf_slots),
                 act_slots: Semaphore::new(f.act_slots),
                 cpu: f.cpu.map(FcfsServers::new),
@@ -366,6 +367,7 @@ pub fn build(p: Params) -> (Ctx, Executor) {
         .map(|_| Client {
             conn: usize::MAX,
             conn_expires: 0,
+            rr: RoundRobin::default(),
         })
         .collect();
 
@@ -396,6 +398,7 @@ pub fn build(p: Params) -> (Ctx, Executor) {
         es: RefCell::new(Vec::new()),
         m: RefCell::new(Metrics::new(n_types)),
         timer_seq: RefCell::new(0),
+        proxy_next: Cell::new(0),
         schedule_buckets: RefCell::new(HashMap::new()),
         measuring: RefCell::new(false),
         p,
@@ -634,7 +637,10 @@ async fn scale(ctx: &Ctx, svc: Service, target: usize) {
             };
             let Some(addr) = addr else { break };
             let ordinal = ctx.pods.borrow().iter().filter(|p| p.svc == svc).count();
-            let pod = make_pod(&ctx.p, svc, ordinal, addr, target, n_fe);
+            let mut pod = make_pod(&ctx.p, svc, ordinal, addr, target, n_fe);
+            if let Some(fe) = pod.fe.as_mut() {
+                fe.ready_at = now() + ctx.p.proxy_discovery;
+            }
             let id = {
                 let mut pods = ctx.pods.borrow_mut();
                 pods.push(pod);

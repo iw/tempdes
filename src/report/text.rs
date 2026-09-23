@@ -150,7 +150,7 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
     );
     let _ = writeln!(
         o,
-        "  replicas frontend={} history={} matching={} worker={} · {} shards · {} (capacity {}) · simulated {:.0}s after {:.0}s warm-up in {:.1}s",
+        "  replicas frontend={} history={} matching={} worker={} · {} shards · {} (capacity {}) · client LB {} · simulated {:.0}s after {:.0}s warm-up in {:.1}s",
         rep.get("frontend").unwrap_or(&0),
         rep.get("history").unwrap_or(&0),
         rep.get("matching").unwrap_or(&0),
@@ -158,6 +158,7 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
         r.config.num_history_shards,
         r.persistence.store,
         r.persistence.capacity,
+        r.config.client_lb,
         r.duration_s,
         r.warmup_s,
         r.wall_ms as f64 / 1000.0
@@ -292,6 +293,7 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
             let owns = match s.service.as_str() {
                 "history" => format!("{} shards", p.owned),
                 "matching" => format!("{} parts", p.owned),
+                "frontend" if r.config.client_lb == "proxy" => "via proxy".to_string(),
                 "frontend" => format!("{} conns", p.owned),
                 _ => format!("{} ns-workers", p.owned),
             };

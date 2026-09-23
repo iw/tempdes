@@ -26,6 +26,7 @@ pub enum Setting {
     Replicas(String, u32),
     Dc(String, String),
     Load(f64),
+    ClientLb(crate::config::scenario::ClientLb),
 }
 
 impl Setting {
@@ -34,6 +35,7 @@ impl Setting {
             Setting::Replicas(s, n) => format!("{s}={n}"),
             Setting::Dc(k, v) => format!("{}={v}", short_key(k)),
             Setting::Load(l) => format!("load×{l}"),
+            Setting::ClientLb(m) => format!("client_lb={m}"),
         }
     }
 
@@ -50,6 +52,7 @@ impl Setting {
                 ov.dc.push((key, val, cons));
             }
             Setting::Load(l) => ov.start_rate_scale = Some(ov.start_rate_scale.unwrap_or(1.0) * l),
+            Setting::ClientLb(m) => ov.client_lb = Some(*m),
         }
         Ok(())
     }
@@ -99,6 +102,9 @@ fn parse_axis(spec: &str) -> anyhow::Result<Vec<Vec<Setting>>> {
                     Setting::Replicas(lk.trim_start_matches("replicas.").to_string(), val.parse()?)
                 }
                 "load" => Setting::Load(val.parse()?),
+                "client_lb" | "network.client_lb" | "cluster.network.client_lb" => {
+                    Setting::ClientLb(val.parse().map_err(|e: String| anyhow::anyhow!(e))?)
+                }
                 _ => {
                     let base = k.split('[').next().unwrap_or(k);
                     if crate::config::dynamic::registry().get(base).is_none() {
@@ -555,5 +561,9 @@ mod tests {
         assert!(parse_axis("history.shardIoConcurency=1,2").is_err());
         let p = product(&[a, b]);
         assert_eq!(p.len(), 6);
+        let a = parse_axis("client_lb=pinned,round_robin").unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[1][0].label(), "client_lb=round_robin");
+        assert!(parse_axis("client_lb=sticky").is_err());
     }
 }
