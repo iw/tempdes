@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 
 use crate::config::dynamic::{Constraints, DcValue, DynamicConfig};
-use crate::config::scenario::{Replicas, Scenario};
+use crate::config::scenario::{ClientLb, Replicas, Scenario};
 use crate::metrics::observed::Observations;
 use crate::model::build::{self, RunInfo};
 use crate::model::params::Params;
@@ -20,6 +20,7 @@ pub struct Overrides {
     pub warmup_s: Option<f64>,
     pub seed: Option<u64>,
     pub start_rate_scale: Option<f64>,
+    pub client_lb: Option<ClientLb>,
 }
 
 impl Overrides {
@@ -32,6 +33,9 @@ impl Overrides {
         parts.extend(self.dc.iter().map(|(k, v, _)| format!("{k}={v}")));
         if let Some(s) = self.start_rate_scale {
             parts.push(format!("load×{s}"));
+        }
+        if let Some(lb) = self.client_lb {
+            parts.push(format!("client_lb={lb}"));
         }
         parts.join(" ")
     }
@@ -81,6 +85,7 @@ pub struct Calibration {
 /// Build a calibration from observations. When CPU usage is observed, a pilot simulation of the
 /// *base* configuration (the one the observations came from) measures simulated CPU demand
 /// and the cost tables are scaled to match; sweeps then reuse the same scales for every cell.
+/// The pilot runs at the observed load: a `--load` multiplier applies on top of calibration.
 pub fn calibrate(
     sc: &Scenario,
     base: &Overrides,
@@ -111,6 +116,7 @@ pub fn calibrate(
         return Ok(cal);
     }
     let mut pilot = base.clone();
+    pilot.start_rate_scale = None; // observed CPU belongs to the observed load
     pilot.warmup_s = Some(sc.warmup().secs().min(15.0));
     pilot.duration_s = Some(sc.duration.secs().min(30.0));
     let p = prepare(sc, &pilot, Some(&cal))?;
@@ -147,6 +153,9 @@ pub fn prepare(sc: &Scenario, ov: &Overrides, cal: Option<&Calibration>) -> anyh
     if let Some(s) = ov.seed {
         sc.seed = s;
     }
+    if let Some(lb) = ov.client_lb {
+        sc.cluster.network.client_lb = lb;
+    }
     if let Some(k) = ov.start_rate_scale {
         for w in &mut sc.workflows {
             if let Some(r) = w.start_rate.as_mut() {
@@ -164,7 +173,13 @@ pub fn prepare(sc: &Scenario, ov: &Overrides, cal: Option<&Calibration>) -> anyh
     let replicas = apply_replicas(sc.cluster.replicas, &ov.replicas)?;
     let mut p = Params::build(&sc, dc, replicas)?;
     if let Some(c) = cal {
-        crate::calibrate::apply(&mut p, &c.obs, c.persistence_latency, c.workload);
+        let load = ov.start_rate_scale.unwrap_or(1.0);
+        crate::calibrate::apply(&mut p, &c.obs, c.persistence_latency, c.workload, load);
+        if !is_observed_load(ov) {
+            p.prov.notes.push(format!(
+                "load ×{load} applied on top of the calibrated workload; the comparison with observed metrics is skipped"
+            ));
+        }
         for (i, k) in c.cpu_scale.iter().enumerate() {
             if let Some(k) = k {
                 p.costs.scale[i] = *k;
@@ -173,6 +188,21 @@ pub fn prepare(sc: &Scenario, ov: &Overrides, cal: Option<&Calibration>) -> anyh
         p.prov.notes.extend(c.notes.iter().cloned());
     }
     Ok(p)
+}
+
+/// True when the overrides keep the scenario's (or the observed) load, so simulated metrics can
+/// be compared with observed ones.
+pub fn is_observed_load(ov: &Overrides) -> bool {
+    ov.start_rate_scale.is_none_or(|k| (k - 1.0).abs() < 1e-9)
+}
+
+/// Observations to validate a run against: none when a load multiplier makes the simulated
+/// workload differ from the observed one.
+pub fn validation_obs<'a>(
+    ov: &Overrides,
+    obs: Option<&'a Observations>,
+) -> Option<&'a Observations> {
+    obs.filter(|_| is_observed_load(ov))
 }
 
 pub struct RunOutput {

@@ -40,7 +40,7 @@ This page describes what the simulator does at each step of a request, and which
 | Workflow → shard | `common/util.go` `WorkflowIDToHistoryShard`: `farm.Fingerprint32(nsID + "_" + wfID) % numShards + 1` | Same hash (`src/util/farmhash.rs`), verified against go-farm test vectors |
 | Shard → history pod | ringpop hash ring, `common/membership/ringpop/service_resolver.go`, key `strconv.Itoa(shardID)` | Same ring (`src/model/ring.rs`): `system.ringpopReplicaPoints` points per member, hashed `Fingerprint32(address + index)` |
 | Task-queue partition → matching pod | ring lookup of `"<nsID>:<name>:<type>"` | Same. Partition names follow `/_sys/<tq>/<n>` for n > 0 |
-| Client → frontend pod | gRPC connection through an NLB / kube Service; the server sends GOAWAY at `frontend.keepAliveMaxConnectionAge` (`service/frontend/fx.go`) | One connection per client and worker process, placed on a random live frontend and reconnected at max age ±10% jitter |
+| Client → frontend pod | gRPC connection through an NLB / kube Service; the server sends GOAWAY at `frontend.keepAliveMaxConnectionAge` (`service/frontend/fx.go`) | `cluster.network.client_lb`. `pinned` (default): one connection per process on a random live frontend, reconnected at max age ±10%. `round_robin`: grpc-go / grpc-java client-side balancing on a headless Service, with a subchannel per resolved pod, one call per subchannel in turn, and DNS re-resolved on GOAWAY or a lost pod at most every 30 s. `proxy`: per-call round robin over healthy pods, plus `proxy_latency`, with new pods joining after `proxy_discovery`. See [EKS.md](EKS.md) |
 
 Pod addresses are synthesised as `10.x.y.z:<grpc port>`, or taken from
 `cluster.member_addresses`. Different pod IPs change placement, so an uneven spread of shards
@@ -299,7 +299,7 @@ knobs.
 * Archival.
 * Batch operations.
 * The classic and fairness matchers.
-* Frontend DNS or NLB effects beyond connection pinning.
+* DNS caching, TLS handshake cost and cross-AZ effects of the client load-balancing modes.
 * GC pauses and memory pressure.
 * Database-internal contention (row locks, vacuum, compaction).
 * Kubernetes scheduling and pod restarts other than scaling events.

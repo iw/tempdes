@@ -3,7 +3,7 @@
 //! State is split into independently borrowed cells so that flows can mutate e.g. a workflow
 //! while recording metrics. Rule: never hold a `RefCell` borrow across an `.await`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::rc::Rc;
 
@@ -52,7 +52,11 @@ pub struct FrontendState {
     pub concurrent_max: HashMap<(usize, Api), i64>,
     /// client-side matching load balancer: outstanding polls per (tq, kind, partition)
     pub poll_lb: HashMap<(usize, TqKind), Vec<u32>>,
+    /// SDK connections to this pod (`round_robin`: one subchannel per client process)
     pub connections: u32,
+    /// `proxy`: when the proxy starts sending traffic to this pod (a pod added by scaling
+    /// waits for registration and health checks)
+    pub ready_at: Time,
 }
 
 pub struct HistoryHostState {
@@ -472,6 +476,7 @@ pub struct WorkerProc {
     pub ordinal: u32,
     pub conn: PodId,
     pub conn_expires: Time,
+    pub rr: RoundRobin,
     pub wft_slots: Semaphore,
     pub act_slots: Semaphore,
     pub cpu: Option<FcfsServers>,
@@ -491,6 +496,22 @@ pub struct WorkerProc {
 pub struct Client {
     pub conn: PodId,
     pub conn_expires: Time,
+    pub rr: RoundRobin,
+}
+
+/// gRPC client-side round robin state of one process (`network.client_lb: round_robin`).
+#[derive(Clone, Debug, Default)]
+pub struct RoundRobin {
+    /// frontend pods from the last DNS resolution, one subchannel (connection) each
+    pub subchannels: Vec<PodId>,
+    /// when each subchannel's connection receives GOAWAY (max connection age ± 10%)
+    pub expires: Vec<Time>,
+    /// picker position
+    pub next: usize,
+    /// a subchannel closed since the last resolution, so the channel wants to re-resolve
+    pub resolve_pending: bool,
+    /// time of the last DNS resolution (None before the first request)
+    pub resolved_at: Option<Time>,
 }
 
 // --- database -----------------------------------------------------------------------------------
@@ -533,6 +554,8 @@ pub struct Sim {
     pub es: RefCell<Vec<EsBulk>>,
     pub m: RefCell<Metrics>,
     pub timer_seq: RefCell<u64>,
+    /// `proxy`: round robin position over the frontend pods
+    pub proxy_next: Cell<usize>,
     pub schedule_buckets: RefCell<HashMap<(usize, PodId), TokenBucket>>,
     pub measuring: RefCell<bool>,
 }

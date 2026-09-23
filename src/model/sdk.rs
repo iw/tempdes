@@ -1,6 +1,7 @@
 //! SDK side: client connections, retry policy, worker processes (pollers, slots, sticky cache),
 //! workflow task processing (the workflow "program" interpreter) and activity execution.
 
+use crate::config::scenario::ClientLb;
 use crate::sim::executor::{Time, now, sleep, spawn};
 use crate::sim::sync::Permit;
 
@@ -20,10 +21,19 @@ pub enum Conn {
     Worker(usize),
 }
 
-/// Current frontend pod for a connection, reconnecting on GOAWAY (max connection age ±10%) or
-/// when the pod is gone. New connections land on a uniformly random live frontend (NLB / kube
-/// Service), so connection imbalance persists until connections age out.
+/// The frontend pod that a request's next attempt goes to, following `network.client_lb`.
 pub fn conn_pod(ctx: &Ctx, conn: Conn) -> PodId {
+    match ctx.p.client_lb {
+        ClientLb::Pinned => pinned_pod(ctx, conn),
+        ClientLb::RoundRobin => round_robin_pod(ctx, conn),
+        ClientLb::Proxy => proxy_pod(ctx),
+    }
+}
+
+/// `pinned`: the process's single connection, reconnecting on GOAWAY (max connection age ±10%)
+/// or when its pod is gone. New connections land on a uniformly random live frontend (NLB /
+/// kube Service), so connection imbalance persists until connections age out.
+fn pinned_pod(ctx: &Ctx, conn: Conn) -> PodId {
     let t = now();
     let (cur, exp) = match conn {
         Conn::Client(i) => {
@@ -41,8 +51,7 @@ pub fn conn_pod(ctx: &Ctx, conn: Conn) -> PodId {
     }
     let live = ctx.live_pods(Service::Frontend);
     let pod = live[ctx.rand_index(live.len())];
-    let age = ctx.p.k.keepalive_max_conn_age as f64 * (0.9 + 0.2 * ctx.rand());
-    let exp = t + age as Time;
+    let exp = t.saturating_add(max_conn_age(ctx));
     {
         let mut pods = ctx.pods.borrow_mut();
         if let Some(fe) = pods.get_mut(cur).and_then(|p| p.fe.as_mut()) {
@@ -65,6 +74,125 @@ pub fn conn_pod(ctx: &Ctx, conn: Conn) -> PodId {
         }
     }
     pod
+}
+
+/// grpc-go's DNS resolver re-resolves at most once per 30 s (`minDNSResRate`).
+const DNS_RERESOLVE_MIN: Time = 30_000_000;
+
+/// Connection lifetime until the server's GOAWAY: `frontend.keepAliveMaxConnectionAge` with
+/// grpc-go's ±10% jitter (0 means connections never age out).
+fn max_conn_age(ctx: &Ctx) -> Time {
+    let age = ctx.p.k.keepalive_max_conn_age;
+    if age == 0 {
+        return Time::MAX;
+    }
+    (age as f64 * (0.9 + 0.2 * ctx.rand())) as Time
+}
+
+/// `round_robin`: gRPC client-side load balancing on a headless Service. The channel holds a
+/// subchannel (connection) to every frontend pod that its last DNS resolution returned, and
+/// rotates requests over the live ones. It re-resolves only when a subchannel closes (GOAWAY
+/// at the max connection age, or its pod going away), and at most every 30 s. Pods added by
+/// scaling therefore get traffic from a process only after its next re-resolution.
+fn round_robin_pod(ctx: &Ctx, conn: Conn) -> PodId {
+    let t = now();
+    let mut rr = match conn {
+        Conn::Client(i) => std::mem::take(&mut ctx.clients.borrow_mut()[i].rr),
+        Conn::Worker(i) => std::mem::take(&mut ctx.workers.borrow_mut()[i].rr),
+    };
+    let pod = rr_pick(ctx, &mut rr, t);
+    match conn {
+        Conn::Client(i) => ctx.clients.borrow_mut()[i].rr = rr,
+        Conn::Worker(i) => ctx.workers.borrow_mut()[i].rr = rr,
+    }
+    pod
+}
+
+fn rr_pick(ctx: &Ctx, rr: &mut RoundRobin, t: Time) -> PodId {
+    let alive = |pod: PodId| ctx.pods.borrow()[pod].alive;
+    match rr.resolved_at {
+        None => rr_resolve(ctx, rr, t),
+        Some(last) => {
+            // a connection that reached its max age got GOAWAY: it reconnects to the same pod,
+            // and the channel asks the resolver for fresh addresses
+            for i in 0..rr.expires.len() {
+                if rr.expires[i] <= t {
+                    rr.resolve_pending = true;
+                    while rr.expires[i] <= t {
+                        rr.expires[i] = rr.expires[i].saturating_add(max_conn_age(ctx));
+                    }
+                }
+            }
+            if rr.subchannels.iter().any(|&p| !alive(p)) {
+                rr.resolve_pending = true;
+            }
+            if rr.resolve_pending && t >= last + DNS_RERESOLVE_MIN {
+                rr_resolve(ctx, rr, t);
+            }
+        }
+    }
+    for _ in 0..rr.subchannels.len() {
+        let pod = rr.subchannels[rr.next];
+        rr.next = (rr.next + 1) % rr.subchannels.len();
+        if alive(pod) {
+            return pod;
+        }
+    }
+    // no live subchannel left: the channel re-resolves straight away
+    rr_resolve(ctx, rr, t);
+    rr.subchannels[rr.next]
+}
+
+/// Resolve the headless Service: every Ready frontend pod. Subchannels to pods that are still
+/// there keep their connections, new pods get new ones, and gone pods are dropped.
+fn rr_resolve(ctx: &Ctx, rr: &mut RoundRobin, t: Time) {
+    let live = ctx.live_pods(Service::Frontend);
+    {
+        let mut pods = ctx.pods.borrow_mut();
+        for &p in rr.subchannels.iter().filter(|p| !live.contains(p)) {
+            if let Some(fe) = pods[p].fe.as_mut() {
+                fe.connections = fe.connections.saturating_sub(1);
+            }
+        }
+        for &p in live.iter().filter(|p| !rr.subchannels.contains(p)) {
+            if let Some(fe) = pods[p].fe.as_mut() {
+                fe.connections += 1;
+            }
+        }
+    }
+    let mut expires = Vec::with_capacity(live.len());
+    for &p in &live {
+        let exp = match rr.subchannels.iter().position(|&q| q == p) {
+            Some(i) => rr.expires[i],
+            None => t.saturating_add(max_conn_age(ctx)),
+        };
+        expires.push(exp);
+    }
+    rr.subchannels = live;
+    rr.expires = expires;
+    // grpc's round_robin picker starts at a random subchannel each time it is rebuilt
+    rr.next = ctx.rand_index(rr.subchannels.len());
+    rr.resolve_pending = false;
+    rr.resolved_at = Some(t);
+}
+
+/// `proxy`: an L7 load balancer (ALB, Envoy, a service mesh) picks a frontend for every
+/// request, round robin over the pods it considers healthy. A pod added by scaling joins after
+/// `network.proxy_discovery`; a removed pod leaves at once.
+fn proxy_pod(ctx: &Ctx) -> PodId {
+    let t = now();
+    let live = ctx.live_pods(Service::Frontend);
+    let ready: Vec<PodId> = {
+        let pods = ctx.pods.borrow();
+        live.iter()
+            .copied()
+            .filter(|&p| pods[p].fe.as_ref().is_none_or(|fe| fe.ready_at <= t))
+            .collect()
+    };
+    let pool = if ready.is_empty() { &live } else { &ready };
+    let i = ctx.proxy_next.get();
+    ctx.proxy_next.set(i.wrapping_add(1));
+    pool[i % pool.len()]
 }
 
 /// SDK retry policy (Go SDK style): transient errors back off from 100ms, ResourceExhausted
@@ -117,6 +245,9 @@ where
         attempt += 1;
         let fe = conn_pod(ctx, conn);
         client_hop(ctx).await;
+        if ctx.p.client_lb == ClientLb::Proxy && ctx.p.proxy_latency > 0 {
+            sleep(ctx.p.proxy_latency).await;
+        }
         let r = frontend::handle(ctx, fe, ns, api, extra_cpu, &body).await;
         client_hop(ctx).await;
         match r {
