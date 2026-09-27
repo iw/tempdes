@@ -48,6 +48,7 @@ $ tempdes run examples/scenarios/hot-entity.yaml
 - [Dimension 1: replica counts](#dimension-1-replica-counts)
 - [Dimension 2: dynamic config](#dimension-2-dynamic-config)
 - [Sweeps: replicas × dynamic config](#sweeps-replicas--dynamic-config)
+- [Watching a run live](#watching-a-run-live)
 - [Feeding in Temporal metrics](#feeding-in-temporal-metrics)
 - [Reading the report](#reading-the-report)
 - [Scenario reference](#scenario-reference)
@@ -75,10 +76,12 @@ git clone https://github.com/iw/tempdes && cd tempdes
 cargo build --release
 ```
 
-The binary is `target/release/tempdes`. It depends only on `serde`, `serde-saphyr` (YAML),
-`serde_json`, `clap` and `anyhow`, and the simulation runs on a single thread per run.
-A 60-second simulation at 150 workflows/s takes one to two seconds. Sweeps run their
-cells in parallel.
+The binary is `target/release/tempdes`. The simulator itself depends only on `serde`,
+`serde-saphyr` (YAML), `serde_json`, `clap` and `anyhow`; the live view (`tempdes ui`) adds
+the [Topcoat](https://github.com/tokio-rs/topcoat) web framework and tokio behind the default
+`ui` feature (`--no-default-features` builds the lean command-line tool). The simulation runs
+on a single thread per run. A 60-second simulation at 150 workflows/s takes one to two
+seconds. Sweeps run their cells in parallel.
 
 ## Quick tour
 
@@ -97,6 +100,9 @@ tempdes sweep examples/scenarios/frontend-lb.yaml --rows frontend=3,4 \
 tempdes sweep examples/scenarios/baseline.yaml --load 1.3 \
     --rows matching=3,4,6 --cols matching.rps=1200,2400 --html out/sweep.html
 
+# watch a run live in the browser, changing load, replicas and dynamic config as it runs
+tempdes ui examples/scenarios/baseline.yaml --open
+
 # calibrate against production metrics, then compare predictions with observations
 tempdes run examples/scenarios/baseline.yaml -o examples/metrics/observed.yaml
 
@@ -113,7 +119,8 @@ tempdes metrics show examples/metrics/observed.yaml
 
 `run` also writes `--json` (the full result), `--prom` (simulated metrics in Prometheus text
 format with Temporal metric names) and `--html` (a self-contained report with time-series charts
-and a shard map). `-v` prints per-pod, per-shard and per-partition tables.
+and a shard map). `-v` prints per-pod, per-shard and per-partition tables. `ui` takes the same
+scenario and overrides and shows the run live in the browser.
 
 ## Dimension 1: replica counts
 
@@ -258,6 +265,27 @@ Each cell is a full simulation with the same seed. The output includes these gri
 
 `--csv` and `--json` write every cell. `--html` writes a heatmap you can switch between metrics,
 with per-cell detail.
+
+## Watching a run live
+
+```bash
+tempdes ui examples/scenarios/baseline.yaml --open
+tempdes ui examples/scenarios/db-bound.yaml --speed 5 -r history=6
+```
+
+`tempdes ui` serves the simulation as it runs, at a chosen multiple of real time (warm-up
+runs at full speed). The page shows the cluster as a figure of the request paths, with CPU per
+pod, the limiter closest to its limit on each service, and the flows between services; two
+rows of stages, one for the request path (clients → frontend → history → persistence) and one
+for the task path (history queues → matching → workers → completion), each with its own
+saturation and the symptoms it causes in the next; three minutes of time series; and the
+report's hotspots, re-ranked every five simulated seconds.
+
+While it runs you can change the load multiplier, the replica count of each service and the
+dynamic config keys Temporal re-reads at runtime. Each change is marked on the charts and the
+timeline, so you can watch, say, `matching.rps` start rejecting polls, the backlog grow, and
+workflow task schedule-to-start latency follow. [docs/UI.md](docs/UI.md) describes the page and
+how it is built with the Topcoat web framework.
 
 ## Feeding in Temporal metrics
 
@@ -591,6 +619,8 @@ Source layout:
 * `src/calibrate.rs` and `src/run.rs`: calibration and single runs.
 * `src/report/`: hotspot rules and the text, JSON, Prometheus and HTML outputs.
 * `src/sweep.rs`: sweeps.
+* `src/ui/`: the live view (`ui` feature): the simulation thread, frames, and the Topcoat
+  pages, routes and client script.
 
 ## Contributing
 

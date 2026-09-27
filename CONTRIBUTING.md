@@ -95,8 +95,9 @@ To support another Temporal release:
 
 ## Dependencies
 
-tempdes depends only on `serde`, `serde_json`, `serde-saphyr`, `clap` and `anyhow`. Please open
-an issue before adding a dependency. `cargo deny check` enforces the license allow-list in
+The simulator depends only on `serde`, `serde_json`, `serde-saphyr`, `clap` and `anyhow`; the
+live view behind the default `ui` feature adds `topcoat`, `tokio` and `futures-util`. Please
+open an issue before adding a dependency. `cargo deny check` enforces the license allow-list in
 `deny.toml`.
 
 ## License

@@ -10,4 +10,6 @@ pub mod report;
 pub mod run;
 pub mod sim;
 pub mod sweep;
+#[cfg(feature = "ui")]
+pub mod ui;
 pub mod util;

@@ -9,6 +9,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`tempdes ui`.** A live view of a running simulation, served by the Topcoat web framework.
+  The page shows the cluster's request paths with CPU per pod, limiter headroom and the flows
+  between services; the request and task paths stage by stage, each with its saturation and
+  the symptoms it causes downstream; time series; and the report's hotspots re-ranked every
+  five simulated seconds. The load multiplier, replica counts and runtime dynamic config keys
+  can be changed while it runs. The simulator gained the hooks this needs: stepping a built
+  cluster in slices, a live load multiplier, interval histograms and a windowed analysis.
+  The `ui` feature is on by default; `--no-default-features` builds the lean CLI.
 - **Simulation kernel.** A deterministic discrete-event model of Temporal Server 1.31.0 on EKS
   covering:
   - the frontend, history, matching and worker services;

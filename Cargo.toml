@@ -13,12 +13,21 @@ categories = ["simulation", "command-line-utilities", "development-tools"]
 default-run = "tempdes"
 exclude = ["/.github", "/out"]
 
+[features]
+default = ["ui"]
+# `tempdes ui`: the live visualisation served by the Topcoat web framework. Disable it for a
+# lean, dependency-light CLI build (`--no-default-features`).
+ui = ["dep:topcoat", "dep:tokio", "dep:futures-util"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "1.3"
 serde_json = "1"
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1"
+topcoat = { version = "0.9.0", default-features = false, features = ["router", "serve", "view", "font-fontsource", "sse"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"], optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

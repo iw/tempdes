@@ -19,10 +19,16 @@ use super::world::*;
 /// Current start rate per workflow type (events may change it).
 pub struct Rates {
     pub start: Vec<f64>,
+    /// Live multiplier on every start and signal rate, changed between steps by `tempdes ui`.
+    /// Always 1.0 in a CLI run.
+    pub scale: f64,
 }
 
 fn rate_at(ctx: &Ctx, rates: &Rc<RefCell<Rates>>, t: usize) -> f64 {
-    let base = rates.borrow().start[t];
+    let base = {
+        let r = rates.borrow();
+        r.start[t] * r.scale
+    };
     match ctx.p.wf_types[t].ramp {
         Some((from, over)) if over > 0 && now() < over => {
             base * (from + (1.0 - from) * now() as f64 / over as f64)
@@ -222,18 +228,24 @@ pub async fn start_entities(ctx: Ctx, client: usize) {
     }
 }
 
-pub fn start_signalers(ctx: &Ctx, client_base: usize) {
+pub fn start_signalers(ctx: &Ctx, rates: &Rc<RefCell<Rates>>, client_base: usize) {
     for (si, s) in ctx.p.signals.iter().enumerate() {
         if s.rate <= 0.0 {
             continue;
         }
         let c = ctx.clone();
         let s = s.clone();
+        let rates = rates.clone();
         spawn(async move {
             // hot entities are started at t=0; give them a moment
             sleep(500_000).await;
             loop {
-                let gap = c.rng.borrow_mut().exp(1e6 / s.rate);
+                let rate = s.rate * rates.borrow().scale;
+                if rate <= 0.0 {
+                    sleep(1_000_000).await;
+                    continue;
+                }
+                let gap = c.rng.borrow_mut().exp(1e6 / rate);
                 sleep(gap.max(1.0) as Time).await;
                 let target = {
                     let wfs = c.wfs.borrow();
