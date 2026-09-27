@@ -30,9 +30,12 @@ pub fn format_value(v: Option<&Value>, f: &str) -> String {
         return v
             .and_then(Value::as_str)
             .map(|s| {
-                // `key`: a dynamic config key without its service prefix, for narrow labels
+                // `key`: a dynamic config key without its service prefix and with `namespace`
+                // shortened to `ns`, for the narrow labels of the cluster figure
                 if f == "key" {
-                    s.split_once('.').map_or(s, |(_, rest)| rest).to_string()
+                    s.split_once('.')
+                        .map_or(s, |(_, rest)| rest)
+                        .replace("namespace", "ns")
                 } else {
                     s.to_string()
                 }
@@ -662,7 +665,7 @@ async fn service_node(
             }
             // the limiter closest to its limit on the busiest pod
             <text x=(n(r.x + 12.0)) y=(n(r.y + r.h - 34.0)) class="nlabel mono" data-bind=(format!("services.{si}.limit.name|key")) data-empty="no limiter">
-                (if limit_name.is_empty() { "no limiter".to_string() } else { limit_name.split_once('.').map_or(limit_name.as_str(), |(_, rest)| rest).to_string() })
+                (if limit_name.is_empty() { "no limiter".to_string() } else { format_value(Some(&Value::from(limit_name.as_str())), "key") })
             </text>
             <text x=(n(r.x + r.w - 12.0)) y=(n(r.y + r.h - 34.0)) text-anchor="end" class="nvalue" data-bind=(format!("{limit_path}|pct"))>
                 (fmt_at(v, &limit_path, "pct"))
@@ -1316,10 +1319,8 @@ mod tests {
             fmt_at(&v, "services.0.limit.name", "text"),
             "frontend.namespaceRPS[orders]"
         );
-        assert_eq!(
-            fmt_at(&v, "services.0.limit.name", "key"),
-            "namespaceRPS[orders]"
-        );
+        assert_eq!(fmt_at(&v, "services.0.limit.name", "key"), "nsRPS[orders]");
+        assert_eq!(format_value(Some(&json!("history.rps")), "key"), "rps");
         assert_eq!(fmt_at(&v, "latency.start.p99_ms", "ms"), "12.3ms");
         assert_eq!(fmt_at(&v, "t", "secs"), "42.2 s");
         assert_eq!(fmt_at(&v, "speed", "speed"), "max");

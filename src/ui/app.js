@@ -26,7 +26,7 @@
     num: x => x.toFixed(1),
     speed: x => x <= 0 ? 'max' : x.toFixed(1) + '×',
     text: x => String(x),
-    key: x => { const s = String(x); const i = s.indexOf('.'); return i < 0 ? s : s.slice(i + 1); },
+    key: x => { const s = String(x); const i = s.indexOf('.'); return (i < 0 ? s : s.slice(i + 1)).replace(/namespace/g, 'ns'); },
   };
   const heat = u => u < 0.05 ? 0 : u < 0.30 ? 1 : u < 0.55 ? 2 : u < 0.75 ? 3 : u < 0.90 ? 4 : 5;
   const clamp01 = v => Math.max(0, Math.min(1, Number(v) || 0));
