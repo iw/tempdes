@@ -302,14 +302,16 @@ async fn masthead(d: &PageData) -> Result<impl View> {
 #[component]
 async fn controls(d: &PageData) -> Result<impl View> {
     let f = &*d.frame;
-    let speeds: [(f64, &str); 6] = [
-        (0.5, "0.5×"),
-        (1.0, "1×"),
-        (2.0, "2×"),
-        (5.0, "5×"),
-        (10.0, "10×"),
-        (0.0, "max"),
-    ];
+    // the presets, plus the speed given on the command line when it is not one of them
+    let mut speeds: Vec<(f64, String)> = [0.5, 1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|x| (x, format!("{}×", n(x))))
+        .collect();
+    if f.speed > 0.0 && !speeds.iter().any(|(x, _)| (*x - f.speed).abs() < 1e-9) {
+        speeds.push((f.speed, format!("{}×", n(f.speed))));
+        speeds.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+    speeds.push((0.0, "max".to_string()));
     Ok(view! {
         <section class="controls" aria-label="controls">
             <div class="ctl">
@@ -397,27 +399,27 @@ const WORKERSVC: Rect = Rect {
     h: 140.0,
 };
 const FRONTEND: Rect = Rect {
-    x: 270.0,
+    x: 300.0,
     y: 150.0,
-    w: 200.0,
+    w: 190.0,
     h: 200.0,
 };
 const HISTORY: Rect = Rect {
-    x: 550.0,
+    x: 580.0,
     y: 40.0,
-    w: 200.0,
+    w: 190.0,
     h: 236.0,
 };
 const MATCHING: Rect = Rect {
-    x: 550.0,
+    x: 580.0,
     y: 316.0,
-    w: 200.0,
+    w: 190.0,
     h: 220.0,
 };
 const DB: Rect = Rect {
-    x: 830.0,
+    x: 850.0,
     y: 150.0,
-    w: 160.0,
+    w: 150.0,
     h: 230.0,
 };
 
@@ -485,12 +487,16 @@ async fn edge(
         )
     };
     let (mx, my) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
+    // keep a label of up to 16 mono characters inside the gap between the two nodes
+    let half = 16.0 * 6.6 / 2.0;
+    let (lo, hi) = (x1.min(x2) + half + 4.0, x1.max(x2) - half - 4.0);
+    let cx = if lo <= hi { mx.clamp(lo, hi) } else { mx };
     let (lx, ly) = if vertical {
         (mx + 8.0 * side, my + 4.0)
     } else if side > 0.0 {
-        (mx, my + 17.0)
+        (cx, my + 17.0)
     } else {
-        (mx, my - 9.0)
+        (cx, my - 9.0)
     };
     let per_s = format!("flows.{i}.per_s");
     let rej = format!("flows.{i}.rejected_per_s");
