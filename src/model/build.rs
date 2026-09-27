@@ -406,15 +406,32 @@ pub fn build(p: Params) -> (Ctx, Executor) {
     (ctx, ex)
 }
 
-/// Run a built simulation to completion (warm-up + duration). Returns the executor stats.
+/// Executor statistics of a finished (or, for a live view, ongoing) run.
 pub struct RunInfo {
     pub polls: u64,
     pub end: Time,
     pub wall_ms: u128,
 }
 
+/// Run a built simulation to completion (warm-up + duration). Returns the executor stats.
 pub fn run(ctx: &Ctx, mut ex: Executor) -> RunInfo {
     let wall = std::time::Instant::now();
+    let _rates = start(ctx, &mut ex);
+    let end = ctx.p.warmup + ctx.p.duration;
+    let t = ex.run_until(end);
+    RunInfo {
+        polls: ex.polls(),
+        end: t,
+        wall_ms: wall.elapsed().as_millis(),
+    }
+}
+
+/// Spawn everything that drives a built cluster (SDK workers and clients, workload generators,
+/// the sampler, the warm-up reset and the timeline events) on `ex` without running it. The
+/// caller then advances the executor, all at once (`run`) or in slices (`tempdes ui`). The
+/// returned rates are read by the generators on every arrival, so a caller stepping the
+/// executor can change the load between steps.
+pub fn start(ctx: &Ctx, ex: &mut Executor) -> Rc<RefCell<Rates>> {
     let p = &ctx.p;
     // client index layout
     let mut client_base = Vec::new();
@@ -431,6 +448,7 @@ pub fn run(ctx: &Ctx, mut ex: Executor) -> RunInfo {
     let system_client = misc_base + 4;
     let rates = Rc::new(RefCell::new(Rates {
         start: p.wf_types.iter().map(|t| t.start_rate).collect(),
+        scale: 1.0,
     }));
 
     {
@@ -451,7 +469,7 @@ pub fn run(ctx: &Ctx, mut ex: Executor) -> RunInfo {
             spawn(workload::start_entities(c.clone(), system_client));
             spawn(workload::start_schedules(c.clone(), system_client));
             workload::start_generators(&c, &rates, &client_base);
-            workload::start_signalers(&c, signal_base);
+            workload::start_signalers(&c, &rates, signal_base);
             workload::start_queries(&c, misc_base, 4);
             workload::start_visibility(&c, misc_base, 4);
             workload::start_sampler(&c, 5_000_000);
@@ -459,13 +477,7 @@ pub fn run(ctx: &Ctx, mut ex: Executor) -> RunInfo {
             schedule_events(&c, &rates);
         });
     }
-    let end = p.warmup + p.duration;
-    let t = ex.run_until(end);
-    RunInfo {
-        polls: ex.polls(),
-        end: t,
-        wall_ms: wall.elapsed().as_millis(),
-    }
+    rates
 }
 
 fn schedule_events(ctx: &Ctx, rates: &Rc<RefCell<Rates>>) {
@@ -514,8 +526,8 @@ async fn apply_event(ctx: &Ctx, i: usize, rates: &Rc<RefCell<Rates>>) {
 }
 
 /// Apply a dynamic config change at runtime for the limiter / capacity knobs that Temporal
-/// reads dynamically.
-fn apply_dc(ctx: &Ctx, key: &str, v: &crate::config::dynamic::DcValue) {
+/// reads dynamically. Returns whether the simulator applied it.
+pub fn apply_dc(ctx: &Ctx, key: &str, v: &crate::config::dynamic::DcValue) -> bool {
     use crate::config::dynamic::DcValue;
     let num = match v {
         DcValue::Int(i) => *i as f64,
@@ -524,7 +536,7 @@ fn apply_dc(ctx: &Ctx, key: &str, v: &crate::config::dynamic::DcValue) {
             ctx.m.borrow_mut().notes.push(format!(
                 "dynamic config {key}: non-numeric runtime change ignored"
             ));
-            return;
+            return false;
         }
     };
     let k = key.to_ascii_lowercase();
@@ -615,10 +627,11 @@ fn apply_dc(ctx: &Ctx, key: &str, v: &crate::config::dynamic::DcValue) {
     } else {
         format!("  dynamic config {key} -> {v}: not applied at runtime by the simulator")
     });
+    applied
 }
 
 /// Change a service's replica count: create/remove pods, rebuild the ring and move ownership.
-async fn scale(ctx: &Ctx, svc: Service, target: usize) {
+pub async fn scale(ctx: &Ctx, svc: Service, target: usize) {
     let current = ctx.live_pods(svc);
     if target == current.len() || target == 0 {
         return;

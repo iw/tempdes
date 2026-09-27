@@ -291,6 +291,14 @@ impl Semaphore {
         st.stats_start = now();
     }
 
+    /// Permit-microseconds held since the statistics window started: a cheap monotonic
+    /// counter for interval sampling (`tempdes ui`), without computing quantiles.
+    pub fn busy_us(&self) -> f64 {
+        let mut st = self.st.borrow_mut();
+        st.account();
+        st.busy_area
+    }
+
     pub fn stats(&self) -> SemStats {
         let mut st = self.st.borrow_mut();
         st.account();

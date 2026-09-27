@@ -358,8 +358,20 @@ fn quantile_of(v: &mut [f64], q: f64) -> f64 {
 }
 
 pub fn analyze(ctx: &Ctx, info: &RunInfo, obs: Option<&Observations>) -> RunResult {
+    analyze_window(ctx, info, obs, ctx.p.duration as f64 / 1e6)
+}
+
+/// [`analyze`] with rates computed over `measured_s` seconds of measurement rather than the
+/// scenario's full duration: the live view calls this part-way through a run, with the time
+/// elapsed since the warm-up reset.
+pub fn analyze_window(
+    ctx: &Ctx,
+    info: &RunInfo,
+    obs: Option<&Observations>,
+    measured_s: f64,
+) -> RunResult {
     let p = &ctx.p;
-    let dur = (p.duration as f64 / 1e6).max(1e-9);
+    let dur = measured_s.max(1e-9);
     let m = ctx.m.borrow();
 
     // --- workflows -------------------------------------------------------------------------

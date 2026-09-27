@@ -37,6 +37,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MetricsCmd,
     },
+    /// Simulate one configuration and watch it live in the browser: load, replica counts and
+    /// dynamic config can be changed while it runs.
+    #[cfg(feature = "ui")]
+    Ui(UiArgs),
 }
 
 #[derive(Args, Clone)]
@@ -113,6 +117,26 @@ struct SweepArgs {
     /// Write an HTML heatmap report.
     #[arg(long)]
     html: Option<PathBuf>,
+}
+
+#[cfg(feature = "ui")]
+#[derive(Args)]
+struct UiArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// Address to listen on.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    /// Port to listen on (0 picks a free one).
+    #[arg(long, default_value_t = 3000)]
+    port: u16,
+    /// Simulated seconds per wall-clock second after warm-up (0 runs as fast as possible).
+    /// Warm-up always runs as fast as possible.
+    #[arg(long, default_value_t = 1.0)]
+    speed: f64,
+    /// Open the page in the default browser.
+    #[arg(long)]
+    open: bool,
 }
 
 #[derive(Subcommand)]
@@ -217,7 +241,38 @@ pub fn main() -> anyhow::Result<ExitCode> {
             MetricsCmd::Template => crate::metrics::cmd::Cmd::Template,
             MetricsCmd::Show { file } => crate::metrics::cmd::Cmd::Show { file },
         }),
+        #[cfg(feature = "ui")]
+        Cmd::Ui(a) => cmd_ui(a),
     }
+}
+
+#[cfg(feature = "ui")]
+fn cmd_ui(a: UiArgs) -> anyhow::Result<ExitCode> {
+    let sc = Scenario::load(&a.common.scenario)?;
+    let ov = parse_overrides(&a.common)?;
+    let obs = run::load_observations(&sc, &a.common.observed)?;
+    let cal = match obs {
+        Some(o) => {
+            eprintln!("calibrating against observed metrics…");
+            Some(run::calibrate(&sc, &ov, o)?)
+        }
+        None => None,
+    };
+    let params = run::prepare(&sc, &ov, cal.as_ref())?;
+    anyhow::ensure!(
+        a.speed.is_finite() && a.speed >= 0.0,
+        "--speed must be 0 (unlimited) or a positive number"
+    );
+    crate::ui::serve(
+        params,
+        &crate::ui::UiOptions {
+            host: a.host,
+            port: a.port,
+            speed: a.speed,
+            open: a.open,
+        },
+    )?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_dc(cmd: DcCmd) -> crate::dccmd::Cmd {

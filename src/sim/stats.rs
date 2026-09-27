@@ -104,6 +104,27 @@ impl Histogram {
         self.max
     }
 
+    /// The records added since `prev`, an earlier snapshot of this histogram: the
+    /// distribution over the interval between the two snapshots. Bucket counts subtract;
+    /// the observed bounds stay those of `self`, which only clamp the quantiles. If the
+    /// histogram was reset in between (fewer records than `prev`), `self` is returned as is.
+    pub fn since(&self, prev: &Histogram) -> Histogram {
+        if prev.count == 0 || self.count < prev.count {
+            return self.clone();
+        }
+        let mut counts = self.counts.clone();
+        for (a, b) in counts.iter_mut().zip(prev.counts.iter()) {
+            *a = a.saturating_sub(*b);
+        }
+        Histogram {
+            counts,
+            count: self.count - prev.count,
+            sum: (self.sum - prev.sum).max(0.0),
+            min: self.min,
+            max: self.max,
+        }
+    }
+
     pub fn merge(&mut self, other: &Histogram) {
         if other.count == 0 {
             return;
@@ -255,5 +276,28 @@ mod tests {
         let c = h.cumulative_at(&[100, 1_000, 20_000]);
         assert!((c[0] as i64 - 100).abs() <= 8, "{c:?}");
         assert_eq!(c[2], 10_000);
+    }
+
+    #[test]
+    fn since_isolates_the_interval() {
+        let mut h = Histogram::default();
+        for v in 1..=1_000u64 {
+            h.record(v);
+        }
+        let snapshot = h.clone();
+        for v in 5_000..=6_000u64 {
+            h.record(v);
+        }
+        let d = h.since(&snapshot);
+        assert_eq!(d.count(), 1_001);
+        let p50 = d.quantile(0.5) as f64;
+        assert!((p50 - 5_500.0).abs() / 5_500.0 < 0.07, "{p50}");
+        assert!((d.mean() - 5_500.0).abs() < 1.0, "{}", d.mean());
+        // a reset histogram (fewer records than the snapshot) is returned whole
+        let mut fresh = Histogram::default();
+        fresh.record(7);
+        assert_eq!(fresh.since(&snapshot).count(), 1);
+        // an empty snapshot is a no-op
+        assert_eq!(h.since(&Histogram::default()).count(), h.count());
     }
 }
