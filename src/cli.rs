@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::dynamic::{Constraints, DcValue};
-use crate::config::scenario::Scenario;
+use crate::profile::{self, RunOptions, RunSpec};
 use crate::run::{self, Overrides};
 
 #[derive(Parser)]
@@ -41,12 +41,21 @@ enum Cmd {
     /// dynamic config can be changed while it runs.
     #[cfg(feature = "ui")]
     Ui(UiArgs),
+    /// Save runs as named profiles, kept private outside any repository, and manage them.
+    Profile {
+        #[command(subcommand)]
+        cmd: ProfileCmd,
+    },
 }
 
 #[derive(Args, Clone)]
 pub struct CommonArgs {
     /// Scenario file (YAML).
-    scenario: PathBuf,
+    #[arg(required_unless_present = "profile", conflicts_with = "profile")]
+    scenario: Option<PathBuf>,
+    /// Run a saved profile (`tempdes profile list`); the options given here apply on top.
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
     /// Override replica counts: `history=6` (repeatable).
     #[arg(long = "replicas", short = 'r', value_name = "SERVICE=N")]
     replicas: Vec<String>,
@@ -140,6 +149,37 @@ struct UiArgs {
 }
 
 #[derive(Subcommand)]
+enum ProfileCmd {
+    /// Save a scenario and run options under a name, e.g.
+    /// `tempdes profile save prod cluster.yaml -r history=4 -o observed.yaml`.
+    /// With `--profile BASE` instead of a scenario, the new profile starts from BASE.
+    Save(Box<SaveArgs>),
+    /// List the saved profiles.
+    List,
+    /// Show a profile's options and files.
+    Show { name: String },
+    /// Delete a profile.
+    #[command(alias = "rm")]
+    Remove { name: String },
+    /// Print where profiles are stored.
+    Dir,
+}
+
+#[derive(Args)]
+struct SaveArgs {
+    /// Profile name: letters, digits, '-', '_' and '.'.
+    name: String,
+    #[command(flatten)]
+    common: CommonArgs,
+    /// One line describing the profile.
+    #[arg(long)]
+    description: Option<String>,
+    /// Replace an existing profile with the same name.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Subcommand)]
 enum DcCmd {
     /// List the dynamic config keys the simulator models (with 1.31.0 defaults).
     Modeled,
@@ -166,25 +206,37 @@ enum MetricsCmd {
 }
 
 pub fn parse_overrides(c: &CommonArgs) -> anyhow::Result<Overrides> {
-    let mut ov = Overrides {
-        duration_s: c.duration,
-        warmup_s: c.warmup,
-        seed: c.seed,
-        start_rate_scale: c.load,
+    options(c).overrides()
+}
+
+/// The run options given on the command line.
+fn options(c: &CommonArgs) -> RunOptions {
+    RunOptions {
+        observed: c.observed.iter().map(PathBuf::from).collect(),
+        replicas: c.replicas.clone(),
+        dc: c.dc.clone(),
+        load: c.load,
         client_lb: c.client_lb,
-        ..Default::default()
+        duration: c.duration,
+        warmup: c.warmup,
+        seed: c.seed,
+    }
+}
+
+/// The scenario and options of a run: `--profile` (with the command line's options applied on
+/// top) or the scenario file given.
+pub fn run_spec(c: &CommonArgs) -> anyhow::Result<RunSpec> {
+    let mut spec = match (&c.profile, &c.scenario) {
+        (Some(name), _) => {
+            let entry = profile::Store::open()?.load(name)?;
+            eprintln!("using profile {name} ({})", entry.path.display());
+            entry.spec
+        }
+        (None, Some(path)) => RunSpec::for_scenario(path),
+        (None, None) => anyhow::bail!("give a scenario file or --profile NAME"),
     };
-    for r in &c.replicas {
-        let (s, n) = r
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("--replicas expects SERVICE=N, got {r:?}"))?;
-        ov.replicas
-            .push((s.trim().to_ascii_lowercase(), n.trim().parse()?));
-    }
-    for d in &c.dc {
-        ov.dc.push(parse_dc_override(d)?);
-    }
-    Ok(ov)
+    spec.options.layer(&options(c));
+    Ok(spec)
 }
 
 /// `key=value` or `key[namespace=x,taskQueueName=y,taskType=Activity]=value`
@@ -224,17 +276,21 @@ pub fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Run(a) => cmd_run(a),
-        Cmd::Sweep(a) => crate::sweep::cmd_sweep(
-            &a.common.scenario,
-            parse_overrides(&a.common)?,
-            &a.common.observed,
-            &a.rows,
-            &a.cols,
-            a.jobs,
-            a.json.as_deref(),
-            a.csv.as_deref(),
-            a.html.as_deref(),
-        ),
+        Cmd::Sweep(a) => {
+            let spec = run_spec(&a.common)?;
+            crate::sweep::cmd_sweep(
+                spec.load_scenario()?,
+                spec.options.overrides()?,
+                &spec.options.observed_args(),
+                &a.rows,
+                &a.cols,
+                a.jobs,
+                a.json.as_deref(),
+                a.csv.as_deref(),
+                a.html.as_deref(),
+            )
+        }
+        Cmd::Profile { cmd } => cmd_profile(cmd),
         Cmd::Dc { cmd } => crate::dccmd::run(cmd_dc(cmd)),
         Cmd::Metrics { cmd } => crate::metrics::cmd::run(match cmd {
             MetricsCmd::Queries { window } => crate::metrics::cmd::Cmd::Queries { window },
@@ -248,9 +304,10 @@ pub fn main() -> anyhow::Result<ExitCode> {
 
 #[cfg(feature = "ui")]
 fn cmd_ui(a: UiArgs) -> anyhow::Result<ExitCode> {
-    let sc = Scenario::load(&a.common.scenario)?;
-    let ov = parse_overrides(&a.common)?;
-    let obs = run::load_observations(&sc, &a.common.observed)?;
+    let spec = run_spec(&a.common)?;
+    let sc = spec.load_scenario()?;
+    let ov = spec.options.overrides()?;
+    let obs = run::load_observations(&sc, &spec.options.observed_args())?;
     let cal = match obs {
         Some(o) => {
             eprintln!("calibrating against observed metrics…");
@@ -285,9 +342,10 @@ fn cmd_dc(cmd: DcCmd) -> crate::dccmd::Cmd {
 }
 
 fn cmd_run(a: RunArgs) -> anyhow::Result<ExitCode> {
-    let sc = Scenario::load(&a.common.scenario)?;
-    let ov = parse_overrides(&a.common)?;
-    let obs = run::load_observations(&sc, &a.common.observed)?;
+    let spec = run_spec(&a.common)?;
+    let sc = spec.load_scenario()?;
+    let ov = spec.options.overrides()?;
+    let obs = run::load_observations(&sc, &spec.options.observed_args())?;
     let cal = match obs.clone() {
         Some(o) => {
             eprintln!("calibrating against observed metrics…");
@@ -327,4 +385,130 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn cmd_profile(cmd: ProfileCmd) -> anyhow::Result<ExitCode> {
+    let store = profile::Store::open()?;
+    match cmd {
+        ProfileCmd::Save(a) => {
+            let spec = run_spec(&a.common)?;
+            let saved = store.save(&a.name, &spec, a.description, a.force)?;
+            println!("saved profile {} in {}", a.name, saved.dir.display());
+            for f in &saved.copied {
+                println!("  copied  {}", f.display());
+            }
+            for f in &saved.external {
+                println!("  read from its own place on every run: {}", f.display());
+            }
+            if let Some(root) = profile::untracked_in_git(store.dir()) {
+                eprintln!(
+                    "warning: the profile store is inside the git working tree {} and git doesn't ignore it, so `git add -A` would commit your profiles",
+                    root.display()
+                );
+            }
+            for f in saved.copied.iter().chain(&saved.external) {
+                if let Some(root) = profile::untracked_in_git(f) {
+                    eprintln!(
+                        "note: {} is untracked in the git working tree {} and not ignored, so `git add -A` would commit it. The profile has its own copy: if the file is private, delete it, or list it in {}/.git/info/exclude (a local ignore file that is never pushed).",
+                        f.display(),
+                        root.display(),
+                        root.display()
+                    );
+                }
+            }
+            println!("run it with: tempdes run --profile {}", a.name);
+        }
+        ProfileCmd::List => {
+            let profiles = store.list()?;
+            if profiles.is_empty() {
+                println!("no profiles in {}", store.dir().display());
+            }
+            let width = profiles.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+            for (name, entry) in &profiles {
+                let line = match entry {
+                    Ok(e) if e.kind == profile::Kind::Scenario => match e.spec.load_scenario() {
+                        Ok(sc) => format!(
+                            "{name:<width$}  scenario file{}",
+                            sc.name.map(|n| format!(" ({n})")).unwrap_or_default()
+                        ),
+                        Err(err) => format!(
+                            "{name:<width$}  scenario file, doesn't load: {}",
+                            first_line(&err)
+                        ),
+                    },
+                    Ok(e) => {
+                        let mut line = format!("{name:<width$}  {}", e.spec.options.summary());
+                        if let Some(d) = &e.description {
+                            line = format!("{line}  # {d}");
+                        }
+                        line
+                    }
+                    Err(err) => format!("{name:<width$}  doesn't load: {}", first_line(err)),
+                };
+                println!("{}", line.trim_end());
+            }
+        }
+        ProfileCmd::Show { name } => {
+            let entry = store.load(&name)?;
+            let spec = &entry.spec;
+            println!("profile {name}  ({})", entry.path.display());
+            if entry.kind == profile::Kind::Scenario {
+                println!("  kind         scenario file: the scenario is the whole run");
+            }
+            if let Some(d) = &entry.description {
+                println!("  description  {d}");
+            }
+            if entry.kind == profile::Kind::Saved {
+                println!("  scenario     {}", spec.scenario.display());
+                println!(
+                    "  resolves     relative paths against {}",
+                    spec.scenario_dir.display()
+                );
+                for f in &spec.options.observed {
+                    println!("  observed     {}", f.display());
+                }
+                let options = RunOptions {
+                    observed: Vec::new(),
+                    ..spec.options.clone()
+                };
+                let summary = options.summary();
+                println!(
+                    "  options      {}",
+                    if summary.is_empty() {
+                        "(none)"
+                    } else {
+                        &summary
+                    }
+                );
+            }
+            match spec.load_scenario() {
+                Ok(sc) => {
+                    for f in sc.referenced_files() {
+                        let path = sc.resolve_path(&f);
+                        let state = if path.exists() { "" } else { "  (missing)" };
+                        println!("  reads        {}{state}", path.display());
+                    }
+                }
+                Err(err) => println!("  scenario doesn't load: {err:#}"),
+            }
+            if let Some(note) = profile::readable_by_others(&entry.path) {
+                eprintln!("note: {note}");
+            }
+        }
+        ProfileCmd::Remove { name } => {
+            let dir = store.remove(&name)?;
+            println!("removed profile {name} ({})", dir.display());
+        }
+        ProfileCmd::Dir => println!("{}", store.dir().display()),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The first line of an error, for one-line listings.
+fn first_line(err: &anyhow::Error) -> String {
+    err.to_string()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }

@@ -9,6 +9,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Run profiles.** `tempdes profile save NAME SCENARIO [options]` saves a scenario with a run's
+  options under a name. The options are replica counts, dynamic config, observed metrics, load,
+  client load balancing, duration, warm-up and seed. `--profile NAME` repeats the run with
+  `run`, `sweep` or `ui`, and command-line options apply on top. `profile list`, `show`,
+  `remove` and `dir` manage profiles. A scenario file placed in the store as `<name>.yaml` is a
+  profile too. Profiles are kept private:
+  - they live outside any repository, in `~/.config/tempdes/profiles` (`%APPDATA%\tempdes\profiles`
+    on Windows);
+  - they hold their own copies of the scenario and metrics files;
+  - their directories and files are readable only by you;
+  - saving warns about source files that git could commit by accident.
 - **`tempdes ui`.** A live view of a running simulation, served by the Topcoat web framework.
   The page shows the cluster's request paths with CPU per pod, limiter headroom and the flows
   between services; the request and task paths stage by stage, each with its saturation and
