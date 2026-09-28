@@ -287,6 +287,16 @@ timeline, so you can watch, say, `matching.rps` start rejecting polls, the backl
 workflow task schedule-to-start latency follow. [docs/UI.md](docs/UI.md) describes the page and
 how it is built with the Topcoat web framework.
 
+<p align="center">
+  <img src="docs/images/visualisation-1.png" width="780"
+       alt="Sample visualisation of a running simulation">
+</p>
+
+<p align="center">
+  <img src="docs/images/metrics-1.png" width="780"
+       alt="Sample metrics of a running simulation">
+</p>
+
 ## Feeding in Temporal metrics
 
 Observed metrics serve two purposes: **calibration** changes the model's parameters, and
