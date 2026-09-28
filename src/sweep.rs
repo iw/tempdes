@@ -268,7 +268,7 @@ pub struct SweepResult {
 
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_sweep(
-    scenario: &Path,
+    sc: Scenario,
     base: Overrides,
     observed: &[String],
     rows: &[String],
@@ -278,7 +278,6 @@ pub fn cmd_sweep(
     csv: Option<&Path>,
     html: Option<&Path>,
 ) -> anyhow::Result<ExitCode> {
-    let sc = Scenario::load(scenario)?;
     let obs = run::load_observations(&sc, observed)?;
     let cal = match obs.clone() {
         Some(o) => {

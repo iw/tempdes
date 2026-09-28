@@ -187,6 +187,28 @@ struct ObsEntry {
 }
 
 impl Observations {
+    /// Prometheus scrape files a YAML observations file refers to (`prometheus.before` /
+    /// `prometheus.after`), as written, relative to the file's folder unless absolute. Prometheus
+    /// text files refer to nothing.
+    pub fn referenced_files(path: &Path) -> anyhow::Result<Vec<String>> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading observations {}", path.display()))?;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext == "prom" || ext == "txt" || looks_like_exposition(&text) {
+            return Ok(Vec::new());
+        }
+        let f: ObsFile = serde_saphyr::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        Ok(f.prometheus
+            .map(|p| {
+                p.before
+                    .into_iter()
+                    .chain(std::iter::once(p.after))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     pub fn load(path: &Path) -> anyhow::Result<Observations> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading observations {}", path.display()))?;

@@ -6,6 +6,7 @@ pub mod config;
 pub mod dccmd;
 pub mod metrics;
 pub mod model;
+pub mod profile;
 pub mod report;
 pub mod run;
 pub mod sim;

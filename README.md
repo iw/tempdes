@@ -50,6 +50,7 @@ $ tempdes run examples/scenarios/hot-entity.yaml
 - [Sweeps: replicas × dynamic config](#sweeps-replicas--dynamic-config)
 - [Watching a run live](#watching-a-run-live)
 - [Feeding in Temporal metrics](#feeding-in-temporal-metrics)
+- [Saved run profiles](#saved-run-profiles)
 - [Reading the report](#reading-the-report)
 - [Scenario reference](#scenario-reference)
 - [Example scenarios](#example-scenarios)
@@ -105,6 +106,10 @@ tempdes ui examples/scenarios/baseline.yaml --open
 
 # calibrate against production metrics, then compare predictions with observations
 tempdes run examples/scenarios/baseline.yaml -o examples/metrics/observed.yaml
+
+# save a run as a private, named profile and repeat it by name
+tempdes profile save prod my-cluster.yaml -r history=4 -o observed.yaml
+tempdes run --profile prod --load 1.5
 
 # dynamic config tooling
 tempdes dc modeled                       # the 75 simulated keys, with 1.31.0 defaults
@@ -370,6 +375,44 @@ Turn individual calibrations off in the scenario with
 `-o observed.yaml --load 1.5` simulates 1.5× the observed start rate. CPU calibration still comes
 from a pilot run at the observed load. The comparison with observed metrics is skipped, because
 the simulated workload is no longer the observed one.
+
+## Saved run profiles
+
+A profile saves a scenario with the options of a run under a name, so the run can be repeated
+with `--profile NAME` on `run`, `sweep` and `ui`. The saved options are:
+
+* replica counts and dynamic config;
+* observed metrics;
+* load, client load balancing, duration, warm-up and seed.
+
+Options given on the command line apply on top of the profile.
+
+```bash
+tempdes profile save prod my-cluster.yaml -r history=4 --client-lb round_robin -o observed.yaml \
+    --description "production, weekday peak"
+tempdes run --profile prod                  # the saved run
+tempdes run --profile prod --load 1.5       # the saved run at 1.5x load
+tempdes sweep --profile prod --rows history=4,5,6 --cols load=1,1.5
+tempdes profile save prod-6h --profile prod -r history=6     # a new profile based on prod
+tempdes profile list
+tempdes profile show prod
+tempdes profile remove prod-6h
+```
+
+Profiles usually describe a real cluster, so they are kept private and outside any repository:
+
+* **Location.** The store is `~/.config/tempdes/profiles`. `$XDG_CONFIG_HOME/tempdes/profiles`
+  or `$TEMPDES_PROFILES` override it, and `tempdes profile dir` prints it.
+* **Permissions.** Each profile is a directory holding `profile.yaml` and copies of the scenario
+  and the observed-metrics files, including the scrape files they refer to. On Unix, the store's
+  directories are created readable only by you (`0700`), and its files likewise (`0600`).
+* **Standalone copies.** After saving, a profile runs even if the original files are deleted.
+  Files the scenario itself refers to, such as Helm values or dynamic config files, are not
+  copied: they are still read from the scenario's original folder, and `profile show` lists them.
+* **Git warnings.** `profile save` warns when the store is inside a git working tree that doesn't
+  ignore it. It also names any source file that is untracked and not ignored, so it could be
+  committed by accident. For those, delete the file once the profile has its copy, or list it
+  in `.git/info/exclude`, a local ignore file that is never pushed.
 
 ## Reading the report
 

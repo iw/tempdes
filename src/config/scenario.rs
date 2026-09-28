@@ -733,14 +733,19 @@ impl Default for ReportSpec {
 
 impl Scenario {
     pub fn load(path: &Path) -> anyhow::Result<Scenario> {
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        Self::load_with_base(path, base)
+    }
+
+    /// Load `path`, resolving the scenario's own relative paths (Helm values, dynamic config
+    /// files, calibration observations) against `base_dir` rather than the file's folder. A
+    /// saved profile keeps a copy of the scenario away from its original folder.
+    pub fn load_with_base(path: &Path, base_dir: &Path) -> anyhow::Result<Scenario> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading scenario {}", path.display()))?;
         let mut sc: Scenario = serde_saphyr::from_str(&text)
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-        sc.base_dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
+        sc.base_dir = base_dir.to_path_buf();
         if let Some(h) = sc.cluster.helm_values.clone() {
             let hp = sc.resolve_path(&h);
             sc.import_notes = crate::config::helm::apply(&mut sc, &hp)?;
@@ -754,6 +759,17 @@ impl Scenario {
         sc.base_dir = PathBuf::from(".");
         sc.validate()?;
         Ok(sc)
+    }
+
+    /// Files the scenario itself refers to (Helm values, dynamic config files, calibration
+    /// observations), as written in the scenario.
+    pub fn referenced_files(&self) -> Vec<String> {
+        let mut files: Vec<String> = self.cluster.helm_values.iter().cloned().collect();
+        files.extend(self.dynamic_config_files.iter().cloned());
+        if let Some(c) = &self.calibration {
+            files.extend(c.observations.iter().cloned());
+        }
+        files
     }
 
     pub fn resolve_path(&self, p: &str) -> PathBuf {
