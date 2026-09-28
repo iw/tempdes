@@ -468,3 +468,50 @@ fn persistence_limit_utilisation_counts_only_charged_calls() {
         assert!(util < all_calls * 0.9, "{}: {util} vs {all_calls}", p.name);
     }
 }
+
+#[test]
+fn schedule_to_start_counts_from_the_scheduled_time() {
+    // The SDK measures schedule-to-start from the task's scheduled time, so a task that reaches
+    // matching late is late even when matching dispatches it at once. Reading each shard's
+    // transfer queue once a second holds tasks in history for up to a second.
+    let healthy = simulate("baseline.yaml", short());
+    let mut ov = short();
+    ov.dc.push((
+        "history.transferProcessorMaxPollRPS".into(),
+        DcValue::Int(1),
+        Constraints::default(),
+    ));
+    let slow = simulate("baseline.yaml", ov);
+    let (h, s) = (&healthy.workflows[0], &slow.workflows[0]);
+    for (task, healthy_p99, slow_p99) in [
+        (
+            "workflow task",
+            h.wft_schedule_to_start.p99_ms,
+            s.wft_schedule_to_start.p99_ms,
+        ),
+        (
+            "activity",
+            h.activity_schedule_to_start.p99_ms,
+            s.activity_schedule_to_start.p99_ms,
+        ),
+    ] {
+        assert!(
+            healthy_p99 < 200.0,
+            "{task} p99 {healthy_p99} ms when healthy"
+        );
+        assert!(
+            slow_p99 > 500.0,
+            "{task} p99 {slow_p99} ms with a slow hand-off"
+        );
+    }
+    let matching_wait = slow
+        .matching
+        .partitions
+        .iter()
+        .map(|p| p.task_wait.p99_ms)
+        .fold(0.0, f64::max);
+    assert!(
+        matching_wait < 200.0,
+        "matching wait p99 {matching_wait} ms"
+    );
+}

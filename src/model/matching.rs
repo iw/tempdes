@@ -653,11 +653,14 @@ async fn poll_partition(ctx: &Ctx, pid: usize, deadline: Time) -> Res<Option<Pol
                 if let Some(tx) = matched.sync_done {
                     let _ = tx.send(Ok(()));
                 }
-                let wf_type = match &polled {
-                    Polled::Wft(i) => i.wf_type,
-                    Polled::Act(a) => a.wf_type,
+                // As the SDK measures it (internal_task_pollers.go): from the scheduled time in
+                // the poll response, the workflow task's ScheduledTime or the activity's
+                // CurrentAttemptScheduledTime. History's hand-off to matching counts too.
+                let (wf_type, scheduled_at) = match &polled {
+                    Polled::Wft(i) => (i.wf_type, i.scheduled_at),
+                    Polled::Act(a) => (a.wf_type, a.scheduled_at),
                 };
-                let lat = now().saturating_sub(task.created);
+                let lat = now().saturating_sub(scheduled_at);
                 let mut mm = ctx.m.borrow_mut();
                 match &polled {
                     Polled::Wft(_) => mm.wf[wf_type].wft_sched_to_start.record(lat),
