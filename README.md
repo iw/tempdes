@@ -404,8 +404,9 @@ tempdes profile remove prod-6h
 
 Profiles usually describe a real cluster, so they are kept private and outside any repository:
 
-* **Location.** The store is `~/.config/tempdes/profiles`. `$XDG_CONFIG_HOME/tempdes/profiles`
-  or `$TEMPDES_PROFILES` override it, and `tempdes profile dir` prints it.
+* **Location.** The store is `~/.config/tempdes/profiles`, or `%APPDATA%\tempdes\profiles` on
+  Windows. `$XDG_CONFIG_HOME/tempdes/profiles` or `$TEMPDES_PROFILES` override it, and
+  `tempdes profile dir` prints it.
 * **Permissions.** Each profile is a directory holding `profile.yaml` and copies of the scenario
   and the observed-metrics files, including the scrape files they refer to. On Unix, the store's
   directories are created readable only by you (`0700`), and its files likewise (`0600`).

@@ -15,7 +15,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `run`, `sweep` or `ui`, and command-line options apply on top. `profile list`, `show`,
   `remove` and `dir` manage profiles. A scenario file placed in the store as `<name>.yaml` is a
   profile too. Profiles are kept private:
-  - they live outside any repository, in `~/.config/tempdes/profiles`;
+  - they live outside any repository, in `~/.config/tempdes/profiles` (`%APPDATA%\tempdes\profiles`
+    on Windows);
   - they hold their own copies of the scenario and metrics files;
   - their directories and files are readable only by you;
   - saving warns about source files that git could commit by accident.

@@ -16,9 +16,10 @@
 //! whole run.
 //!
 //! The store is `$TEMPDES_PROFILES`, else `$XDG_CONFIG_HOME/tempdes/profiles`, else
-//! `~/.config/tempdes/profiles`. On Unix its directories are created `0700` and its files
-//! `0600`. Files the scenario itself refers to (Helm values, dynamic config files, calibration
-//! observations) are not copied: they still resolve against the scenario's original folder.
+//! `~/.config/tempdes/profiles` (`%APPDATA%\tempdes\profiles` on Windows). On Unix its
+//! directories are created `0700` and its files `0600`. Files the scenario itself refers to
+//! (Helm values, dynamic config files, calibration observations) are not copied: they still
+//! resolve against the scenario's original folder.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -532,8 +533,11 @@ pub fn default_dir(env: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
     if let Some(d) = env("TEMPDES_PROFILES").filter(|d| !d.as_os_str().is_empty()) {
         return Some(d);
     }
+    // Windows sets HOME only in Unix-like shells, so %APPDATA% (its per-user config folder)
+    // comes first there: PowerShell and Git Bash then share one store.
     let config = env("XDG_CONFIG_HOME")
         .filter(|d| d.is_absolute())
+        .or_else(|| env("APPDATA").filter(|d| cfg!(windows) && d.is_absolute()))
         .or_else(|| env("HOME").map(|h| h.join(".config")))?;
     Some(config.join("tempdes").join("profiles"))
 }
@@ -670,26 +674,52 @@ mod tests {
 
     #[test]
     fn default_location() {
-        let env = |vars: &'static [(&'static str, &'static str)]| {
-            move |k: &str| {
-                vars.iter()
-                    .find(|(n, _)| *n == k)
-                    .map(|(_, v)| PathBuf::from(v))
-            }
+        // an absolute path needs a drive on Windows
+        let abs = |p: &str| {
+            PathBuf::from(if cfg!(windows) {
+                format!("C:{p}")
+            } else {
+                p.into()
+            })
+        };
+        let env = |vars: Vec<(&'static str, PathBuf)>| {
+            move |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone())
         };
         assert_eq!(
-            default_dir(env(&[("TEMPDES_PROFILES", "/p"), ("HOME", "/h")])),
-            Some(PathBuf::from("/p"))
+            default_dir(env(vec![
+                ("TEMPDES_PROFILES", abs("/p")),
+                ("HOME", abs("/h"))
+            ])),
+            Some(abs("/p"))
         );
         assert_eq!(
-            default_dir(env(&[("XDG_CONFIG_HOME", "/x"), ("HOME", "/h")])),
-            Some(PathBuf::from("/x/tempdes/profiles"))
+            default_dir(env(vec![
+                ("XDG_CONFIG_HOME", abs("/x")),
+                ("HOME", abs("/h"))
+            ])),
+            Some(abs("/x/tempdes/profiles"))
+        );
+        // a relative XDG_CONFIG_HOME is ignored, as the XDG spec asks
+        assert_eq!(
+            default_dir(env(vec![
+                ("XDG_CONFIG_HOME", "x".into()),
+                ("HOME", abs("/h"))
+            ])),
+            Some(abs("/h/.config/tempdes/profiles"))
         );
         assert_eq!(
-            default_dir(env(&[("HOME", "/h")])),
-            Some(PathBuf::from("/h/.config/tempdes/profiles"))
+            default_dir(env(vec![("HOME", abs("/h"))])),
+            Some(abs("/h/.config/tempdes/profiles"))
         );
-        assert_eq!(default_dir(env(&[])), None);
+        // %APPDATA% counts only on Windows, where it wins over HOME
+        let appdata = default_dir(env(vec![("APPDATA", abs("/a")), ("HOME", abs("/h"))]));
+        let expected = if cfg!(windows) {
+            "/a/tempdes/profiles"
+        } else {
+            "/h/.config/tempdes/profiles"
+        };
+        assert_eq!(appdata, Some(abs(expected)));
+        assert_eq!(default_dir(env(vec![])), None);
     }
 
     #[test]
