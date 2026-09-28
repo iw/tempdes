@@ -387,6 +387,9 @@ with `--profile NAME` on `run`, `sweep` and `ui`. The saved options are:
 
 Options given on the command line apply on top of the profile.
 
+A scenario file placed in the store as `<name>.yaml` is a profile too: `--profile <name>` runs
+it, and `profile save NEW --profile <name> [options]` builds a saved profile on top of it.
+
 ```bash
 tempdes profile save prod my-cluster.yaml -r history=4 --client-lb round_robin -o observed.yaml \
     --description "production, weekday peak"

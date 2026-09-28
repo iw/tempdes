@@ -228,13 +228,9 @@ fn options(c: &CommonArgs) -> RunOptions {
 pub fn run_spec(c: &CommonArgs) -> anyhow::Result<RunSpec> {
     let mut spec = match (&c.profile, &c.scenario) {
         (Some(name), _) => {
-            let store = profile::Store::open()?;
-            let (_, spec) = store.load(name)?;
-            eprintln!(
-                "using profile {name} ({})",
-                store.dir().join(name).display()
-            );
-            spec
+            let entry = profile::Store::open()?.load(name)?;
+            eprintln!("using profile {name} ({})", entry.path.display());
+            entry.spec
         }
         (None, Some(path)) => RunSpec::for_scenario(path),
         (None, None) => anyhow::bail!("give a scenario file or --profile NAME"),
@@ -428,47 +424,75 @@ fn cmd_profile(cmd: ProfileCmd) -> anyhow::Result<ExitCode> {
                 println!("no profiles in {}", store.dir().display());
             }
             let width = profiles.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-            for (name, p) in &profiles {
-                let (_, spec) = store.load(name)?;
-                let mut line = format!("{name:<width$}  {}", spec.options.summary());
-                if let Some(d) = &p.description {
-                    line = format!("{line}  # {d}");
-                }
+            for (name, entry) in &profiles {
+                let line = match entry {
+                    Ok(e) if e.kind == profile::Kind::Scenario => match e.spec.load_scenario() {
+                        Ok(sc) => format!(
+                            "{name:<width$}  scenario file{}",
+                            sc.name.map(|n| format!(" ({n})")).unwrap_or_default()
+                        ),
+                        Err(err) => format!(
+                            "{name:<width$}  scenario file, doesn't load: {}",
+                            first_line(&err)
+                        ),
+                    },
+                    Ok(e) => {
+                        let mut line = format!("{name:<width$}  {}", e.spec.options.summary());
+                        if let Some(d) = &e.description {
+                            line = format!("{line}  # {d}");
+                        }
+                        line
+                    }
+                    Err(err) => format!("{name:<width$}  doesn't load: {}", first_line(err)),
+                };
                 println!("{}", line.trim_end());
             }
         }
         ProfileCmd::Show { name } => {
-            let (p, spec) = store.load(&name)?;
-            println!("profile {name}  ({})", store.dir().join(&name).display());
-            if let Some(d) = &p.description {
+            let entry = store.load(&name)?;
+            let spec = &entry.spec;
+            println!("profile {name}  ({})", entry.path.display());
+            if entry.kind == profile::Kind::Scenario {
+                println!("  kind         scenario file: the scenario is the whole run");
+            }
+            if let Some(d) = &entry.description {
                 println!("  description  {d}");
             }
-            println!("  scenario     {}", spec.scenario.display());
-            println!(
-                "  resolves     relative paths against {}",
-                spec.scenario_dir.display()
-            );
-            for f in &spec.options.observed {
-                println!("  observed     {}", f.display());
-            }
-            let options = RunOptions {
-                observed: Vec::new(),
-                ..spec.options.clone()
-            };
-            let summary = options.summary();
-            println!(
-                "  options      {}",
-                if summary.is_empty() {
-                    "(none)"
-                } else {
-                    &summary
+            if entry.kind == profile::Kind::Saved {
+                println!("  scenario     {}", spec.scenario.display());
+                println!(
+                    "  resolves     relative paths against {}",
+                    spec.scenario_dir.display()
+                );
+                for f in &spec.options.observed {
+                    println!("  observed     {}", f.display());
                 }
-            );
-            let sc = spec.load_scenario()?;
-            for f in sc.referenced_files() {
-                let path = sc.resolve_path(&f);
-                let state = if path.exists() { "" } else { "  (missing)" };
-                println!("  reads        {}{state}", path.display());
+                let options = RunOptions {
+                    observed: Vec::new(),
+                    ..spec.options.clone()
+                };
+                let summary = options.summary();
+                println!(
+                    "  options      {}",
+                    if summary.is_empty() {
+                        "(none)"
+                    } else {
+                        &summary
+                    }
+                );
+            }
+            match spec.load_scenario() {
+                Ok(sc) => {
+                    for f in sc.referenced_files() {
+                        let path = sc.resolve_path(&f);
+                        let state = if path.exists() { "" } else { "  (missing)" };
+                        println!("  reads        {}{state}", path.display());
+                    }
+                }
+                Err(err) => println!("  scenario doesn't load: {err:#}"),
+            }
+            if let Some(note) = profile::readable_by_others(&entry.path) {
+                eprintln!("note: {note}");
             }
         }
         ProfileCmd::Remove { name } => {
@@ -478,4 +502,13 @@ fn cmd_profile(cmd: ProfileCmd) -> anyhow::Result<ExitCode> {
         ProfileCmd::Dir => println!("{}", store.dir().display()),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The first line of an error, for one-line listings.
+fn first_line(err: &anyhow::Error) -> String {
+    err.to_string()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }

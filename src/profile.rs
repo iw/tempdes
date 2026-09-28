@@ -12,6 +12,9 @@
 //!   observed/1/…         copies of the observed-metrics files (and their scrape files)
 //! ```
 //!
+//! A scenario file placed in the store as `<name>.yaml` is a profile too: the scenario is the
+//! whole run.
+//!
 //! The store is `$TEMPDES_PROFILES`, else `$XDG_CONFIG_HOME/tempdes/profiles`, else
 //! `~/.config/tempdes/profiles`. On Unix its directories are created `0700` and its files
 //! `0600`. Files the scenario itself refers to (Helm values, dynamic config files, calibration
@@ -231,6 +234,26 @@ pub struct Saved {
     pub external: Vec<PathBuf>,
 }
 
+/// How a profile is kept in the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A directory written by `tempdes profile save`: the options, plus copies of the files.
+    Saved,
+    /// A scenario file placed in the store as `<name>.yaml`: the scenario is the whole run.
+    Scenario,
+}
+
+/// A profile found in the store.
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub name: String,
+    pub kind: Kind,
+    /// The profile's directory (saved) or file (scenario).
+    pub path: PathBuf,
+    pub description: Option<String>,
+    pub spec: RunSpec,
+}
+
 /// The profile store: a directory of profiles.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -262,50 +285,104 @@ impl Store {
         Ok(self.dir.join(name))
     }
 
-    /// Load profile `name` as a run.
-    pub fn load(&self, name: &str) -> anyhow::Result<(Profile, RunSpec)> {
+    /// Where profile `name` is kept, if it exists.
+    fn locate(&self, name: &str) -> anyhow::Result<Option<(Kind, PathBuf)>> {
         let dir = self.profile_dir(name)?;
-        let file = dir.join(PROFILE_FILE);
-        if !file.is_file() {
+        let saved = dir.join(PROFILE_FILE).is_file();
+        let file = ["yaml", "yml"]
+            .iter()
+            .map(|ext| self.dir.join(format!("{name}.{ext}")))
+            .find(|p| p.is_file());
+        match (saved, file) {
+            (true, Some(f)) => bail!(
+                "both {} and {} define profile {name:?}; remove one of them",
+                dir.display(),
+                f.display()
+            ),
+            (true, None) => Ok(Some((Kind::Saved, dir))),
+            (false, Some(f)) => Ok(Some((Kind::Scenario, f))),
+            (false, None) => Ok(None),
+        }
+    }
+
+    /// Load profile `name` as a run.
+    pub fn load(&self, name: &str) -> anyhow::Result<Entry> {
+        let Some((kind, path)) = self.locate(name)? else {
             bail!(
                 "no profile {name:?} in {} (see `tempdes profile list`)",
                 self.dir.display()
             );
-        }
-        let text = std::fs::read_to_string(&file)
-            .with_context(|| format!("reading {}", file.display()))?;
-        let profile: Profile = serde_saphyr::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
-        let spec = RunSpec {
-            scenario: dir.join(&profile.scenario),
-            scenario_dir: profile.scenario_dir.clone(),
-            options: profile.options(&dir),
-            profile: Some(name.to_string()),
         };
-        Ok((profile, spec))
+        match kind {
+            Kind::Scenario => Ok(Entry {
+                name: name.to_string(),
+                kind,
+                description: None,
+                spec: RunSpec {
+                    scenario: path.clone(),
+                    scenario_dir: self.dir.clone(),
+                    options: RunOptions::default(),
+                    profile: Some(name.to_string()),
+                },
+                path,
+            }),
+            Kind::Saved => {
+                let file = path.join(PROFILE_FILE);
+                let text = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let profile: Profile = serde_saphyr::from_str(&text)
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+                Ok(Entry {
+                    name: name.to_string(),
+                    kind,
+                    description: profile.description.clone(),
+                    spec: RunSpec {
+                        scenario: path.join(&profile.scenario),
+                        scenario_dir: profile.scenario_dir.clone(),
+                        options: profile.options(&path),
+                        profile: Some(name.to_string()),
+                    },
+                    path,
+                })
+            }
+        }
     }
 
-    /// Profile names with their profiles, sorted by name. Directories that don't hold a
-    /// readable profile are skipped.
-    pub fn list(&self) -> anyhow::Result<Vec<(String, Profile)>> {
+    /// Every profile in the store, sorted by name, with the error for any that doesn't load.
+    pub fn list(&self) -> anyhow::Result<Vec<(String, anyhow::Result<Entry>)>> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", self.dir.display())),
         };
-        let mut out = Vec::new();
+        let mut names = std::collections::BTreeSet::new();
         for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if check_name(&name).is_err() || !entry.path().join(PROFILE_FILE).is_file() {
-                continue;
-            }
-            if let Ok((profile, _)) = self.load(&name) {
-                out.push((name, profile));
+            let path = entry?.path();
+            let name = if path.join(PROFILE_FILE).is_file() {
+                path.file_name()
+            } else if path.is_file()
+                && matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("yaml" | "yml")
+                )
+            {
+                path.file_stem()
+            } else {
+                None
+            };
+            if let Some(name) = name.map(|n| n.to_string_lossy().into_owned())
+                && check_name(&name).is_ok()
+            {
+                names.insert(name);
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(out)
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let entry = self.load(&name);
+                (name, entry)
+            })
+            .collect())
     }
 
     /// Save `spec` as profile `name`: copy the scenario and the observed-metrics files (with
@@ -318,6 +395,12 @@ impl Store {
         force: bool,
     ) -> anyhow::Result<Saved> {
         let target = self.profile_dir(name)?;
+        if let Some((Kind::Scenario, file)) = self.locate(name)? {
+            bail!(
+                "{} already defines profile {name:?}; save under another name, for example `tempdes profile save {name}-2 --profile {name} ...`",
+                file.display()
+            );
+        }
         if target.exists() && !force {
             bail!("profile {name:?} already exists; pass --force to replace it");
         }
@@ -364,14 +447,17 @@ impl Store {
         })
     }
 
-    /// Delete profile `name`.
+    /// Delete profile `name`: a saved profile's directory, or a scenario profile's file.
     pub fn remove(&self, name: &str) -> anyhow::Result<PathBuf> {
-        let dir = self.profile_dir(name)?;
-        if !dir.join(PROFILE_FILE).is_file() {
+        let Some((kind, path)) = self.locate(name)? else {
             bail!("no profile {name:?} in {}", self.dir.display());
+        };
+        match kind {
+            Kind::Saved => std::fs::remove_dir_all(&path),
+            Kind::Scenario => std::fs::remove_file(&path),
         }
-        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
-        Ok(dir)
+        .with_context(|| format!("removing {}", path.display()))?;
+        Ok(path)
     }
 }
 
@@ -508,6 +594,35 @@ fn copy_private(from: &Path, to: &Path) -> anyhow::Result<()> {
     write_private(to, &bytes)
 }
 
+/// On Unix, a note when `path` (a profile's file or directory) can be read by other users,
+/// with the command that makes it private.
+pub fn readable_by_others(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).ok()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            let fix = if path.is_dir() {
+                "chmod -R go-rwx"
+            } else {
+                "chmod 600"
+            };
+            return Some(format!(
+                "{} can be read by other users on this machine (mode {:o}); `{fix} {}` makes it private",
+                path.display(),
+                mode & 0o777,
+                path.display()
+            ));
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// The root of the git working tree in which `path` (a file, or a directory's files) is
 /// untracked and not ignored, so a `git add -A` would pick it up. `None` when it isn't in a
 /// working tree, is tracked or ignored, or git can't be asked.
@@ -631,8 +746,10 @@ mod tests {
         std::fs::remove_file(&scenario).unwrap();
         std::fs::remove_file(src.join("observed.yaml")).unwrap();
         std::fs::remove_file(src.join("scrape.prom")).unwrap();
-        let (profile, loaded) = store.load("prod").unwrap();
-        assert_eq!(profile.description.as_deref(), Some("private cluster"));
+        let entry = store.load("prod").unwrap();
+        assert_eq!(entry.kind, Kind::Saved);
+        assert_eq!(entry.description.as_deref(), Some("private cluster"));
+        let loaded = entry.spec;
         assert_eq!(loaded.profile.as_deref(), Some("prod"));
         assert_eq!(loaded.options.replicas, ["history=4"]);
         assert_eq!(loaded.options.client_lb, Some(ClientLb::RoundRobin));
@@ -653,7 +770,7 @@ mod tests {
             ..Default::default()
         });
         store.save("prod-5", &derived, None, false).unwrap();
-        let (_, d) = store.load("prod-5").unwrap();
+        let d = store.load("prod-5").unwrap().spec;
         let p = crate::run::prepare(
             &d.load_scenario().unwrap(),
             &d.options.overrides().unwrap(),
@@ -667,6 +784,42 @@ mod tests {
         store.remove("prod").unwrap();
         assert!(store.load("prod").is_err());
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scenario_files_in_the_store_are_profiles() {
+        let store_dir = temp_dir("scenario-store");
+        let store = Store::at(&store_dir);
+        let file = scenario_copy(&store_dir);
+        std::fs::rename(&file, store_dir.join("staging.yaml")).unwrap();
+
+        let entry = store.load("staging").unwrap();
+        assert_eq!(entry.kind, Kind::Scenario);
+        assert_eq!(entry.spec.scenario, store_dir.join("staging.yaml"));
+        entry.spec.load_scenario().unwrap();
+        let listed: Vec<String> = store.list().unwrap().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(listed, ["staging"]);
+
+        // a saved profile can't shadow it, even with --force
+        let spec = RunSpec::for_scenario(&store_dir.join("staging.yaml"));
+        let err = store.save("staging", &spec, None, true).unwrap_err();
+        assert!(err.to_string().contains("already defines profile"), "{err}");
+        // but it can be the base of one
+        let mut derived = entry.spec.clone();
+        derived.options.replicas = vec!["history=4".into()];
+        store.save("staging-4h", &derived, None, false).unwrap();
+        assert_eq!(store.load("staging-4h").unwrap().kind, Kind::Saved);
+
+        // one name defined both ways is an error, not a guess
+        std::fs::write(store_dir.join("staging-4h.yaml"), "name: clash\n").unwrap();
+        assert!(store.load("staging-4h").is_err());
+        std::fs::remove_file(store_dir.join("staging-4h.yaml")).unwrap();
+
+        assert_eq!(
+            store.remove("staging").unwrap(),
+            store_dir.join("staging.yaml")
+        );
+        assert!(!store_dir.join("staging.yaml").exists());
     }
 
     #[test]
