@@ -173,6 +173,10 @@ Transfer, timer and visibility queues follow `service/history/queues/`:
     Examples: `AddWorkflowTask`/`AddActivityTask` to matching, starting a child, firing a
     timer, or a visibility upsert.
   * Stale tasks, such as a timeout for an already-completed workflow task, cost a small no-op.
+  * An activity retry timer pushes the next attempt straight to matching
+    (`executeActivityRetryTimerTask` in `timer_queue_active_task_executor.go`). The failed
+    attempt's write already recorded the retry, so the timer writes no mutable state and creates
+    no transfer task.
 * **Retries** (`rescheduler.go`):
   * A `BUSY_WORKFLOW` failure is resubmitted immediately, up to 10 attempts. After that it backs
     off 1 s × 1.1ⁿ.

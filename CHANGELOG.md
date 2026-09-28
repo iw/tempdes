@@ -74,5 +74,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for 3 s or more; before, a heavily throttled run could report tens of milliseconds. A retry
   attempt counts from when it was due. Worker schedule-to-start hotspots now name every internal
   limiter rejecting calls, not only the one throttling polls.
+- **Activity retries go straight to matching.** A retry timer now pushes the next attempt to
+  matching, as Temporal does. It used to write mutable state and create a transfer task as well,
+  which overstated persistence load, history task load and retry latency for workloads with many
+  retries.
 
 [Unreleased]: https://github.com/iw/tempdes/commits/main

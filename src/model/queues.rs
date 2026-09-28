@@ -583,25 +583,7 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             };
             drop(lock);
             let Some(tq) = tq else { return Outcome::Noop };
-            let mt = MTask {
-                wf,
-                wf_gen: wgen,
-                kind: TqKind::Activity,
-                r: task.r,
-                r2: task.r2,
-                created: now(),
-                from_backlog: false,
-                query: false,
-            };
-            let r = call_with_timeout(3_000_000, {
-                let c = ctx.clone();
-                async move { matching::add_task(&c, pod, tq, TqKind::Activity, mt, None).await }
-            })
-            .await;
-            match r {
-                Ok(()) => Outcome::Done,
-                Err(e) => Outcome::Retry(e),
-            }
+            push_activity(ctx, pod, task, tq).await
         }
         TaskType::TransferCloseExecution => {
             cpu(ctx, pod, base_cost).await;
@@ -857,6 +839,9 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             Outcome::Done
         }
         TaskType::TimerActivityRetryTimer => {
+            // executeActivityRetryTimerTask: the failure's write already recorded the next
+            // attempt, so the timer only pushes it to matching. It writes no mutable state and
+            // creates no transfer task.
             let lock = match lock_wf(ctx, wf, wgen, caller, deadline).await {
                 Ok(l) => l,
                 Err(e) => return Outcome::Retry(e),
@@ -864,59 +849,35 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             if let Err(e) = load_ms(ctx, pod, shard, wf, wgen, caller).await {
                 return Outcome::Retry(e);
             }
-            let ok = {
-                let wfs = ctx.wfs.borrow();
-                let Some(w) = wfs.get(wf, wgen) else {
+            let tq = {
+                let mut wfs = ctx.wfs.borrow_mut();
+                let Some(w) = wfs.get_mut(wf, wgen) else {
                     return Outcome::Drop;
                 };
-                w.status == WfStatus::Running
-                    && w.activities.iter().any(|a| {
-                        a.seq == task.r && a.attempt == task.r2 && a.state == ActState::Backoff
-                    })
-            };
-            if !ok {
-                drop(lock);
-                return Outcome::Noop;
-            }
-            cpu(ctx, pod, base_cost).await;
-            if let Err(e) = shard_write(
-                ctx,
-                pod,
-                shard,
-                PersistOp::UpdateWorkflowExecution,
-                false,
-                caller,
-                deadline,
-            )
-            .await
-            {
-                evict_ms(ctx, pod, shard, wf, wgen);
-                return Outcome::Retry(e);
-            }
-            {
-                let mut wfs = ctx.wfs.borrow_mut();
-                if let Some(w) = wfs.get_mut(wf, wgen)
-                    && let Some(a) = w.activities.iter_mut().find(|a| a.seq == task.r)
-                {
-                    a.state = ActState::Scheduled;
-                    // the attempt's scheduled time is when the retry was due
-                    // (updateActivityInfoForRetries), not when this timer task ran
-                    a.scheduled_at = task.fire_at;
+                if w.status != WfStatus::Running {
+                    None
+                } else {
+                    // not started yet: in backoff, or scheduled by a push that failed
+                    w.activities
+                        .iter_mut()
+                        .find(|a| {
+                            a.seq == task.r
+                                && a.attempt == task.r2
+                                && matches!(a.state, ActState::Backoff | ActState::Scheduled)
+                        })
+                        .map(|a| {
+                            a.state = ActState::Scheduled;
+                            // the attempt's scheduled time is when the retry was due
+                            // (updateActivityInfoForRetries), not when this timer task ran
+                            a.scheduled_at = task.fire_at;
+                            a.tq
+                        })
                 }
-            }
-            commit_tasks(
-                ctx,
-                shard,
-                wf,
-                wgen,
-                &[TaskSpec::now(
-                    TaskType::TransferActivityTask,
-                    task.r,
-                    task.r2,
-                )],
-            );
+            };
             drop(lock);
-            Outcome::Done
+            let Some(tq) = tq else { return Outcome::Noop };
+            cpu(ctx, pod, base_cost).await;
+            push_activity(ctx, pod, task, tq).await
         }
         TaskType::VisibilityStartExecution
         | TaskType::VisibilityUpsertExecution
@@ -959,6 +920,30 @@ fn release_later(ctx: &Ctx, wf: WfId, wgen: u32) {
             c.wfs.borrow_mut().release(wf);
         }
     });
+}
+
+/// `AddActivityTask` to matching for the activity attempt a transfer or retry timer task refers
+/// to (`r` is the activity, `r2` the attempt). A failure retries the history task.
+async fn push_activity(ctx: &Ctx, pod: PodId, task: &HistTask, tq: usize) -> Outcome {
+    let mt = MTask {
+        wf: task.wf,
+        wf_gen: task.wf_gen,
+        kind: TqKind::Activity,
+        r: task.r,
+        r2: task.r2,
+        created: now(),
+        from_backlog: false,
+        query: false,
+    };
+    let r = call_with_timeout(3_000_000, {
+        let c = ctx.clone();
+        async move { matching::add_task(&c, pod, tq, TqKind::Activity, mt, None).await }
+    })
+    .await;
+    match r {
+        Ok(()) => Outcome::Done,
+        Err(e) => Outcome::Retry(e),
+    }
 }
 
 /// Call a history API on the current owner of `shard` from another Temporal service, following
