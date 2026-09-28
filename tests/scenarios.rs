@@ -16,7 +16,11 @@ fn simulate(file: &str, ov: Overrides) -> RunResult {
             .join(file),
     )
     .expect("scenario loads");
-    let p = run::prepare(&sc, &ov, None).expect("parameters resolve");
+    simulate_scenario(&sc, ov)
+}
+
+fn simulate_scenario(sc: &Scenario, ov: Overrides) -> RunResult {
+    let p = run::prepare(sc, &ov, None).expect("parameters resolve");
     let out = run::run_params(p);
     report::analyze(&out.ctx, &out.info, None)
 }
@@ -513,5 +517,61 @@ fn schedule_to_start_counts_from_the_scheduled_time() {
     assert!(
         matching_wait < 200.0,
         "matching wait p99 {matching_wait} ms"
+    );
+}
+
+/// Activities that fail half their attempts, retried after 100 ms.
+const RETRYING: &str = r#"
+name: retrying
+duration: 20s
+cluster:
+  num_history_shards: 512
+  replicas: { frontend: 3, history: 3, matching: 3, worker: 1 }
+  persistence: { store: postgresql }
+namespaces:
+  - name: orders
+workers:
+  - name: order-workers
+    namespace: orders
+    task_queue: orders
+    processes: 6
+    workflow_pollers: 10
+    activity_pollers: 16
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 100/s
+    steps:
+      - activity: { count: 2, failure_rate: 0.5, retry_initial: 100ms, duration: { p50: 30ms, p99: 250ms } }
+      - activity: { count: 1, failure_rate: 0.5, retry_initial: 100ms, duration: { p50: 20ms, p99: 150ms } }
+"#;
+
+#[test]
+fn activity_retries_go_straight_to_matching() {
+    // Temporal's retry timer task pushes the next attempt to matching itself, with no transfer
+    // task and no mutable-state write (executeActivityRetryTimerTask). So each attempt is
+    // dispatched by exactly one history task: a transfer task for the first attempt, and a retry
+    // timer for each retry.
+    let sc = Scenario::parse_str(RETRYING).expect("scenario parses");
+    let r = simulate_scenario(&sc, short());
+    let tasks = |t: &str| {
+        r.history
+            .tasks
+            .iter()
+            .find(|x| x.task_type == t)
+            .map_or(0.0, |x| x.per_s)
+    };
+    let api = |a: &str| r.apis.iter().find(|x| x.api == a).map_or(0.0, |x| x.per_s);
+    let transfers = tasks("TransferActiveTaskActivityTask");
+    let retries = tasks("TimerActiveTaskActivityRetryTimer");
+    let attempts = api("RespondActivityTaskCompleted") + api("RespondActivityTaskFailed");
+    assert!(
+        retries > 0.3 * attempts,
+        "{retries} retries/s of {attempts} attempts/s"
+    );
+    assert!(
+        ((transfers + retries) / attempts - 1.0).abs() < 0.1,
+        "{transfers} transfer and {retries} retry tasks/s for {attempts} attempts/s"
     );
 }
