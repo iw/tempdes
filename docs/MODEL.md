@@ -241,6 +241,14 @@ Workers follow the Go SDK.
   * Eager activities are requested on `RespondWorkflowTaskCompleted`.
 * **Retries.** Transient errors back off from 100 ms and `ResourceExhausted` errors from 1 s,
   both doubling up to 10 s. Each call has a deadline, and client latency includes retries.
+* **Schedule-to-start** is measured as the SDK measures it (`internal_task_pollers.go`): from the
+  poll response's `ScheduledTime` for a workflow task, or `CurrentAttemptScheduledTime` for an
+  activity, to `StartedTime`.
+  * It includes history's hand-off to matching as well as the wait in matching. A throttled
+    transfer task, for example, backs off 3 s or more before it reaches matching.
+  * A retry attempt counts from when it was due: Temporal sets the activity's scheduled time to
+    the retry time (`updateActivityInfoForRetries` in `mutable_state_impl.go`).
+  * The matching partition table's dispatch column covers only the wait in matching.
 
 ## Worker service
 

@@ -65,4 +65,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **EKS guide.** [docs/EKS.md](docs/EKS.md) covers each option: a headless Service with SDK
   settings, an ALB for external clients, and frontend connection-age and shutdown settings.
 
+### Fixed
+
+- **Schedule-to-start is measured as the SDK measures it.** Workflow task and activity
+  schedule-to-start now run from the task's scheduled time, as the SDK's
+  `temporal_*_schedule_to_start_latency` metrics do, instead of from when history handed the task
+  to matching. They now include delays in history, such as a throttled transfer task backing off
+  for 3 s or more; before, a heavily throttled run could report tens of milliseconds. A retry
+  attempt counts from when it was due. Worker schedule-to-start hotspots now name every internal
+  limiter rejecting calls, not only the one throttling polls.
+
 [Unreleased]: https://github.com/iw/tempdes/commits/main

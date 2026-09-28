@@ -899,7 +899,9 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                     && let Some(a) = w.activities.iter_mut().find(|a| a.seq == task.r)
                 {
                     a.state = ActState::Scheduled;
-                    a.scheduled_at = now();
+                    // the attempt's scheduled time is when the retry was due
+                    // (updateActivityInfoForRetries), not when this timer task ran
+                    a.scheduled_at = task.fire_at;
                 }
             }
             commit_tasks(

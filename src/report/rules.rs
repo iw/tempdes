@@ -247,13 +247,14 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 "workers",
                 w.workflow_type.clone(),
                 format!("{}: workflow task schedule-to-start p99 {}", w.workflow_type, ms(s2s)),
-                "Workflow tasks wait for pollers. Either SDK workers are poller/slot bound or matching dispatch is slow (backlogged partitions, forwarding). Compare with the matching partition table.".into(),
+                "Workflow tasks start late. Measured from the scheduled time, as in the SDK, so this includes history handing the task to matching (a throttled transfer task backs off 3s or more) as well as the wait in matching (workers short of pollers or slots, backlogged partitions, forwarding). Compare the history task table with the matching partition table.".into(),
                 vec![
                     format!("activity schedule-to-start p99 {}", ms(w.activity_schedule_to_start.p99_ms)),
                     format!("sticky cache hit {}", fmt_pct(w.sticky_hit_ratio)),
                 ],
                 &[
                     "temporal_workflow_task_schedule_to_start_latency (SDK)",
+                    "task_errors_throttled",
                     "asyncmatch_latency",
                     "approximate_backlog_count",
                 ],
@@ -284,9 +285,13 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 "workers",
                 w.workflow_type.clone(),
                 format!("{}: activity schedule-to-start p99 {}", w.workflow_type, ms(as2s)),
-                "Activity tasks queue in matching: activity workers lack pollers/slots for the offered rate, or dispatch is limited per partition.".into(),
+                "Activity tasks start late. Measured from the attempt's scheduled time, as in the SDK, so this includes history handing the task to matching (a throttled transfer or retry task backs off 3s or more) as well as the wait in matching (activity workers short of pollers or slots, or dispatch limited per partition).".into(),
                 vec![],
-                &["temporal_activity_schedule_to_start_latency (SDK)", "approximate_backlog_count{task_type=\"Activity\"}"],
+                &[
+                    "temporal_activity_schedule_to_start_latency (SDK)",
+                    "task_errors_throttled",
+                    "approximate_backlog_count{task_type=\"Activity\"}",
+                ],
                 vec![c.infra("workers.*.activity_pollers / activity_slots", "scenario".into(), "SDK MaxConcurrentActivityTaskPollers / ExecutionSize")],
                 35.0 + as2s / 200.0,
             ));
@@ -1332,42 +1337,7 @@ fn causal(c: &Ctx2<'_>, out: &mut [Hotspot]) {
             .filter(|(k, _)| k.starts_with("ResourceExhausted"))
             .map(|(_, v)| *v)
             .sum();
-    if poll_rejects > 0 {
-        let symptom_max = out
-            .iter()
-            .filter(|h| {
-                matches!(
-                    h.category.as_str(),
-                    "workers" | "matching-backlog" | "workflow-tasks"
-                )
-            })
-            .map(|h| h.score)
-            .fold(0.0, f64::max);
-        let mut limiters = Vec::new();
-        for h in out.iter_mut().filter(|h| h.category == "rate-limit") {
-            if h.resource.starts_with("frontend.") || h.resource == "matching.rps" {
-                h.score = h.score.max(symptom_max + 1.0);
-                h.severity = Severity::Critical;
-                h.evidence.insert(
-                    0,
-                    format!("{poll_rejects} SDK polls were rejected; rejected pollers back off 1–10s, so tasks wait in matching although workers have free slots"),
-                );
-                limiters.push(h.resource.clone());
-            }
-        }
-        if !limiters.is_empty() {
-            for h in out
-                .iter_mut()
-                .filter(|h| matches!(h.category.as_str(), "workers" | "matching-backlog"))
-            {
-                h.detail = format!(
-                    "Likely caused by throttled polls ({}): see that hotspot first. {}",
-                    limiters.join(", "),
-                    h.detail
-                );
-            }
-        }
-    }
+    rank_poll_limiters(out, poll_rejects);
     // 2. internal limiters rejecting calls come before the delays they cause
     rank_internal_limiters(out);
     // 3. a saturated database slows every write and read: it is the root cause of the
@@ -1445,6 +1415,65 @@ fn headroom(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             knobs,
             score: 20.0 + worst * 20.0,
         });
+    }
+}
+
+/// When a frontend limiter or `matching.rps` rejects SDK polls, rejected pollers back off and
+/// tasks wait in matching although workers have free slots. Rank those limiters above the
+/// symptoms and point the symptoms at them. Schedule-to-start also counts history's hand-off to
+/// matching, so worker symptoms name every internal limiter rejecting calls as well.
+fn rank_poll_limiters(out: &mut [Hotspot], poll_rejects: u64) {
+    if poll_rejects == 0 {
+        return;
+    }
+    let symptom_max = out
+        .iter()
+        .filter(|h| {
+            matches!(
+                h.category.as_str(),
+                "workers" | "matching-backlog" | "workflow-tasks"
+            )
+        })
+        .map(|h| h.score)
+        .fold(0.0, f64::max);
+    let mut limiters = Vec::new();
+    for h in out.iter_mut().filter(|h| h.category == "rate-limit") {
+        if h.resource.starts_with("frontend.") || h.resource == "matching.rps" {
+            h.score = h.score.max(symptom_max + 1.0);
+            h.severity = Severity::Critical;
+            h.evidence.insert(
+                0,
+                format!("{poll_rejects} SDK polls were rejected; rejected pollers back off 1–10s, so tasks wait in matching although workers have free slots"),
+            );
+            limiters.push(h.resource.clone());
+        }
+    }
+    if limiters.is_empty() {
+        return;
+    }
+    let mut rejecting: Vec<String> = out
+        .iter()
+        .filter(|h| h.category == "rate-limit" && is_internal_limiter(&h.resource))
+        .map(|h| h.resource.clone())
+        .collect();
+    for l in &limiters {
+        if !rejecting.contains(l) {
+            rejecting.push(l.clone());
+        }
+    }
+    for h in out
+        .iter_mut()
+        .filter(|h| matches!(h.category.as_str(), "workers" | "matching-backlog"))
+    {
+        let cause = if h.category == "workers" && rejecting.len() > limiters.len() {
+            format!("rejected calls ({})", rejecting.join(", "))
+        } else {
+            format!("throttled polls ({})", limiters.join(", "))
+        };
+        h.detail = format!(
+            "Likely caused by {cause}: see that hotspot first. {}",
+            h.detail
+        );
     }
 }
 
@@ -1548,5 +1577,57 @@ mod tests {
         ];
         rank_internal_limiters(&mut out);
         assert_eq!(out[1].score, 60.0);
+    }
+
+    #[test]
+    fn worker_symptoms_name_every_rejecting_limiter() {
+        let mut out = vec![
+            hotspot(Severity::Critical, "workers", "OrderWorkflow", 80.0),
+            hotspot(Severity::Warning, "matching-backlog", "orders", 70.0),
+            hotspot(
+                Severity::Critical,
+                "rate-limit",
+                "history.persistenceMaxQPS",
+                60.0,
+            ),
+            hotspot(Severity::Warning, "rate-limit", "matching.rps", 50.0),
+        ];
+        rank_poll_limiters(&mut out, 264);
+        let find = |cat: &str| out.iter().find(|h| h.category == cat).unwrap();
+        // schedule-to-start counts history's hand-off too, so both limiters are causes
+        assert!(find("workers").detail.starts_with(
+            "Likely caused by rejected calls (history.persistenceMaxQPS, matching.rps)"
+        ));
+        // the backlog forms because rejected pollers back off
+        assert!(
+            find("matching-backlog")
+                .detail
+                .starts_with("Likely caused by throttled polls (matching.rps)")
+        );
+        let matching = out.iter().find(|h| h.resource == "matching.rps").unwrap();
+        assert_eq!(matching.severity, Severity::Critical);
+        assert!(matching.score > find("workers").score);
+
+        // when only the poll limiter rejects, it is the whole cause
+        let mut out = vec![
+            hotspot(Severity::Critical, "workers", "OrderWorkflow", 80.0),
+            hotspot(Severity::Critical, "rate-limit", "matching.rps", 50.0),
+        ];
+        rank_poll_limiters(&mut out, 10);
+        assert!(
+            out[0]
+                .detail
+                .starts_with("Likely caused by throttled polls (matching.rps)")
+        );
+
+        // no rejected polls: left to rank_internal_limiters
+        let mut out = vec![hotspot(
+            Severity::Critical,
+            "workers",
+            "OrderWorkflow",
+            80.0,
+        )];
+        rank_poll_limiters(&mut out, 0);
+        assert_eq!(out[0].detail, "detail");
     }
 }
