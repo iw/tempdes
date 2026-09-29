@@ -263,6 +263,21 @@ impl Step {
     }
 }
 
+/// A workflow task's `historySizeBytes`: the size of the events written before it, as the
+/// server counts it (`ExecutionStats.HistorySize`), with what those events were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SizeSample {
+    pub bytes: u64,
+    pub events: u32,
+    pub signals: u32,
+    /// events that carry a payload where the simulator charges one: the workflow's input,
+    /// activities' and children's inputs and results, and local activities' markers
+    pub payloads: u32,
+    /// events the simulator doesn't model (other markers, search attribute upserts, updates,
+    /// ...), whose data counts in `bytes` too
+    pub unmodelled: u32,
+}
+
 /// One workflow execution read from its history.
 #[derive(Clone, Debug)]
 pub struct Trace {
@@ -283,6 +298,8 @@ pub struct Trace {
     /// event kinds the importer doesn't model, with counts
     pub skipped: BTreeMap<String, u32>,
     pub notes: Vec<String>,
+    /// the history's size before its last workflow task that recorded one
+    pub size: Option<SizeSample>,
 }
 
 /// What one workflow task's completion issued.
@@ -322,6 +339,7 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
         wft_queue_wait_us: Vec::new(),
         skipped: BTreeMap::new(),
         notes: Vec::new(),
+        size: None,
     };
     let id_of = |e: &Event, key: &str| get(&e.attrs, key).and_then(int);
     let mut wft_scheduled: HashMap<i64, i64> = HashMap::new();
@@ -336,7 +354,36 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
     // closed them (none yet: still running)
     let mut activity_closed: HashMap<i64, i64> = HashMap::new();
     let mut child_closed: HashMap<i64, i64> = HashMap::new();
+    // signals and payload-carrying events so far, for workflow tasks' `historySizeBytes`
+    let (mut signals_seen, mut payloads_seen, mut unmodelled_seen) = (0, 0, 0);
     for e in events {
+        // a workflow task started with the events before it written: their size, unless the
+        // task started with the workflow (eager start) and nothing had been written yet
+        if e.kind == Kind::WftStarted
+            && e.id > 1
+            && let Some(bytes) = get(&e.attrs, "historySizeBytes")
+                .and_then(int)
+                .filter(|&b| b > 0)
+        {
+            t.size = Some(SizeSample {
+                bytes: bytes as u64,
+                events: (e.id - 1) as u32,
+                signals: signals_seen,
+                payloads: payloads_seen,
+                unmodelled: unmodelled_seen,
+            });
+        }
+        match e.kind {
+            Kind::Signaled => signals_seen += 1,
+            Kind::WorkflowStarted
+            | Kind::ActivityScheduled
+            | Kind::ActivityCompleted
+            | Kind::ChildInitiated
+            | Kind::ChildCompleted => payloads_seen += 1,
+            Kind::Marker if local_activity(e) => payloads_seen += 1,
+            Kind::Marker | Kind::Other => unmodelled_seen += 1,
+            _ => {}
+        }
         match e.kind {
             Kind::WftScheduled => {
                 wft_scheduled.insert(e.id, e.time_us);
@@ -473,18 +520,16 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
                 }
             }
             Kind::Marker => {
-                let marker = get(&e.attrs, "markerName")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("");
-                // Go and Java write `LocalActivity`; the Core-based SDKs `core_local_activity`
-                if matches!(marker, "LocalActivity" | "core_local_activity") {
+                if local_activity(e) {
                     if let Some(&b) =
                         id_of(e, "workflowTaskCompletedEventId").and_then(|w| batch_of.get(&w))
                     {
                         batches[b].local_activities += 1;
                     }
                 } else {
-                    *t.skipped.entry(format!("marker {marker}")).or_default() += 1;
+                    *t.skipped
+                        .entry(format!("marker {}", marker_name(e)))
+                        .or_default() += 1;
                 }
             }
             Kind::ChildInitiated => {
@@ -628,4 +673,16 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
             .push(format!("{unfinished} activities never closed"));
     }
     Ok(t)
+}
+
+fn marker_name(e: &Event) -> &str {
+    get(&e.attrs, "markerName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// A local activity's marker: Go and Java write `LocalActivity`, the Core-based SDKs
+/// `core_local_activity`.
+fn local_activity(e: &Event) -> bool {
+    matches!(marker_name(e), "LocalActivity" | "core_local_activity")
 }

@@ -12,6 +12,8 @@ use tempdes::run::{self, Overrides};
 /// milliseconds after `start_ms`.
 struct History {
     events: Vec<Value>,
+    /// each event's type, unprefixed
+    kinds: Vec<String>,
     /// `EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` rather than `ActivityTaskScheduled`
     prefixed: bool,
     start_ms: f64,
@@ -21,6 +23,7 @@ impl History {
     fn new(workflow_type: &str, start_ms: f64, prefixed: bool) -> History {
         let mut h = History {
             events: Vec::new(),
+            kinds: Vec::new(),
             prefixed,
             start_ms,
         };
@@ -47,6 +50,7 @@ impl History {
             kind.to_string()
         };
         let key = format!("{}{}EventAttributes", kind[..1].to_lowercase(), &kind[1..]);
+        self.kinds.push(kind.to_string());
         let us = ((self.start_ms + at_ms) * 1000.0).round() as i64;
         self.events.push(json!({
             "eventId": id.to_string(),
@@ -132,6 +136,30 @@ impl History {
         self.event(close, end_ms, attrs);
     }
 
+    /// Record on each workflow task started the size of the events before it
+    /// (`historySizeBytes`), as the server does, for events of 128 bytes that carry `payload`
+    /// bytes of input or result, or 256 bytes for a signal.
+    fn record_sizes(&mut self, payload: f64) {
+        let mut size = 0.0;
+        for (e, kind) in self.events.iter_mut().zip(&self.kinds) {
+            if kind == "WorkflowTaskStarted" {
+                e["workflowTaskStartedEventAttributes"]["historySizeBytes"] =
+                    (size as u64).to_string().into();
+            }
+            size += 128.0
+                + match kind.as_str() {
+                    "WorkflowExecutionStarted"
+                    | "ActivityTaskScheduled"
+                    | "ActivityTaskCompleted"
+                    | "StartChildWorkflowExecutionInitiated"
+                    | "ChildWorkflowExecutionCompleted"
+                    | "MarkerRecorded" => payload,
+                    "WorkflowExecutionSignaled" => 256.0,
+                    _ => 0.0,
+                };
+        }
+    }
+
     fn json(&self) -> String {
         json!({"events": self.events}).to_string()
     }
@@ -214,6 +242,10 @@ fn import(histories: &[String]) -> program::Program {
 /// 1s and 2s apart after 100ms tries, each attempt waiting 20ms in the cluster); a local
 /// activity; a 2s sleep (left out when `sleep` is false); then a shipment child.
 fn order(start_ms: f64, lookup_attempts: u32, sleep: bool, prefixed: bool) -> String {
+    order_history(start_ms, lookup_attempts, sleep, prefixed).json()
+}
+
+fn order_history(start_ms: f64, lookup_attempts: u32, sleep: bool, prefixed: bool) -> History {
     let mut h = History::new("OrderWorkflow", start_ms, prefixed);
     let w = h.wft(0.0, 5.0);
     let charge = h.schedule(w, "Charge", 6.0);
@@ -268,7 +300,7 @@ fn order(start_ms: f64, lookup_attempts: u32, sleep: bool, prefixed: bool) -> St
     );
     h.wft(t + 500.0, 3.0);
     h.event("WorkflowExecutionCompleted", t + 504.0, json!({}));
-    h.json()
+    h
 }
 
 fn steps_of(text: &str) -> Vec<Step> {
@@ -692,6 +724,48 @@ fn failures_without_a_retry_state_are_judged_by_failure_and_policy() {
         p.summary
     );
     simulate("payments", &p.yaml);
+}
+
+#[test]
+fn payload_sizes_come_from_the_history_sizes_the_server_recorded() {
+    // orders whose inputs and results are 4 KiB, with the sizes their workflow tasks recorded
+    let sized = |i: u32, payload: f64| {
+        let mut h = order_history(f64::from(i) * 1000.0, 1, true, i.is_multiple_of(2));
+        h.record_sizes(payload);
+        h.json()
+    };
+    let p = import(&(0..4).map(|i| sized(i, 4096.0)).collect::<Vec<_>>());
+    assert!(p.yaml.contains("    payload_bytes: 4.0KiB\n"), "{}", p.yaml);
+    assert!(
+        p.summary
+            .contains("payload_bytes 4.0KiB from the history sizes the server recorded")
+            && p.summary.contains("in 4 of 4 histories"),
+        "{}",
+        p.summary
+    );
+    let w = simulate("payments", &p.yaml);
+    assert!(
+        w.workflows
+            .iter()
+            .any(|w| w.workflow_type == "OrderWorkflow" && w.max_history_bytes > 30_000.0),
+        "{:#?}",
+        w.workflows
+    );
+    // tiny payloads come out near nothing, not below
+    let p = import(&(0..4).map(|i| sized(i, 0.0)).collect::<Vec<_>>());
+    assert!(p.yaml.contains("    payload_bytes: 0B\n"), "{}", p.yaml);
+    // histories that recorded no sizes leave payload_bytes at the default
+    let p = import(
+        &(0..4)
+            .map(|i| order(f64::from(i) * 1000.0, 1, true, false))
+            .collect::<Vec<_>>(),
+    );
+    assert!(!p.yaml.contains("    payload_bytes:"), "{}", p.yaml);
+    assert!(
+        p.summary.contains("payload_bytes left at the default"),
+        "{}",
+        p.summary
+    );
 }
 
 #[test]

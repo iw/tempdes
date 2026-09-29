@@ -9,7 +9,7 @@ use crate::config::dynamic::{Constraints, DcValue, DynamicConfig, TaskQueueType}
 use crate::config::scenario::*;
 use crate::sim::dist::Dist;
 use crate::sim::executor::Time;
-use crate::util::units::fmt_us;
+use crate::util::units::{fmt_bytes, fmt_us};
 
 use super::ring::synthetic_addresses;
 use super::types::*;
@@ -17,6 +17,7 @@ use super::types::*;
 pub const US: f64 = 1.0;
 pub const MS: f64 = 1_000.0;
 pub const SEC: f64 = 1_000_000.0;
+pub const MIB: f64 = 1024.0 * 1024.0;
 
 /// Where a parameter value came from (for the report's "effective configuration" section).
 #[derive(Clone, Debug, Default)]
@@ -277,6 +278,10 @@ pub struct NsParams {
     pub task_sched_global_ns_max_qps: f64,
     pub default_wft_timeout: Time,
     pub history_long_poll: Time,
+    /// `limit.historySize.error` and `.warn`: a running workflow whose history is larger than
+    /// the error limit is terminated at its next update; the warn limit only logs
+    pub history_size_error: f64,
+    pub history_size_warn: f64,
     pub per_ns_worker_count: u32,
     pub scheduler_start_rps: f64,
     pub scheduler_la_sleep_limit: Time,
@@ -683,6 +688,10 @@ pub struct Params {
     /// Create/UpdateWorkflowExecution carry: set by calibration, since production's
     /// `persistence_latency` measures the whole call (indexed by PersistOp)
     pub db_includes_append: Vec<bool>,
+    /// time a statement adds per byte of history it writes, and per byte a
+    /// `ReadHistoryBranch` reads (µs)
+    pub db_write_us_per_byte: f64,
+    pub db_read_us_per_byte: f64,
     pub vis: VisParams,
     pub costs: Costs,
     pub k: Knobs,
@@ -732,6 +741,10 @@ pub const MODELED_KEYS: &[&str] = &[
     "history.hostLevelCacheMaxSize",
     "history.cacheNonUserContextLockTimeout",
     "history.eventsCacheMaxSizeBytes",
+    "limit.historySize.error",
+    "limit.historySize.warn",
+    "limit.blobSize.error",
+    "limit.blobSize.warn",
     "history.transferProcessorSchedulerWorkerCount",
     "history.timerProcessorSchedulerWorkerCount",
     "history.visibilityProcessorSchedulerWorkerCount",
@@ -961,6 +974,8 @@ impl Params {
                     &p,
                     20.0 * SEC,
                 )),
+                history_size_error: dc.int("limit.historySize.error", &p, 50 * 1024 * 1024) as f64,
+                history_size_warn: dc.int("limit.historySize.warn", &p, 10 * 1024 * 1024) as f64,
                 per_ns_worker_count: dc.int("worker.perNamespaceWorkerCount", &p, 1).max(1) as u32,
                 scheduler_start_rps: dc.float(
                     "worker.schedulerNamespaceStartWorkflowRPS",
@@ -1432,6 +1447,28 @@ impl Params {
                 });
             }
             let ns = ns_idx(&w.namespace);
+            // a payload over `limit.blobSize.error` is rejected (`blobSizeChecker`), one over
+            // `limit.blobSize.warn` logged
+            let prec = DynamicConfig::prec_namespace(&w.namespace);
+            let blob_error = dc.int("limit.blobSize.error", &prec, 2 * 1024 * 1024) as f64;
+            let blob_warn = dc.int("limit.blobSize.warn", &prec, 512 * 1024) as f64;
+            if w.payload_bytes.0 > blob_error {
+                bail!(
+                    "{}: payload_bytes {} is over limit.blobSize.error ({}) for namespace {}: the server rejects each such payload",
+                    w.type_name,
+                    fmt_bytes(w.payload_bytes.0),
+                    fmt_bytes(blob_error),
+                    w.namespace
+                );
+            }
+            if w.payload_bytes.0 > blob_warn {
+                prov.warnings.push(format!(
+                    "{}: payload_bytes {} is over limit.blobSize.warn ({}): the server logs a warning for each such payload",
+                    w.type_name,
+                    fmt_bytes(w.payload_bytes.0),
+                    fmt_bytes(blob_warn)
+                ));
+            }
             if w.eager_start && !namespaces[ns].enable_eager_start {
                 prov.warnings.push(format!(
                     "{}: eager_start requested but system.enableEagerWorkflowStart is false for namespace {} — starts go through matching",
@@ -1796,6 +1833,18 @@ impl Params {
             db_capacity,
             db_latency,
             db_includes_append: vec![false; PersistOp::ALL.len()],
+            db_write_us_per_byte: sc
+                .cluster
+                .persistence
+                .write_per_mib
+                .map_or(20.0 * MS, |d| d.us() as f64)
+                / MIB,
+            db_read_us_per_byte: sc
+                .cluster
+                .persistence
+                .read_per_mib
+                .map_or(5.0 * MS, |d| d.us() as f64)
+                / MIB,
             vis,
             costs,
             k,

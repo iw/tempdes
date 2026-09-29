@@ -124,11 +124,11 @@ Each API follows the real handler sequence (`service/history/api/*`):
    events first, inside the same call (`UpdateWorkflowExecution` in
    `common/persistence/sql/execution.go` and `cassandra/execution_store.go`). The append is one
    more database statement but not a separate persistence call: it passes the rate limiters
-   once with the write, and its time is part of the write's `persistence_latency`.
+   once with the write, and its time is part of the write's `persistence_latency`. It takes
+   `write_per_mib` for each MiB of events it appends (see [History size](#history-size)).
 7. Task generation (transfer, timer and visibility tasks) is written in the same transaction.
-8. Lock release, then post-lock reads. For example, `RecordWorkflowTaskStarted` reads history
-   through the events cache (`service/history/events/cache.go`, `history.eventsCacheMaxSizeBytes`)
-   or `ReadHistoryBranch`.
+8. Lock release, then post-lock reads. For example, `RecordWorkflowTaskStarted` reads the
+   events for its poll response with `ReadHistoryBranch`.
 
 State changes are computed first and applied only if the write succeeds. A throttled or
 timed-out write evicts the workflow from the cache, like Temporal's `clearMutableState`.
@@ -176,8 +176,53 @@ These workflow behaviours are simulated:
      Temporal. There is no waiting for a token.
 2. **The pod's SQL connection pool** (`maxConns`). Waiting here is reported as
    `connection-pool`.
-3. **The database station.** Each operation draws a service time from its distribution.
-   Cassandra lightweight-transaction operations get a 1.6× default.
+3. **The database station.** Each operation draws a service time from its distribution, plus
+   the time for the history it writes or reads. Cassandra lightweight-transaction operations
+   get a 1.6× default.
+
+### History size
+
+A workflow's history grows by the events each write appends (`Append` in
+`src/model/world.rs`), weighed as Temporal's `ExecutionStats.HistorySize` counts them:
+
+* every event, 128 bytes. Histories that record their size (`historySizeBytes`) weigh 95–180
+  bytes an event besides payloads: a median of 141, and 123 pooled over 1,308 events of the Go
+  SDK's replay tests;
+* plus `payload_bytes` on each event that carries an input or result: `WorkflowExecutionStarted`,
+  `ActivityTaskScheduled`, `ActivityTaskCompleted`, `StartChildWorkflowExecutionInitiated`,
+  `ChildWorkflowExecutionCompleted` (at the child's size), local activities' `MarkerRecorded`
+  and the close event;
+* a signal's input, 256 bytes.
+
+Sizes cost time and room:
+
+* **Writes and reads.** A statement takes `cluster.persistence.write_per_mib` (20 ms by
+  default) for each MiB it appends. A `ReadHistoryBranch` takes `read_per_mib` (5 ms) for each
+  MiB it reads: a workflow task's events at the history's mean event size, or on an events
+  cache miss the batch the event was written in.
+* **The events cache** (`service/history/events/cache.go`). Each shard's LRU holds
+  `history.eventsCacheMaxSizeBytes` (512 KiB) of events, weighed by their size. As
+  `writeEventToCache` in `mutable_state_impl.go` does, a write puts in the start event, each
+  activity's scheduled event, each child's initiated event and the close event, with their
+  payloads. Three reads use it:
+  * `RecordActivityTaskStarted`, for the activity's scheduled event;
+  * the transfer task that starts a child, for its initiated event
+    (`GetChildExecutionInitiatedEvent`);
+  * the transfer task that reports a child's close to its parent, for the close event
+    (`GetCompletionEvent`).
+
+  A miss reads the whole batch the event was written in (`getHistoryEventFromStore`, a
+  `ReadHistoryBranch` from the batch's first event) and caches the event again. A shard that
+  changes owner starts with an empty cache. The host-level events cache
+  (`history.eventsHostLevelCacheMaxSizeBytes`) is off by default and isn't modelled.
+* **Limits.** When a workflow task completes, a history over `limit.historySize.error` (50 MiB)
+  is terminated instead of updated, as `enforceHistorySizeCheck` in
+  `service/history/workflow/context.go` does: the pending changes are discarded, the mutable
+  state is loaded again (`GetWorkflowExecution`) and `WorkflowExecutionTerminated` is written.
+  A history over `limit.historySize.warn` (10 MiB) is counted. A `payload_bytes` over its
+  namespace's `limit.blobSize.error` (2 MiB) is refused when the scenario loads, since the
+  server would reject every such payload; over `limit.blobSize.warn` (512 KiB) it runs with a
+  warning.
 
 ## History task queues (`src/model/queues.rs`)
 
@@ -438,6 +483,14 @@ Workers follow the Go SDK.
   more (how servers fill in "none") treated as unset.
 * **Pooling.** Executions of a type that took the same steps are pooled per step. Paths taken by
   at least `--min-path-share` of them become types of their own, with their share of the rate.
+* **Payload size.** `WorkflowTaskStarted.historySizeBytes` is the size of the history before
+  that workflow task: `ExecutionStats.HistorySize`, read in `getHistorySizeInfo`
+  (`workflow_task_state_machine.go`) before the started event is added. The last one a history
+  records (a task started with the workflow records 0, and is skipped) gives the size S of
+  events 1…E−1. A type's `payload_bytes` is Σ(S − 128·(E−1) − 256·signals) over Σ payload
+  events, those the simulator charges a payload to, across its histories, and 0 at least. The
+  summary gives it for 95 and 180 bytes an event too, and notes when events that aren't
+  modelled outnumber the payload events, since their data is counted as payloads.
 
 ## CPU costs
 
@@ -466,6 +519,8 @@ Used directly as the service time, it would count the queueing twice, and the ap
   simulated mean latency until they agree within 3%. The factor stays between 0.05 and 1,
   since latency can't be shorter than service time, and an operation with fewer than 50 calls
   in the pilot keeps the observed distribution.
+* The pilots run with the history sizes of the scenario, so the fitted service times leave room
+  for the time writes and reads take for their bytes at those sizes.
 * The CPU fit runs in the same pilots. Sweep cells and `--load` runs reuse the results.
 
 ## Hotspot rules (`src/report/rules.rs`)
@@ -501,6 +556,12 @@ knobs.
   failing as activities run out of retries are critical too. Activities that fail with a
   non-retryable error, as the scenario plans, are counted apart and raise neither: they are the
   workload's outcome, not a symptom.
+* **Caches.** An events cache hit ratio under 90%, with at least one miss a second, is a
+  `cache` hotspot (a warning under 50%): events read back from the database, with
+  `history.eventsCacheMaxSizeBytes` and `payload_bytes` as knobs.
+* **History size.** Workflows terminated over `limit.historySize.error` are a critical
+  `history-size` hotspot, and histories over `limit.historySize.warn` a warning, with the
+  largest history.
 * **Causal ranking.** After detection, a causal pass re-ranks results:
   * when polls are rejected, the frontend or matching limiter that rejects them outranks the
     worker schedule-to-start latency and the matching backlog they cause;
@@ -526,6 +587,11 @@ knobs.
 * The classic and fairness matchers.
 * DNS caching, TLS handshake cost and cross-AZ effects of the client load-balancing modes.
 * GC pauses and memory pressure.
+* CPU and network time for payload bytes; only the database's time is charged.
+* The history event count limit (`limit.historyCount.error`), the mutable state size limit and
+  the gRPC message size limit. The history size limit is checked when a workflow task completes
+  rather than on every update, and the caller sees `NotFound` rather than `InvalidArgument`.
+* Continue-as-new.
 * Database-internal contention (row locks, vacuum, compaction).
 * The minute a new pod runs on its per-pod persistence setting before its limiter first
   re-reads the cluster-wide share.

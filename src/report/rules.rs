@@ -5,7 +5,7 @@
 use super::*;
 use crate::config::scenario::ClientLb;
 use crate::metrics::observed::Observations;
-use crate::util::units::{fmt_pct, fmt_rate, fmt_us};
+use crate::util::units::{fmt_bytes, fmt_pct, fmt_rate, fmt_us};
 
 struct Ctx2<'a> {
     ctx: &'a Ctx,
@@ -168,6 +168,7 @@ pub fn detect(ctx: &Ctx, r: &RunResult) -> Vec<Hotspot> {
     limits(&c, &mut out);
     headroom(&c, &mut out);
     caches(&c, &mut out);
+    history_size(&c, &mut out);
     schedules(&c, &mut out);
     api_latency(&c, &mut out);
     movement(&c, &mut out);
@@ -410,14 +411,15 @@ fn sample_quantile(sorted: &[f64], q: f64) -> f64 {
 
 fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     for (i, w) in c.r.workflows.iter().enumerate() {
-        // not keeping up: workflows close (complete or fail) more slowly than a healthy cluster
-        // would close them, given how long they run by themselves
+        // not keeping up: workflows close (complete, fail or are terminated) more slowly than a
+        // healthy cluster would close them, given how long they run by themselves
         if w.started_per_s > 0.0
             && let Some(runs) = own_run_times(&c.ctx.p, i)
         {
             let window = c.r.duration_s;
             let expected = w.started_per_s * closing_fraction(&runs, c.r.warmup_s, window);
-            let closed = w.completed_per_s + w.failed_per_s;
+            let closed =
+                w.completed_per_s + w.failed_per_s + w.terminated as f64 / window.max(1e-9);
             let short = expected - closed;
             let noise = 3.0 * (expected * window).sqrt() / window;
             if expected > 0.0 && short > noise.max(0.1 * expected) {
@@ -1600,6 +1602,38 @@ fn limits(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
 
 fn caches(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     let h = &c.r.history;
+    if h.events_cache_hit_ratio < 0.9 && h.events_cache_misses_per_s >= 1.0 {
+        out.push(hs(
+            if h.events_cache_hit_ratio < 0.5 {
+                Severity::Warning
+            } else {
+                Severity::Info
+            },
+            "cache",
+            "events cache".into(),
+            format!(
+                "history events cache hit ratio {}: {} events read back from the database",
+                fmt_pct(h.events_cache_hit_ratio),
+                fmt_rate(h.events_cache_misses_per_s)
+            ),
+            "Activity starts, child workflow starts and children reporting to their parents read their scheduled, initiated or close event from the shard's events cache, which holds history.eventsCacheMaxSizeBytes (512 KiB per shard by default). Large payloads leave room for fewer events, and a lookup that misses reads the whole batch its event was written in (ReadHistoryBranch).".into(),
+            vec![],
+            &[
+                "cache_miss{operation=\"EventsCacheGetEvent\"}",
+                "cache_requests{operation=\"EventsCacheGetEvent\"}",
+                "persistence_requests{operation=\"ReadHistoryBranch\"}",
+            ],
+            vec![
+                c.knob("history.eventsCacheMaxSizeBytes", "bytes per shard"),
+                c.infra(
+                    "workflows.*.payload_bytes",
+                    "scenario".into(),
+                    "smaller payloads leave room for more events",
+                ),
+            ],
+            12.0,
+        ));
+    }
     if h.cache_hit_ratio < 0.8 {
         out.push(hs(
             if h.cache_hit_ratio < 0.5 { Severity::Warning } else { Severity::Info },
@@ -1627,6 +1661,59 @@ fn caches(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 15.0,
             ));
         }
+    }
+}
+
+/// Histories that grow over `limit.historySize.error` get their workflows terminated, and over
+/// `limit.historySize.warn` logged.
+fn history_size(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
+    for w in &c.r.workflows {
+        let terminated = w.terminated > 0;
+        if !terminated && w.histories_over_warn == 0 {
+            continue;
+        }
+        let mut evidence = vec![format!(
+            "largest history {}",
+            fmt_bytes(w.max_history_bytes)
+        )];
+        if w.histories_over_warn > 0 {
+            evidence.push(format!(
+                "{} workflows passed limit.historySize.warn",
+                w.histories_over_warn
+            ));
+        }
+        out.push(hs(
+            if terminated {
+                Severity::Critical
+            } else {
+                Severity::Warning
+            },
+            "history-size",
+            w.workflow_type.clone(),
+            if terminated {
+                format!(
+                    "{}: {} workflows terminated as their history grew over limit.historySize.error",
+                    w.workflow_type, w.terminated
+                )
+            } else {
+                format!(
+                    "{}: histories over limit.historySize.warn",
+                    w.workflow_type
+                )
+            },
+            "A running workflow whose history is over limit.historySize.error (50 MiB by default) is terminated at its next update; over limit.historySize.warn (10 MiB) the server logs a warning. Payloads make up most of a history's size: keep large data out of it and pass references, or continue-as-new before the limit (not simulated).".into(),
+            evidence,
+            &["history_size", "workflow_terminate"],
+            vec![
+                c.knob("limit.historySize.error", "bytes of history per execution"),
+                c.infra(
+                    "workflows.*.payload_bytes",
+                    "scenario".into(),
+                    "keep large data outside the history and pass references",
+                ),
+            ],
+            if terminated { 75.0 } else { 20.0 },
+        ));
     }
 }
 

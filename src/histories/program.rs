@@ -8,9 +8,12 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::util::units::{fmt_rate, fmt_us};
+use crate::model::world::{EVENT_BYTES, SIGNAL_BYTES};
+use crate::util::units::{fmt_bytes, fmt_rate, fmt_us};
 
-use super::trace::{ActOutcome, Activity, Ending, Outcome, Retry, Step, TimeoutType, Trace};
+use super::trace::{
+    ActOutcome, Activity, Ending, Outcome, Retry, SizeSample, Step, TimeoutType, Trace,
+};
 
 /// Options of an import.
 #[derive(Clone, Debug)]
@@ -61,8 +64,9 @@ pub fn build(traces: &[Trace], opts: &Options) -> Program {
     let _ = writeln!(
         yaml,
         "# Imported by `tempdes workload import` from {} histories started over {}.\n\
-         # Payloads were not read. Durations are each step's own time, without waits in the\n\
-         # cluster. Add a worker fleet for every task queue named here.\nworkflows:",
+         # Payloads were not read; payload_bytes comes from the history sizes the server\n\
+         # recorded. Durations are each step's own time, without waits in the cluster.\n\
+         # Add a worker fleet for every task queue named here.\nworkflows:",
         traces.len(),
         fmt_us((last - first).max(0) as f64)
     );
@@ -212,6 +216,36 @@ fn workflow_type(
     if !child {
         let _ = writeln!(summary, "  start rate: {rate_note}");
     }
+    let samples: Vec<SizeSample> = runs.iter().filter_map(|t| t.size).collect();
+    let payload = payload_bytes(&samples, EVENT_BYTES);
+    let _ = match payload {
+        Some(p) => writeln!(
+            summary,
+            "  payload_bytes {} from the history sizes the server recorded (historySizeBytes) in {} of {n} histories, less {} an event and {} a signal ({}–{} for {}–{} an event)",
+            fmt_bytes(p),
+            samples.len(),
+            fmt_bytes(EVENT_BYTES),
+            fmt_bytes(SIGNAL_BYTES),
+            fmt_bytes(payload_bytes(&samples, EVENT_BYTES_RANGE.1).unwrap_or(0.0)),
+            fmt_bytes(payload_bytes(&samples, EVENT_BYTES_RANGE.0).unwrap_or(0.0)),
+            fmt_bytes(EVENT_BYTES_RANGE.1),
+            fmt_bytes(EVENT_BYTES_RANGE.0)
+        ),
+        None => writeln!(
+            summary,
+            "  payload_bytes left at the default: no history recorded its size (historySizeBytes); set it if payloads are large"
+        ),
+    };
+    let unmodelled: u32 = samples.iter().map(|s| s.unmodelled).sum();
+    let payloads: u32 = samples.iter().map(|s| s.payloads).sum();
+    if payload.is_some() && unmodelled >= payloads {
+        let _ = writeln!(
+            summary,
+            "  note: payload_bytes takes in the data of {} the simulator doesn't model (markers, search attribute upserts, updates, ...), against {} with payloads: high if that data is large",
+            Unit::Events.count(unmodelled as usize),
+            Unit::Events.count(payloads as usize)
+        );
+    }
     let mut notes = Notes::new();
     let mut skipped: BTreeMap<String, u32> = BTreeMap::new();
     for t in runs {
@@ -251,6 +285,7 @@ fn workflow_type(
             &type_name,
             path_runs,
             (!child).then_some(rate * share),
+            payload,
             opts,
             yaml,
             &mut notes,
@@ -277,6 +312,7 @@ fn entry(
     type_name: &str,
     runs: &[&Trace],
     rate: Option<f64>,
+    payload: Option<f64>,
     opts: &Options,
     yaml: &mut String,
     notes: &mut Notes,
@@ -294,6 +330,9 @@ fn entry(
         .collect();
     if let Some(d) = dist(&mut wft) {
         let _ = writeln!(yaml, "    wft_processing: {d}");
+    }
+    if let Some(p) = payload {
+        let _ = writeln!(yaml, "    payload_bytes: {}", fmt_bytes(p));
     }
     // the typical wait of a first attempt in its queue, for steps without one
     let mut waits: Vec<f64> = runs
@@ -360,6 +399,28 @@ fn entry(
             }
         }
     }
+}
+
+/// What an event weighs besides its payload in histories that recorded their sizes: 95–180
+/// bytes (1,308 events of the Go SDK's replay tests).
+const EVENT_BYTES_RANGE: (f64, f64) = (95.0, 180.0);
+
+/// The mean size of a payload in histories whose sizes the server recorded: what is left of
+/// their sizes once `per_event` for each event and `SIGNAL_BYTES` for each signal's input are
+/// taken off, over the events that carry a payload where the simulator charges one. Payloads
+/// aren't read.
+fn payload_bytes(samples: &[SizeSample], per_event: f64) -> Option<f64> {
+    let payloads: f64 = samples.iter().map(|s| f64::from(s.payloads)).sum();
+    if payloads == 0.0 {
+        return None;
+    }
+    let rest: f64 = samples
+        .iter()
+        .map(|s| {
+            s.bytes as f64 - per_event * f64::from(s.events) - SIGNAL_BYTES * f64::from(s.signals)
+        })
+        .sum();
+    Some((rest / payloads).max(0.0))
 }
 
 fn failed(o: ActOutcome) -> bool {
@@ -448,6 +509,7 @@ fn started_together(
 enum Unit {
     Histories,
     Activities,
+    Events,
 }
 
 impl Unit {
@@ -455,6 +517,7 @@ impl Unit {
         let (one, many) = match self {
             Unit::Histories => ("history", "histories"),
             Unit::Activities => ("activity", "activities"),
+            Unit::Events => ("event", "events"),
         };
         format!("{n} {}", if n == 1 { one } else { many })
     }
