@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 use crate::util::units::{fmt_rate, fmt_us};
 
-use super::trace::{ActOutcome, Activity, Outcome, Step, Trace};
+use super::trace::{ActOutcome, Activity, Ending, Outcome, Retry, Step, TimeoutType, Trace};
 
 /// Options of an import.
 #[derive(Clone, Debug)]
@@ -214,11 +214,11 @@ fn workflow_type(
     if !child {
         let _ = writeln!(summary, "  start rate: {rate_note}");
     }
-    let mut notes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut notes = Notes::new();
     let mut skipped: BTreeMap<String, u32> = BTreeMap::new();
     for t in runs {
-        for note in &t.notes {
-            *notes.entry(note.clone()).or_default() += 1;
+        for text in &t.notes {
+            note(&mut notes, text, Unit::Histories, 1);
         }
         for (k, v) in &t.skipped {
             *skipped.entry(k.clone()).or_default() += v;
@@ -258,8 +258,8 @@ fn workflow_type(
             &mut notes,
         );
     }
-    for (note, count) in &notes {
-        let _ = writeln!(summary, "  note: {note} ({count} histories)");
+    for ((text, unit), n) in &notes {
+        let _ = writeln!(summary, "  note: {text} ({})", unit.count(*n));
     }
     if !skipped.is_empty() {
         let _ = writeln!(
@@ -281,7 +281,7 @@ fn entry(
     rate: Option<f64>,
     opts: &Options,
     yaml: &mut String,
-    notes: &mut BTreeMap<String, usize>,
+    notes: &mut Notes,
 ) {
     let task_queue = most_common(runs.iter().map(|t| t.task_queue.clone())).unwrap_or_default();
     let _ = writeln!(yaml, "  - type: {}", quote(type_name));
@@ -297,6 +297,12 @@ fn entry(
     if let Some(d) = dist(&mut wft) {
         let _ = writeln!(yaml, "    wft_processing: {d}");
     }
+    // the typical wait of a first attempt in its queue, for steps without one
+    let mut waits: Vec<f64> = runs
+        .iter()
+        .flat_map(|t| t.activity_queue_wait_us.iter().map(|&v| v as f64))
+        .collect();
+    let type_wait = quantile(&mut waits, 0.5) as u64;
     let steps = runs.first().map_or(0, |t| t.steps.len());
     if steps == 0 {
         let _ = writeln!(yaml, "    steps: []");
@@ -333,6 +339,7 @@ fn entry(
                     &task_queue,
                     went_on > stopped,
                     at.len(),
+                    type_wait,
                     yaml,
                     notes,
                 );
@@ -370,9 +377,12 @@ fn entry(
             Step::Children(types) => {
                 let child = most_common(types.iter().cloned()).unwrap_or_default();
                 if types.iter().any(|t| *t != child) {
-                    *notes
-                        .entry("children of several types started together were imported as the most common type".into())
-                        .or_default() += 1;
+                    note(
+                        notes,
+                        "children of several types started together were imported as the most common type",
+                        Unit::Steps,
+                        1,
+                    );
                 }
                 let _ = writeln!(
                     yaml,
@@ -404,90 +414,255 @@ fn failed(o: ActOutcome) -> bool {
     matches!(o, ActOutcome::Failed | ActOutcome::TimedOut)
 }
 
-/// An activity step pooled over its executions.
+/// What a summary note counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Unit {
+    Histories,
+    Steps,
+    Activities,
+}
+
+impl Unit {
+    fn count(self, n: usize) -> String {
+        let (one, many) = match self {
+            Unit::Histories => ("history", "histories"),
+            Unit::Steps => ("step", "steps"),
+            Unit::Activities => ("activity", "activities"),
+        };
+        format!("{n} {}", if n == 1 { one } else { many })
+    }
+}
+
+/// Summary notes by text and what they count.
+type Notes = BTreeMap<(String, Unit), usize>;
+
+fn note(notes: &mut Notes, text: &str, unit: Unit, n: usize) {
+    *notes.entry((text.to_string(), unit)).or_default() += n;
+}
+
+/// The retry policy the server gives an activity that sets none
+/// (`history.defaultActivityRetryPolicy`).
+const DEFAULT_RETRY: Retry = Retry {
+    initial_us: 1_000_000,
+    coefficient: 2.0,
+    max_interval_us: 100_000_000,
+    max_attempts: 0,
+};
+
+/// The interval before the attempt after `attempt` (`nextBackoffInterval`,
+/// `service/history/workflow/retry.go`): the initial interval grown by the coefficient per
+/// attempt, up to the maximum interval (none when 0).
+fn retry_interval_us(r: &Retry, attempt: u32) -> u64 {
+    let v = r.initial_us as f64 * r.coefficient.powi(attempt.saturating_sub(1) as i32);
+    match r.max_interval_us {
+        0 => v.min(u64::MAX as f64) as u64,
+        max => v.min(max as f64) as u64,
+    }
+}
+
+/// An attempt that an activity whose attempts kept failing until its policy or its
+/// schedule-to-close timeout stopped them can't reach: one past the policy's attempts, or the
+/// first that the retry intervals alone would start after schedule-to-close.
+fn beyond_reach(a: &Activity) -> u32 {
+    let r = a.retry.unwrap_or(DEFAULT_RETRY);
+    let mut n = a.attempts + 1;
+    if r.max_attempts > 0 {
+        n = n.max(r.max_attempts + 1);
+    } else if a.timeouts.schedule_to_close > 0 {
+        let (mut waited, mut k) = (0u64, 1u32);
+        while waited <= a.timeouts.schedule_to_close && k < 10_000 {
+            waited = waited.saturating_add(retry_interval_us(&r, k));
+            k += 1;
+        }
+        n = n.max(k);
+    }
+    n
+}
+
+/// The run times of an activity's attempts before its last, which a history doesn't record,
+/// estimated from `gap`, the time from the first schedule to the last attempt's start: less the
+/// retry intervals of its policy and a typical queue wait (`wait`) per attempt, shared equally.
+/// The one before the last ran to its start-to-close timeout when the last attempt's
+/// `lastFailure` says it timed out.
+fn earlier_attempts_us(a: &Activity, gap: u64, wait: u64) -> Vec<u64> {
+    let mut left = a.attempts.saturating_sub(1);
+    if left == 0 {
+        return Vec::new();
+    }
+    let r = a.retry.unwrap_or(DEFAULT_RETRY);
+    let intervals = (1..a.attempts)
+        .map(|i| retry_interval_us(&r, i))
+        .fold(0u64, u64::saturating_add);
+    let waits = u64::from(a.attempts).saturating_mul(wait);
+    let mut total = gap.saturating_sub(intervals.saturating_add(waits));
+    let mut out = Vec::new();
+    let stc = a.timeouts.start_to_close;
+    if a.last_failure_timeout == Some(TimeoutType::StartToClose) && stc > 0 {
+        out.push(stc);
+        total = total.saturating_sub(stc);
+        left -= 1;
+    }
+    if left > 0 {
+        out.extend(std::iter::repeat_n(total / u64::from(left), left as usize));
+    }
+    out
+}
+
+/// An activity step pooled over its executions; `type_wait` is the typical queue wait of the
+/// workflow type's first attempts.
+#[allow(clippy::too_many_arguments)]
 fn activity_step(
     group: &[Activity],
     acts: &[&Activity],
     workflow_tq: &str,
     continue_on_failure: bool,
     executions: usize,
+    type_wait: u64,
     yaml: &mut String,
-    notes: &mut BTreeMap<String, usize>,
+    notes: &mut Notes,
 ) {
     let count = group.len();
     let mut types: Vec<&str> = group.iter().map(|a| a.activity_type.as_str()).collect();
     types.sort_unstable();
     types.dedup();
     let retried = acts.iter().filter(|a| a.attempts > 1).count();
+    let failed_for_good = acts
+        .iter()
+        .filter(|a| matches!(a.ending(), Ending::NonRetryable | Ending::RanOut))
+        .count();
+    let mut shares = String::new();
+    for (n, what) in [(retried, "retried"), (failed_for_good, "failed for good")] {
+        if n > 0 {
+            let _ = write!(shares, ", {} {what}", pct(n, acts.len()));
+        }
+    }
     let _ = writeln!(
         yaml,
-        "      # {}: {} activities in {executions} executions{}",
+        "      # {}: {} activities in {executions} executions{shares}",
         types.join(", "),
         acts.len(),
-        if retried > 0 {
-            format!(", {} retried", pct(retried, acts.len()))
-        } else {
-            String::new()
-        }
     );
     if types.len() > 1 {
-        *notes
-            .entry(
-                "parallel activities of different types were pooled into one distribution".into(),
-            )
-            .or_default() += 1;
+        note(
+            notes,
+            "parallel activities of different types were pooled into one distribution",
+            Unit::Steps,
+            1,
+        );
     }
     let _ = writeln!(yaml, "      - activity:");
     let _ = writeln!(yaml, "          count: {count}");
     if count > 1 {
         let _ = writeln!(yaml, "          parallel: true");
     }
-    let mut runs: Vec<f64> = acts
+    // plans: the attempt that succeeds, or fails with a non-retryable error; one whose attempts
+    // kept failing until its policy or schedule-to-close stopped them needs one it can't reach
+    let mut succeeds: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut rejected: BTreeMap<u32, usize> = BTreeMap::new();
+    // own run times: final attempts that succeeded; failed attempts, the final one when it
+    // failed and the ones before it estimated
+    let (mut runs, mut failed_runs): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+    let mut first_waits: Vec<f64> = acts
         .iter()
-        .filter_map(|a| a.run_us.map(|v| v as f64))
+        .filter(|a| a.attempts == 1)
+        .filter_map(|a| a.start_gap_us().map(|v| v as f64))
         .collect();
+    let wait = if first_waits.is_empty() {
+        type_wait
+    } else {
+        quantile(&mut first_waits, 0.5) as u64
+    };
+    let (mut queue_timeouts, mut estimated, mut no_state) = (0, 0, 0);
+    for a in acts {
+        match a.ending() {
+            Ending::Completed => {
+                *succeeds.entry(a.attempts).or_default() += 1;
+                runs.extend(a.run_us.map(|v| v as f64));
+            }
+            Ending::NonRetryable => {
+                *rejected.entry(a.attempts).or_default() += 1;
+                failed_runs.extend(a.run_us.map(|v| v as f64));
+            }
+            Ending::RanOut => {
+                *succeeds.entry(beyond_reach(a)).or_default() += 1;
+                failed_runs.extend(a.run_us.map(|v| v as f64));
+            }
+            Ending::QueueTimeout => {
+                queue_timeouts += 1;
+                continue;
+            }
+        }
+        if failed(a.outcome) && a.retry_state.is_none() {
+            no_state += 1;
+        }
+        if a.attempts > 1
+            && let Some(gap) = a.start_gap_us()
+        {
+            failed_runs.extend(
+                earlier_attempts_us(a, gap, wait)
+                    .into_iter()
+                    .map(|v| v as f64),
+            );
+            estimated += 1;
+        }
+    }
+    for (n, text) in [
+        (
+            queue_timeouts,
+            "activities that timed out waiting in a task queue (schedule-to-start) were left out of the attempt plans: that queueing is the recorded cluster's",
+        ),
+        (
+            estimated,
+            "failed attempts' durations were estimated from the time between scheduling and the last attempt's start, less the retry intervals and typical queue waits",
+        ),
+        (
+            no_state,
+            "failed activities with no recorded retry state were judged by their failure and retry policy",
+        ),
+    ] {
+        if n > 0 {
+            note(notes, text, Unit::Activities, n);
+        }
+    }
+    let failed_dist = dist(&mut failed_runs);
     let _ = writeln!(
         yaml,
         "          duration: {}",
-        dist(&mut runs).unwrap_or_else(|| "1s".into())
+        dist(&mut runs)
+            .or_else(|| failed_dist.clone())
+            .unwrap_or_else(|| "1s".into())
     );
-    // attempts: one that failed for good because its policy ran out needed more than it had
-    let retry = most_common(acts.iter().map(|a| a.retry.map(RetryKey::from))).flatten();
-    let mut plan: BTreeMap<u32, usize> = BTreeMap::new();
-    let mut unexplained = 0;
-    for a in acts {
-        let exhausted = a
-            .retry
-            .is_some_and(|r| r.max_attempts > 0 && a.attempts >= r.max_attempts);
-        let n = if failed(a.outcome) && exhausted {
-            a.attempts + 1
-        } else {
-            if failed(a.outcome) {
-                unexplained += 1;
-            }
-            a.attempts
-        };
-        *plan.entry(n).or_default() += 1;
+    if let Some(d) = failed_dist {
+        let _ = writeln!(yaml, "          failed_duration: {d}");
     }
-    if unexplained > 0 {
-        *notes
-            .entry("activities that failed without using up their retries (non-retryable errors, timeouts) were imported as succeeding on their last attempt".into())
-            .or_default() += 1;
-    }
-    match plan.len() {
-        1 if plan.contains_key(&1) => {}
+    let planned = succeeds.values().sum::<usize>() + rejected.values().sum::<usize>();
+    let shares_of = |m: &BTreeMap<u32, usize>| {
+        m.iter()
+            .map(|(k, v)| format!("{k}: {}", share(*v as f64 / planned as f64)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // one count applies to every activity the non-retryable shares leave
+    match succeeds.len() {
+        0 => {}
         1 => {
-            let _ = writeln!(yaml, "          attempts: {}", plan.keys().next().unwrap());
+            let k = *succeeds.keys().next().unwrap();
+            if k > 1 {
+                let _ = writeln!(yaml, "          attempts: {k}");
+            }
         }
         _ => {
-            let total: usize = plan.values().sum();
-            let shares: Vec<String> = plan
-                .iter()
-                .map(|(k, v)| format!("{k}: {}", num(*v as f64 / total as f64)))
-                .collect();
-            let _ = writeln!(yaml, "          attempts: {{ {} }}", shares.join(", "));
+            let _ = writeln!(yaml, "          attempts: {{ {} }}", shares_of(&succeeds));
         }
     }
+    if !rejected.is_empty() {
+        let _ = writeln!(
+            yaml,
+            "          non_retryable: {{ {} }}",
+            shares_of(&rejected)
+        );
+    }
+    let retry = most_common(acts.iter().map(|a| a.retry.map(RetryKey::from))).flatten();
     if let Some(r) = retry {
         let _ = writeln!(
             yaml,
@@ -660,6 +835,17 @@ fn num(x: f64) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// A share with three significant digits, so small ones aren't rounded to zero.
+fn share(x: f64) -> String {
+    if x <= 0.0 {
+        return "0".into();
+    }
+    let decimals = (2 - x.log10().floor() as i32).max(0) as usize;
+    let s = format!("{x:.decimals$}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_string()
 }
 
 fn pct(part: usize, whole: usize) -> String {

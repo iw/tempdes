@@ -185,6 +185,15 @@ pub fn name(v: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// An enum value in either spelling, lower-case without its prefix or underscores:
+/// `RETRY_STATE_NON_RETRYABLE_FAILURE` and `NonRetryableFailure` both give
+/// `nonretryablefailure`.
+pub fn enum_value(v: &Value, prefix: &str) -> Option<String> {
+    v.as_str()
+        .map(|s| normalise(s.strip_prefix(prefix).unwrap_or(s)))
+        .filter(|s| !s.is_empty() && s != "unspecified")
+}
+
 /// An integer written as a number or a string.
 pub fn int(v: &Value) -> Option<i64> {
     match v {
@@ -308,6 +317,17 @@ mod tests {
         // the attributes key names the type when eventType is missing
         let bare = r#"[{"eventTime": "2026-09-28T10:00:00Z", "timerFiredEventAttributes": {}}]"#;
         assert_eq!(parse_history(bare).unwrap()[0].kind, Kind::TimerFired);
+        // enum values come in the same two spellings
+        for s in ["RETRY_STATE_NON_RETRYABLE_FAILURE", "NonRetryableFailure"] {
+            assert_eq!(
+                enum_value(&Value::from(s), "RETRY_STATE_").as_deref(),
+                Some("nonretryablefailure")
+            );
+        }
+        assert_eq!(
+            enum_value(&Value::from("RETRY_STATE_UNSPECIFIED"), "RETRY_STATE_"),
+            None
+        );
     }
 
     #[test]

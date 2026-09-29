@@ -107,9 +107,107 @@ impl History {
         );
     }
 
+    /// The final attempt of activity `scheduled` failing: started at `start_ms` (`None`: it never
+    /// started), with `started` added to its started event, and closed at `end_ms` by `close`
+    /// (`ActivityTaskFailed` or `ActivityTaskTimedOut`) with `closed` added.
+    #[allow(clippy::too_many_arguments)]
+    fn fail(
+        &mut self,
+        scheduled: i64,
+        attempt: u32,
+        start_ms: Option<f64>,
+        started: Value,
+        close: &str,
+        end_ms: f64,
+        closed: Value,
+    ) {
+        let mut attrs = json!({"scheduledEventId": scheduled.to_string()});
+        if let Some(s) = start_ms {
+            let mut a = json!({"scheduledEventId": scheduled.to_string(), "attempt": attempt});
+            merge(&mut a, started);
+            let st = self.event("ActivityTaskStarted", s, a);
+            attrs["startedEventId"] = st.to_string().into();
+        }
+        merge(&mut attrs, closed);
+        self.event(close, end_ms, attrs);
+    }
+
     fn json(&self) -> String {
         json!({"events": self.events}).to_string()
     }
+}
+
+fn merge(into: &mut Value, from: Value) {
+    if let (Some(a), Value::Object(b)) = (into.as_object_mut(), from) {
+        a.extend(b);
+    }
+}
+
+/// A payment: one Authorize activity scheduled at 10ms, 20ms in the queue before each attempt,
+/// failed attempts of 300ms, 1s, 2s, 4s… apart, and a final attempt of 100ms (50ms when it
+/// fails). It succeeds on attempt `attempts`, or with `non_retryable`, fails for good there and
+/// fails the workflow.
+fn payment(start_ms: f64, attempts: u32, non_retryable: bool, prefixed: bool) -> String {
+    let mut h = History::new("PaymentWorkflow", start_ms, prefixed);
+    let w = h.wft(0.0, 5.0);
+    let a = h.schedule(w, "Authorize", 10.0);
+    let mut t = 10.0;
+    for n in 1..attempts {
+        t += 20.0 + 300.0 + 1000.0 * 2f64.powi(n as i32 - 1);
+    }
+    t += 20.0;
+    let last_failure = if attempts > 1 {
+        json!({"lastFailure": {"message": "declined", "applicationFailureInfo": {"type": "Busy"}}})
+    } else {
+        json!({})
+    };
+    if non_retryable {
+        let state = if prefixed {
+            "RETRY_STATE_NON_RETRYABLE_FAILURE"
+        } else {
+            "NonRetryableFailure"
+        };
+        h.fail(
+            a,
+            attempts,
+            Some(t),
+            last_failure,
+            "ActivityTaskFailed",
+            t + 50.0,
+            json!({"retryState": state, "failure": {"message": "card declined", "applicationFailureInfo": {"type": "Declined", "nonRetryable": true}}}),
+        );
+        h.wft(t + 50.0, 2.0);
+        h.event("WorkflowExecutionFailed", t + 53.0, json!({}));
+    } else {
+        let st = h.event(
+            "ActivityTaskStarted",
+            t,
+            json!({"scheduledEventId": a.to_string(), "attempt": attempts, "lastFailure": last_failure["lastFailure"]}),
+        );
+        h.event(
+            "ActivityTaskCompleted",
+            t + 100.0,
+            json!({"scheduledEventId": a.to_string(), "startedEventId": st.to_string()}),
+        );
+        h.wft(t + 100.0, 2.0);
+        h.event("WorkflowExecutionCompleted", t + 103.0, json!({}));
+    }
+    h.json()
+}
+
+fn import(histories: &[String]) -> program::Program {
+    let traces: Vec<_> = histories
+        .iter()
+        .map(|h| trace(&parse_history(h).unwrap()).unwrap())
+        .collect();
+    program::build(
+        &traces,
+        &Options {
+            namespace: "payments".into(),
+            rate: Some(10.0),
+            ..Default::default()
+        },
+    )
 }
 
 /// An order: charge; publish, check and look up in parallel (the lookup took `lookup_attempts`,
@@ -279,6 +377,16 @@ fn executions_are_pooled_by_path() {
         "{}",
         p.yaml
     );
+    // their earlier attempts ran 100ms: the time before the last attempt less 1s + 2s + 4s of
+    // retry intervals and 20ms in the queue per attempt
+    assert!(p.yaml.contains("failed_duration: 100ms"), "{}", p.yaml);
+    assert!(
+        p.summary
+            .contains("failed attempts' durations were estimated")
+            && p.summary.contains("(2 activities)"),
+        "{}",
+        p.summary
+    );
     // the rarer path (1 of 7) is a type of its own, with its share of the rate
     assert!(p.yaml.contains("type: \"OrderWorkflow~2\""), "{}", p.yaml);
     assert!(
@@ -304,6 +412,212 @@ fn executions_are_pooled_by_path() {
     );
     assert!(!folded.yaml.contains("OrderWorkflow~2"), "{}", folded.yaml);
     assert!(folded.yaml.contains("start_rate: 70/s"), "{}", folded.yaml);
+}
+
+/// A sync: one Fetch activity with a 10s schedule-to-close timeout, scheduled at 10ms, after
+/// which the workflow completes. It succeeds after 20ms in the queue and 100ms (`"ok"`), keeps
+/// failing until the timeout fires during its third attempt, which started at 3.67s (`"ran
+/// out"`), or waits in its queue past its 5s schedule-to-start timeout (`"queued"`).
+fn sync(start_ms: f64, ending: &str, prefixed: bool) -> String {
+    let mut h = History::new("SyncWorkflow", start_ms, prefixed);
+    let w = h.wft(0.0, 5.0);
+    let a = h.event(
+        "ActivityTaskScheduled",
+        10.0,
+        json!({
+            "activityType": {"name": "Fetch"},
+            "taskQueue": {"name": "orders"},
+            "scheduleToCloseTimeout": "10s",
+            "scheduleToStartTimeout": "5s",
+            "startToCloseTimeout": "10s",
+            "workflowTaskCompletedEventId": w.to_string(),
+            "retryPolicy": {"initialInterval": "1s", "backoffCoefficient": 2, "maximumInterval": "100s"}
+        }),
+    );
+    let spell = |prefix: &str, long: &str, short: &str| {
+        if prefixed {
+            format!("{prefix}{long}")
+        } else {
+            short.to_string()
+        }
+    };
+    let end = match ending {
+        "ok" => {
+            h.run(a, 1, 30.0, 130.0);
+            130.0
+        }
+        "ran out" => {
+            h.fail(
+                a,
+                3,
+                Some(3670.0),
+                json!({}),
+                "ActivityTaskTimedOut",
+                10_010.0,
+                json!({
+                    "retryState": spell("RETRY_STATE_", "TIMEOUT", "Timeout"),
+                    "failure": {"timeoutFailureInfo": {"timeoutType": spell("TIMEOUT_TYPE_", "SCHEDULE_TO_CLOSE", "ScheduleToClose")}}
+                }),
+            );
+            10_010.0
+        }
+        _ => {
+            h.fail(
+                a,
+                1,
+                None,
+                json!({}),
+                "ActivityTaskTimedOut",
+                5010.0,
+                json!({
+                    "retryState": spell("RETRY_STATE_", "TIMEOUT", "Timeout"),
+                    "failure": {"timeoutFailureInfo": {"timeoutType": spell("TIMEOUT_TYPE_", "SCHEDULE_TO_START", "ScheduleToStart")}}
+                }),
+            );
+            5010.0
+        }
+    };
+    h.wft(end, 2.0);
+    h.event("WorkflowExecutionCompleted", end + 3.0, json!({}));
+    h.json()
+}
+
+/// Wraps imported `workflows:` in a scenario with a worker fleet, and simulates it.
+fn simulate(namespace: &str, workflows: &str) -> report::RunResult {
+    let scenario = format!(
+        "name: imported\nwarmup: 20s\nduration: 30s\ncluster:\n  num_history_shards: 64\n  replicas: {{ frontend: 1, history: 1, matching: 1, worker: 1 }}\n  persistence: {{ store: postgresql }}\nnamespaces: [ {{ name: {namespace} }} ]\nworkers:\n  - {{ name: w, namespace: {namespace}, task_queue: orders, processes: 2, activity_slots: 200 }}\n{workflows}"
+    );
+    let sc = Scenario::parse_str(&scenario).unwrap_or_else(|e| panic!("{e}\n{scenario}"));
+    let params = run::prepare(&sc, &Overrides::default(), None).expect("parameters resolve");
+    let out = run::run_params(params);
+    report::analyze(&out.ctx, &out.info, None)
+}
+
+#[test]
+fn failures_become_attempt_plans() {
+    for prefixed in [false, true] {
+        // 7 payments authorised at once, 2 on their third attempt, 1 declined on its second
+        let histories: Vec<String> = (0..10)
+            .map(|i| {
+                let start = f64::from(i) * 10_000.0;
+                match i {
+                    0..7 => payment(start, 1, false, prefixed),
+                    7 | 8 => payment(start, 3, false, prefixed),
+                    _ => payment(start, 2, true, prefixed),
+                }
+            })
+            .collect();
+        let p = import(&histories);
+        for want in [
+            "30% retried, 10% failed for good",
+            "attempts: { 1: 0.7, 3: 0.2 }",
+            "non_retryable: { 2: 0.1 }",
+            "duration: 100ms",
+            // the declined attempt's 50ms, and 300ms for the five attempts before the last ones:
+            // the time before the last attempt less 1s, 2s… of retry intervals and 20ms in the
+            // queue per attempt
+            "failed_duration: 300ms",
+        ] {
+            assert!(p.yaml.contains(want), "{want}\n{}", p.yaml);
+        }
+        // the declined payment failed its workflow
+        assert!(!p.yaml.contains("on_failure"), "{}", p.yaml);
+        assert!(p.summary.contains("(3 activities)"), "{}", p.summary);
+        // a tenth of the workflows fail, as planned: not a hotspot
+        let r = simulate("payments", &p.yaml);
+        let w = &r.workflows[0];
+        assert!(
+            (w.failed_per_s / w.started_per_s - 0.1).abs() < 0.05,
+            "{w:#?}"
+        );
+        assert_eq!(w.activities_non_retryable, w.activities_failed, "{w:#?}");
+        assert!(
+            !r.hotspots.iter().any(|h| h.category == "activity-timeouts"),
+            "{:?}",
+            r.hotspots.iter().map(|h| &h.title).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn timeouts_are_told_apart() {
+    let histories: Vec<String> = ["ok", "ok", "ok", "ran out", "queued"]
+        .iter()
+        .enumerate()
+        .map(|(i, e)| sync(i as f64 * 20_000.0, e, i % 2 == 0))
+        .collect();
+    let p = import(&histories);
+    for want in [
+        // the attempts that ran out of time need a fifth attempt to succeed, and the 1s, 2s,
+        // 4s and 8s of retry intervals alone before it pass the 10s schedule-to-close
+        "attempts: { 1: 0.75, 5: 0.25 }",
+        // the workflows went on after the activity failed
+        "on_failure: continue",
+        "schedule_to_close_timeout: 10s",
+        // the timed-out attempt's 6.34s, and 300ms for each of the two before it
+        "failed_duration: { p50: 300ms, p99: 6.34s }",
+    ] {
+        assert!(p.yaml.contains(want), "{want}\n{}", p.yaml);
+    }
+    // the queued one is the recorded cluster's queueing: left out of the plans
+    assert!(
+        p.summary.contains("timed out waiting in a task queue")
+            && p.summary.contains("(1 activity)"),
+        "{}",
+        p.summary
+    );
+    simulate("payments", &p.yaml);
+}
+
+#[test]
+fn failures_without_a_retry_state_are_judged_by_failure_and_policy() {
+    // two activities that failed on the fifth and last attempt their policy allows, with no
+    // retry state recorded: one with an error marked non-retryable, one that used up its attempts
+    let histories: Vec<String> = [true, false]
+        .iter()
+        .map(|&non_retryable| {
+            let mut h = History::new("LegacyWorkflow", 0.0, false);
+            let w = h.wft(0.0, 5.0);
+            let a = h.event(
+                "ActivityTaskScheduled",
+                10.0,
+                json!({
+                    "activityType": {"name": "Post"},
+                    "taskQueue": {"name": "orders"},
+                    "startToCloseTimeout": "10s",
+                    "workflowTaskCompletedEventId": w.to_string(),
+                    "retryPolicy": {"initialInterval": "1s", "backoffCoefficient": 2, "maximumAttempts": 5}
+                }),
+            );
+            h.fail(
+                a,
+                5,
+                Some(15_000.0),
+                json!({}),
+                "ActivityTaskFailed",
+                15_100.0,
+                json!({"failure": {"applicationFailureInfo": {"type": "Rejected", "nonRetryable": non_retryable}}}),
+            );
+            h.wft(15_100.0, 2.0);
+            h.event("WorkflowExecutionFailed", 15_103.0, json!({}));
+            h.json()
+        })
+        .collect();
+    let p = import(&histories);
+    // the used-up one needs a sixth attempt its policy doesn't allow
+    for want in [
+        "attempts: 6",
+        "non_retryable: { 5: 0.5 }",
+        "max_attempts: 5",
+    ] {
+        assert!(p.yaml.contains(want), "{want}\n{}", p.yaml);
+    }
+    assert!(
+        p.summary.contains("no recorded retry state") && p.summary.contains("(2 activities)"),
+        "{}",
+        p.summary
+    );
+    simulate("payments", &p.yaml);
 }
 
 #[test]

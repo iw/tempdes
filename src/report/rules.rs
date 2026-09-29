@@ -242,6 +242,7 @@ fn sample_run_time(
                 count,
                 parallel,
                 duration,
+                failed_duration,
                 failure_rate,
                 attempts,
                 retry,
@@ -259,6 +260,7 @@ fn sample_run_time(
                     }
                     let (d, ok) = sample_activity(
                         duration,
+                        failed_duration.as_deref(),
                         *failure_rate,
                         attempts.as_ref(),
                         retry,
@@ -298,13 +300,14 @@ fn sample_run_time(
 }
 
 /// One activity's time from its first schedule to its outcome, in seconds, and whether it
-/// succeeded. An attempt fails at `failure_rate`, or before the planned count of `attempts`,
-/// or when it runs past start-to-close or schedule-to-close (the worker stops at its
-/// deadline); a failed attempt retries after the policy's next interval
-/// (`nextBackoffInterval`) until the attempts are used up or the retry would start after the
-/// schedule-to-close deadline.
+/// succeeded. An attempt fails as its plan says (`attempts`, `non_retryable`) or at
+/// `failure_rate`, running for `failed_duration` when set, or when it runs past start-to-close
+/// or schedule-to-close (the worker stops at its deadline). A non-retryable failure ends the
+/// activity; another retries after the policy's next interval (`nextBackoffInterval`) until the
+/// attempts are used up or the retry would start after the schedule-to-close deadline.
 fn sample_activity(
     duration: &crate::sim::dist::Dist,
+    failed_duration: Option<&crate::sim::dist::Dist>,
     failure_rate: f64,
     attempts: Option<&crate::model::params::AttemptsP>,
     retry: &crate::model::params::RetryPolicyP,
@@ -314,7 +317,7 @@ fn sample_activity(
     // retries beyond this count run past any measurement window
     const MAX_ATTEMPTS: u32 = 1_000;
     let expiration = (timeouts.schedule_to_close > 0).then_some(timeouts.schedule_to_close);
-    let planned = attempts.map(|a| a.sample(rng.f64()));
+    let plan = attempts.map(|a| a.sample(rng.f64())).unwrap_or_default();
     let mut now: u64 = 0;
     let mut attempt = 1;
     loop {
@@ -325,15 +328,24 @@ fn sample_activity(
         if let Some(e) = expiration {
             deadline = deadline.min(e.max(now));
         }
-        let end = now.saturating_add(duration.sample_us(rng));
-        let failed = match planned {
-            Some(n) => attempt < n,
-            None => rng.f64() < failure_rate,
+        // drawn in the worker's order (`sdk::process_activity`)
+        let mut outcome = plan.outcome(attempt);
+        if outcome.is_none() && failed_duration.is_some() {
+            outcome = Some((rng.f64() < failure_rate, false));
+        }
+        let d = match (outcome, failed_duration) {
+            (Some((true, _)), Some(f)) => f,
+            _ => duration,
         };
+        let end = now.saturating_add(d.sample_us(rng));
+        let (failed, non_retryable) = outcome.unwrap_or_else(|| (rng.f64() < failure_rate, false));
         if end < deadline && !failed {
             return (end as f64 / 1e6, true);
         }
         now = end.min(deadline);
+        if end < deadline && non_retryable {
+            return (now as f64 / 1e6, false);
+        }
         match retry.next_delay(attempt, now, expiration) {
             Some(d) if attempt < MAX_ATTEMPTS => {
                 now += d;
@@ -549,6 +561,16 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
 fn activity_timeouts(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     for w in &c.r.workflows {
         let fired: u64 = w.activity_timeouts.values().sum();
+        // activities the scenario fails with a non-retryable error are its outcome, not a symptom
+        let unplanned = w
+            .activities_failed
+            .saturating_sub(w.activities_non_retryable);
+        let planned = (w.activities_non_retryable > 0).then(|| {
+            format!(
+                "{} activities failed with non-retryable errors, as the scenario plans",
+                w.activities_non_retryable
+            )
+        });
         if fired > 0 {
             let rate = fired as f64 / c.r.duration_s;
             let attempts =
@@ -575,19 +597,19 @@ fn activity_timeouts(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 detail.push("Heartbeat: a running attempt's heartbeats stopped reaching history in time, for example throttled or failing RecordActivityTaskHeartbeat calls. The attempt is retried from scratch while the worker's copy is cancelled.");
             }
             let mut evidence = vec![format!("{} of activity attempts timed out", fmt_pct(frac))];
-            if w.activities_failed > 0 {
+            if unplanned > 0 {
                 evidence.push(format!(
-                    "{} activities failed for good (timeouts not retried, or retries used up)",
-                    w.activities_failed
+                    "{unplanned} activities failed for good (timeouts not retried, or retries used up)"
                 ));
+                if w.failed_per_s > 0.0 {
+                    evidence.push(format!(
+                        "{} of the workflows failed as a result",
+                        fmt_rate(w.failed_per_s)
+                    ));
+                }
             }
-            if w.failed_per_s > 0.0 {
-                evidence.push(format!(
-                    "{} of the workflows failed as a result",
-                    fmt_rate(w.failed_per_s)
-                ));
-            }
-            let failing = w.activities_failed > 0 || w.failed_per_s > 0.0;
+            evidence.extend(planned.clone());
+            let failing = unplanned > 0;
             out.push(hs(
                 if failing || frac > 0.01 {
                     Severity::Critical
@@ -627,7 +649,7 @@ fn activity_timeouts(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 ],
                 if failing { 70.0 } else { 30.0 } + frac * 100.0,
             ));
-        } else if w.failed_per_s > 0.0 {
+        } else if unplanned > 0 && w.failed_per_s > 0.0 {
             out.push(hs(
                 Severity::Critical,
                 "activity-timeouts",
@@ -639,10 +661,9 @@ fn activity_timeouts(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 ),
                 "Activities that fail more often than their retry policy allows fail the workflow."
                     .into(),
-                vec![format!(
-                    "{} activities failed for good",
-                    w.activities_failed
-                )],
+                std::iter::once(format!("{unplanned} activities failed for good"))
+                    .chain(planned)
+                    .collect(),
                 &["workflow_failed", "activity_failures"],
                 vec![c.infra(
                     "workflows.*.steps[].activity.max_attempts",
@@ -2139,7 +2160,8 @@ mod tests {
 
     #[test]
     fn activity_retries_follow_the_policy_and_timeouts() {
-        use crate::model::params::{ActTimeouts, RetryPolicyP};
+        use crate::config::scenario::AttemptsSpec;
+        use crate::model::params::{ActTimeouts, AttemptsP, RetryPolicyP};
         use crate::sim::dist::Dist;
         let mut rng = crate::sim::rng::Rng::new(1);
         let retry = RetryPolicyP {
@@ -2155,19 +2177,18 @@ mod tests {
         // a 10s attempt times out at 2s: attempts at 0-2s, 3-5s and 7-9s, then the policy stops
         let long = Dist::Const(10_000_000.0);
         assert_eq!(
-            sample_activity(&long, 0.0, None, &retry, &timeouts, &mut rng),
+            sample_activity(&long, None, 0.0, None, &retry, &timeouts, &mut rng),
             (9.0, false)
         );
         // a fast attempt that never fails succeeds at once
         let fast = Dist::Const(500_000.0);
         assert_eq!(
-            sample_activity(&fast, 0.0, None, &retry, &timeouts, &mut rng),
+            sample_activity(&fast, None, 0.0, None, &retry, &timeouts, &mut rng),
             (0.5, true)
         );
         // three planned attempts of 0.5s: fail at 0.5s, retry at 1.5s, fail at 2s, retry at 4s,
         // succeed at 4.5s
-        let three =
-            crate::model::params::AttemptsP::new(&crate::config::scenario::AttemptsSpec::Count(3));
+        let three = AttemptsP::new(Some(&AttemptsSpec::Count(3)), None).unwrap();
         let unlimited_retry = RetryPolicyP {
             max_attempts: 0,
             ..retry
@@ -2175,6 +2196,7 @@ mod tests {
         assert_eq!(
             sample_activity(
                 &fast,
+                None,
                 0.0,
                 Some(&three),
                 &unlimited_retry,
@@ -2182,6 +2204,49 @@ mod tests {
                 &mut rng
             ),
             (4.5, true)
+        );
+        // failed attempts of 0.1s: fail at 0.1s, retry at 1.1s, fail at 1.2s, retry at 3.2s,
+        // succeed at 3.7s
+        let quick = Dist::Const(100_000.0);
+        assert_eq!(
+            sample_activity(
+                &fast,
+                Some(&quick),
+                0.0,
+                Some(&three),
+                &unlimited_retry,
+                &timeouts,
+                &mut rng
+            ),
+            (3.7, true)
+        );
+        // failed attempts that hang time out at 2s: 0-2s, 3-5s, then succeed at 7.5s
+        assert_eq!(
+            sample_activity(
+                &fast,
+                Some(&long),
+                0.0,
+                Some(&three),
+                &unlimited_retry,
+                &timeouts,
+                &mut rng
+            ),
+            (7.5, true)
+        );
+        // a non-retryable error on the second attempt ends the activity: fail at 0.5s, retry at
+        // 1.5s, fail for good at 2s
+        let second = AttemptsP::new(None, Some(&[(2, 1.0)].into())).unwrap();
+        assert_eq!(
+            sample_activity(
+                &fast,
+                None,
+                0.0,
+                Some(&second),
+                &unlimited_retry,
+                &timeouts,
+                &mut rng
+            ),
+            (2.0, false)
         );
         // schedule-to-close ends the retries: attempts at 0-2s and 3-5s, a third would start
         // after the 6s deadline
@@ -2195,7 +2260,7 @@ mod tests {
             ..retry
         };
         assert_eq!(
-            sample_activity(&long, 0.0, None, &unlimited, &bounded, &mut rng),
+            sample_activity(&long, None, 0.0, None, &unlimited, &bounded, &mut rng),
             (5.0, false)
         );
     }

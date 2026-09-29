@@ -859,21 +859,35 @@ async fn respond_wft(
 /// without a response ("Activity complete after timeout" in `internal_task_handlers.go`), and
 /// history's timeout task retries or fails the attempt.
 pub async fn process_activity(ctx: Ctx, wk: usize, info: ActTaskInfo, permit: Permit) {
-    let (duration, heartbeat, failure_rate, timeouts) =
+    // whether the attempt fails, and non-retryably: planned when the activity was scheduled, or
+    // drawn at the failure rate, up front when a failed attempt has its own duration
+    let (duration, heartbeat, outcome, failure_rate, timeouts) =
         match ctx.p.wf_types[info.wf_type].steps.get(info.step) {
             Some(StepP::Activity {
                 duration,
+                failed_duration,
                 heartbeat,
                 failure_rate,
                 timeouts,
                 ..
-            }) => (
-                duration.sample_us(&mut ctx.rng.borrow_mut()),
-                *heartbeat,
-                *failure_rate,
-                *timeouts,
-            ),
-            _ => (1_000, None, 0.0, Default::default()),
+            }) => {
+                let mut outcome = info.plan.outcome(info.attempt);
+                if outcome.is_none() && failed_duration.is_some() {
+                    outcome = Some((ctx.rand() < *failure_rate, false));
+                }
+                let d = match (outcome, failed_duration.as_deref()) {
+                    (Some((true, _)), Some(f)) => f,
+                    _ => duration,
+                };
+                (
+                    d.sample_us(&mut ctx.rng.borrow_mut()),
+                    *heartbeat,
+                    outcome,
+                    *failure_rate,
+                    *timeouts,
+                )
+            }
+            _ => (1_000, None, None, 0.0, Default::default()),
         };
     let ns = ctx.p.wf_types[info.wf_type].ns;
     let Some(shard) = ctx.wf_shard(info.wf, info.wgen) else {
@@ -921,11 +935,7 @@ pub async fn process_activity(ctx: Ctx, wk: usize, info: ActTaskInfo, permit: Pe
         drop(permit);
         return;
     }
-    let failed = if info.planned_attempts > 0 {
-        info.attempt < info.planned_attempts
-    } else {
-        ctx.rand() < failure_rate
-    };
+    let (failed, non_retryable) = outcome.unwrap_or_else(|| (ctx.rand() < failure_rate, false));
     let api = if failed {
         Api::RespondActivityTaskFailed
     } else {
@@ -941,7 +951,9 @@ pub async fn process_activity(ctx: Ctx, wk: usize, info: ActTaskInfo, permit: Pe
         move |c, _fe, deadline| async move {
             history_call(&c, shard, |c2, hp| {
                 let c2 = c2.clone();
-                async move { history::respond_activity(&c2, hp, info, failed, deadline).await }
+                async move {
+                    history::respond_activity(&c2, hp, info, failed, non_retryable, deadline).await
+                }
             })
             .await
         },

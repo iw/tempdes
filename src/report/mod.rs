@@ -103,8 +103,11 @@ pub struct WorkflowResult {
     pub activity_failures: u64,
     /// activity timeouts that fired, by kind (`StartToClose`, `ScheduleToStart`, ...)
     pub activity_timeouts: BTreeMap<String, u64>,
-    /// activities that failed for good (a timeout that is not retried, or retries used up)
+    /// activities that failed for good (a timeout that is not retried, retries used up, or a
+    /// non-retryable error)
     pub activities_failed: u64,
+    /// of those, activities that failed with a non-retryable error, as the scenario plans
+    pub activities_non_retryable: u64,
     pub signals_per_s: f64,
     pub signals_failed: u64,
     pub eager_starts: u64,
@@ -458,6 +461,7 @@ pub fn analyze_window(
                 .map(|k| (k.as_str().to_string(), w.activity_timeouts[k.idx()]))
                 .collect(),
             activities_failed: w.activities_failed,
+            activities_non_retryable: w.activities_non_retryable,
             signals_per_s: w.signals_sent as f64 / dur,
             signals_failed: w.signals_failed,
             eager_starts: w.eager_starts,
