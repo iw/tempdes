@@ -351,7 +351,9 @@ Workers follow the Go SDK.
   * Worker polls are single attempts with `poll_timeout`: the SDK builds their context without
     retry options (`internal_task_pollers.go`), and the poller loop polls again.
   * Client latency includes the retries.
-* **Activities** run for a duration drawn from the step, heartbeating every `heartbeat`. The
+* **Activities** run for a duration drawn from the step, heartbeating every `heartbeat`. An
+  attempt fails at the step's `failure_rate`, or, with `attempts`, when it comes before the
+  count drawn for the activity when history scheduled it. The
   SDK gives the activity a context that ends at the earlier of start-to-close from its start
   and schedule-to-close from its first schedule (`calculateActivityDeadline`). The activity is
   assumed to honour it: it stops there, and the SDK drops the result without responding
@@ -380,6 +382,29 @@ Workers follow the Go SDK.
   bulk processor: `worker.ESProcessorBulkActions`, `worker.ESProcessorFlushInterval` and
   `worker.ESProcessorNumOfWorkers` concurrent bulks. SQL visibility writes go straight to the
   visibility database.
+
+## Workloads from histories (`src/histories`)
+
+`tempdes workload import` builds `workflows:` entries from exported histories.
+
+* **Events to steps.** The commands issued by one workflow task form a step: activities
+  scheduled together run in parallel, `LocalActivity` (or `core_local_activity`) markers are
+  local activities run inside that task, a timer on its own is a sleep, and children started
+  together are one child step. A timer started with activities or children is a timeout guard
+  and is left out. A signal that wakes a workflow with nothing running is a wait for signals,
+  and a timer cancelled by it is the wait's timeout.
+* **Own time only.** An activity's duration is its final attempt from `ActivityTaskStarted` to
+  its close, and a workflow task's processing time is from `WorkflowTaskStarted` to
+  `WorkflowTaskCompleted`. Schedule-to-start and retry gaps are cluster waits: the importer
+  reports them but the simulation produces its own.
+* **Attempts.** A history records only an activity's final attempt, with its number
+  (`ActivityTaskStarted.attempt`), so the step's `attempts` are those counts. An activity that
+  failed for good after using up `maximumAttempts` is counted as needing one more, so the
+  simulated retry policy gives up on it too.
+* **Retry policy and timeouts** come from `ActivityTaskScheduled`, with timeouts of a year or
+  more (how servers fill in "none") treated as unset.
+* **Pooling.** Executions of a type that took the same steps are pooled per step. Paths taken by
+  at least `--min-path-share` of them become types of their own, with their share of the rate.
 
 ## CPU costs
 

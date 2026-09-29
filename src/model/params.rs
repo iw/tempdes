@@ -417,6 +417,39 @@ impl ActTimeouts {
     }
 }
 
+/// How many attempts each activity of a step makes, drawn when it is scheduled: counts and
+/// their cumulative shares.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttemptsP {
+    pub counts: Vec<u32>,
+    pub cumulative: Vec<f64>,
+}
+
+impl AttemptsP {
+    pub fn new(spec: &crate::config::scenario::AttemptsSpec) -> AttemptsP {
+        use crate::config::scenario::AttemptsSpec;
+        let pairs: Vec<(u32, f64)> = match spec {
+            AttemptsSpec::Count(n) => vec![((*n).max(1), 1.0)],
+            AttemptsSpec::Shares(m) => m.iter().map(|(n, s)| ((*n).max(1), *s)).collect(),
+        };
+        let total: f64 = pairs.iter().map(|p| p.1).sum();
+        let mut acc = 0.0;
+        let (mut counts, mut cumulative) = (Vec::new(), Vec::new());
+        for (n, s) in pairs {
+            acc += s / total;
+            counts.push(n);
+            cumulative.push(acc);
+        }
+        AttemptsP { counts, cumulative }
+    }
+
+    /// The count at uniform draw `u` in [0, 1).
+    pub fn sample(&self, u: f64) -> u32 {
+        let i = self.cumulative.partition_point(|&c| c <= u);
+        self.counts[i.min(self.counts.len() - 1)]
+    }
+}
+
 /// An activity's retry policy with the namespace defaults filled in
 /// (`retrypolicy.EnsureDefaults`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -455,6 +488,8 @@ pub enum StepP {
         /// heartbeat interval of the activity code
         heartbeat: Option<Time>,
         failure_rate: f64,
+        /// attempts per activity, drawn when scheduled (instead of `failure_rate`)
+        attempts: Option<AttemptsP>,
         retry: RetryPolicyP,
         timeouts: ActTimeouts,
         on_failure: OnFailure,
@@ -1242,6 +1277,7 @@ impl Params {
                             duration,
                             heartbeat,
                             failure_rate: a.failure_rate,
+                            attempts: a.attempts.as_ref().map(AttemptsP::new),
                             retry,
                             timeouts,
                             on_failure: a.on_failure,

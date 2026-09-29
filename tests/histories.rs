@@ -1,0 +1,364 @@
+//! `tempdes workload import`: histories in both export spellings become steps, pooled
+//! programs and a scenario that simulates.
+
+use serde_json::{Value, json};
+use tempdes::config::scenario::Scenario;
+use tempdes::histories::trace::{Outcome, Step, trace};
+use tempdes::histories::{Options, parse::parse_history, program};
+use tempdes::report;
+use tempdes::run::{self, Overrides};
+
+/// Builds a workflow history the way the CLI or the Web UI export it, with event times in
+/// milliseconds after `start_ms`.
+struct History {
+    events: Vec<Value>,
+    /// `EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` rather than `ActivityTaskScheduled`
+    prefixed: bool,
+    start_ms: f64,
+}
+
+impl History {
+    fn new(workflow_type: &str, start_ms: f64, prefixed: bool) -> History {
+        let mut h = History {
+            events: Vec::new(),
+            prefixed,
+            start_ms,
+        };
+        h.event(
+            "WorkflowExecutionStarted",
+            0.0,
+            json!({"workflowType": {"name": workflow_type}, "taskQueue": {"name": "orders"}}),
+        );
+        h
+    }
+
+    fn event(&mut self, kind: &str, at_ms: f64, attrs: Value) -> i64 {
+        let id = self.events.len() as i64 + 1;
+        let event_type = if self.prefixed {
+            let mut s = String::from("EVENT_TYPE");
+            for c in kind.chars() {
+                if c.is_ascii_uppercase() {
+                    s.push('_');
+                }
+                s.push(c.to_ascii_uppercase());
+            }
+            s
+        } else {
+            kind.to_string()
+        };
+        let key = format!("{}{}EventAttributes", kind[..1].to_lowercase(), &kind[1..]);
+        let us = ((self.start_ms + at_ms) * 1000.0).round() as i64;
+        self.events.push(json!({
+            "eventId": id.to_string(),
+            "eventTime": format!(
+                "2026-09-28T10:{:02}:{:02}.{:06}Z",
+                us / 60_000_000,
+                us / 1_000_000 % 60,
+                us % 1_000_000
+            ),
+            "eventType": event_type,
+            key: attrs,
+        }));
+        id
+    }
+
+    /// A workflow task scheduled at `at_ms` that runs for `span_ms`; returns its completion.
+    fn wft(&mut self, at_ms: f64, span_ms: f64) -> i64 {
+        let s = self.event("WorkflowTaskScheduled", at_ms, json!({}));
+        let st = self.event(
+            "WorkflowTaskStarted",
+            at_ms + 1.0,
+            json!({"scheduledEventId": s.to_string()}),
+        );
+        self.event(
+            "WorkflowTaskCompleted",
+            at_ms + 1.0 + span_ms,
+            json!({"scheduledEventId": s.to_string(), "startedEventId": st.to_string()}),
+        )
+    }
+
+    fn schedule(&mut self, wft: i64, activity: &str, at_ms: f64) -> i64 {
+        self.event(
+            "ActivityTaskScheduled",
+            at_ms,
+            json!({
+                "activityType": {"name": activity},
+                "taskQueue": {"name": "orders"},
+                "scheduleToCloseTimeout": "315360000s",
+                "startToCloseTimeout": "10s",
+                "heartbeatTimeout": "0s",
+                "workflowTaskCompletedEventId": wft.to_string(),
+                "retryPolicy": {"initialInterval": "1s", "backoffCoefficient": 2, "maximumInterval": "100s"}
+            }),
+        )
+    }
+
+    /// The final attempt of activity `scheduled`, from `start_ms` to `end_ms`.
+    fn run(&mut self, scheduled: i64, attempt: u32, start_ms: f64, end_ms: f64) {
+        let st = self.event(
+            "ActivityTaskStarted",
+            start_ms,
+            json!({"scheduledEventId": scheduled.to_string(), "attempt": attempt}),
+        );
+        self.event(
+            "ActivityTaskCompleted",
+            end_ms,
+            json!({"scheduledEventId": scheduled.to_string(), "startedEventId": st.to_string()}),
+        );
+    }
+
+    fn json(&self) -> String {
+        json!({"events": self.events}).to_string()
+    }
+}
+
+/// An order: charge; publish, check and look up in parallel (the lookup took `lookup_attempts`,
+/// 1s and 2s apart after 100ms tries, each attempt waiting 20ms in the cluster); a local
+/// activity; a 2s sleep (left out when `sleep` is false); then a shipment child.
+fn order(start_ms: f64, lookup_attempts: u32, sleep: bool, prefixed: bool) -> String {
+    let mut h = History::new("OrderWorkflow", start_ms, prefixed);
+    let w = h.wft(0.0, 5.0);
+    let charge = h.schedule(w, "Charge", 6.0);
+    h.run(charge, 1, 26.0, 226.0);
+    let w = h.wft(226.0, 4.0);
+    let publish = h.schedule(w, "Publish", 231.0);
+    let check = h.schedule(w, "Check", 231.0);
+    let lookup = h.schedule(w, "Lookup", 231.0);
+    h.run(publish, 1, 251.0, 351.0);
+    h.wft(351.0, 2.0);
+    h.run(check, 1, 251.0, 451.0);
+    h.wft(451.0, 2.0);
+    // earlier attempts aren't recorded: 100ms tries with 1s, 2s, 4s… between them
+    let backoff: f64 = (1..lookup_attempts)
+        .map(|n| 1000.0 * 2f64.powi(n as i32 - 1) + 120.0)
+        .sum();
+    let last = 251.0 + backoff;
+    h.run(lookup, lookup_attempts, last, last + 100.0);
+    // the next workflow task runs a local activity (40ms) and starts the sleep
+    let w = h.wft(last + 100.0, 42.0);
+    h.event(
+        "MarkerRecorded",
+        last + 143.0,
+        json!({"markerName": "LocalActivity", "details": {"data": {}}, "workflowTaskCompletedEventId": w.to_string()}),
+    );
+    let mut t = last + 143.0;
+    let w = if sleep {
+        let timer = h.event(
+            "TimerStarted",
+            t,
+            json!({"timerId": "1", "startToFireTimeout": "2s", "workflowTaskCompletedEventId": w.to_string()}),
+        );
+        t += 2000.0;
+        h.event(
+            "TimerFired",
+            t,
+            json!({"timerId": "1", "startedEventId": timer.to_string()}),
+        );
+        h.wft(t, 3.0)
+    } else {
+        w
+    };
+    let child = h.event(
+        "StartChildWorkflowExecutionInitiated",
+        t + 4.0,
+        json!({"workflowType": {"name": "ShipmentWorkflow"}, "taskQueue": {"name": "orders"}, "workflowTaskCompletedEventId": w.to_string()}),
+    );
+    h.event(
+        "ChildWorkflowExecutionCompleted",
+        t + 500.0,
+        json!({"initiatedEventId": child.to_string()}),
+    );
+    h.wft(t + 500.0, 3.0);
+    h.event("WorkflowExecutionCompleted", t + 504.0, json!({}));
+    h.json()
+}
+
+fn steps_of(text: &str) -> Vec<Step> {
+    trace(&parse_history(text).expect("parses"))
+        .expect("traces")
+        .steps
+}
+
+#[test]
+fn an_order_history_becomes_its_steps() {
+    for prefixed in [false, true] {
+        let text = order(0.0, 4, true, prefixed);
+        let t = trace(&parse_history(&text).unwrap()).unwrap();
+        assert_eq!(t.workflow_type, "OrderWorkflow");
+        assert_eq!(t.outcome, Outcome::Completed);
+        let sig: Vec<String> = t.steps.iter().map(Step::signature).collect();
+        assert_eq!(
+            sig,
+            [
+                "activity Charge",
+                "activity Check + Lookup + Publish",
+                "local activity ×1",
+                "timer",
+                "child ShipmentWorkflow"
+            ]
+        );
+        let Step::Activities(group) = &t.steps[1] else {
+            panic!("parallel activities")
+        };
+        let lookup = group.iter().find(|a| a.activity_type == "Lookup").unwrap();
+        assert_eq!(lookup.attempts, 4);
+        // the final attempt's own time, not the retries before it
+        assert_eq!(lookup.run_us, Some(100_000));
+        // the 10-year schedule-to-close servers fill in counts as unset
+        assert_eq!(lookup.timeouts.schedule_to_close, 0);
+        assert_eq!(lookup.timeouts.start_to_close, 10_000_000);
+        // cluster waits are kept apart: 20ms before each first attempt
+        assert!(t.activity_queue_wait_us.iter().all(|&w| w == 20_000));
+        let Step::Timer { duration_us } = t.steps[3] else {
+            panic!("timer")
+        };
+        assert_eq!(duration_us, 2_000_000);
+    }
+}
+
+#[test]
+fn signal_waits_are_told_from_signals_buffered_during_work() {
+    // idle after the first workflow task: the signal wakes the workflow
+    let mut h = History::new("CartWorkflow", 0.0, false);
+    h.wft(0.0, 2.0);
+    h.event(
+        "WorkflowExecutionSignaled",
+        5000.0,
+        json!({"signalName": "add"}),
+    );
+    h.wft(5000.0, 2.0);
+    h.event("WorkflowExecutionCompleted", 5004.0, json!({}));
+    let sig: Vec<String> = steps_of(&h.json()).iter().map(Step::signature).collect();
+    assert_eq!(sig, ["signal ×1"]);
+
+    // a signal while an activity runs is buffered
+    let mut h = History::new("CartWorkflow", 0.0, false);
+    let w = h.wft(0.0, 2.0);
+    let a = h.schedule(w, "Price", 3.0);
+    h.event(
+        "WorkflowExecutionSignaled",
+        50.0,
+        json!({"signalName": "add"}),
+    );
+    h.wft(50.0, 2.0);
+    h.run(a, 1, 10.0, 200.0);
+    h.wft(200.0, 2.0);
+    h.event("WorkflowExecutionCompleted", 204.0, json!({}));
+    let t = trace(&parse_history(&h.json()).unwrap()).unwrap();
+    let sig: Vec<String> = t.steps.iter().map(Step::signature).collect();
+    assert_eq!(sig, ["activity Price"]);
+    assert!(
+        t.notes.iter().any(|n| n.contains("buffered")),
+        "{:?}",
+        t.notes
+    );
+}
+
+#[test]
+fn executions_are_pooled_by_path() {
+    // six orders on one path, two of them with a lookup that took four attempts, and one that
+    // skipped the sleep
+    let mut traces = Vec::new();
+    for i in 0..6 {
+        let attempts = if i < 2 { 4 } else { 1 };
+        traces.push(
+            trace(&parse_history(&order(i as f64 * 1000.0, attempts, true, i % 2 == 0)).unwrap())
+                .unwrap(),
+        );
+    }
+    traces.push(trace(&parse_history(&order(6000.0, 1, false, false)).unwrap()).unwrap());
+    let opts = Options {
+        namespace: "orders".into(),
+        rate: Some(70.0),
+        ..Default::default()
+    };
+    let p = program::build(&traces, &opts);
+    // 18 parallel activities, 2 of them with four attempts
+    assert!(
+        p.yaml.contains("attempts: { 1: 0.889, 4: 0.111 }"),
+        "{}",
+        p.yaml
+    );
+    // the rarer path (1 of 7) is a type of its own, with its share of the rate
+    assert!(p.yaml.contains("type: \"OrderWorkflow~2\""), "{}", p.yaml);
+    assert!(
+        p.yaml.contains("start_rate: 60/s") && p.yaml.contains("start_rate: 10/s"),
+        "{}",
+        p.yaml
+    );
+    // the child's histories weren't given: a stub keeps the scenario valid
+    assert!(p.yaml.contains("type: \"ShipmentWorkflow\""), "{}", p.yaml);
+    assert!(
+        p.summary.contains("none of its histories were given"),
+        "{}",
+        p.summary
+    );
+
+    // a higher threshold folds the rarer path into the common one
+    let folded = program::build(
+        &traces,
+        &Options {
+            min_path_share: 0.2,
+            ..opts
+        },
+    );
+    assert!(!folded.yaml.contains("OrderWorkflow~2"), "{}", folded.yaml);
+    assert!(folded.yaml.contains("start_rate: 70/s"), "{}", folded.yaml);
+}
+
+#[test]
+fn imported_workloads_simulate() {
+    let dir = std::env::temp_dir().join(format!("tempdes-import-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..10 {
+        let attempts = if i % 5 == 0 { 3 } else { 1 };
+        std::fs::write(
+            dir.join(format!("order-{i}.json")),
+            order(i as f64 * 500.0, attempts, true, i % 2 == 0),
+        )
+        .unwrap();
+    }
+    std::fs::write(dir.join("notes.txt"), "not a history").unwrap();
+    let p = tempdes::histories::import(
+        std::slice::from_ref(&dir),
+        &Options {
+            namespace: "orders".into(),
+            rate: Some(20.0),
+            ..Default::default()
+        },
+    )
+    .expect("imports");
+    std::fs::remove_dir_all(&dir).ok();
+    let scenario = format!(
+        "name: imported\nwarmup: 20s\nduration: 30s\ncluster:\n  num_history_shards: 64\n  replicas: {{ frontend: 1, history: 1, matching: 1, worker: 1 }}\n  persistence: {{ store: postgresql }}\nnamespaces: [ {{ name: orders }} ]\nworkers:\n  - {{ name: w, namespace: orders, task_queue: orders, processes: 2, activity_slots: 200 }}\n{}",
+        p.yaml
+    );
+    let sc = Scenario::parse_str(&scenario).unwrap_or_else(|e| panic!("{e}\n{scenario}"));
+    let params = run::prepare(&sc, &Overrides::default(), None).expect("parameters resolve");
+    let out = run::run_params(params);
+    let r = report::analyze(&out.ctx, &out.info, None);
+    let w = r
+        .workflows
+        .iter()
+        .find(|w| w.workflow_type == "OrderWorkflow")
+        .unwrap();
+    assert!(w.completed_per_s > 15.0, "{w:#?}");
+    // 2 of 30 parallel activities took three attempts: about 4 failures per 34 attempts
+    let per_s = |api: &str| {
+        r.apis
+            .iter()
+            .find(|a| a.api == api)
+            .map_or(0.0, |a| a.per_s)
+    };
+    let failed = per_s("RespondActivityTaskFailed");
+    let completed = per_s("RespondActivityTaskCompleted");
+    assert!(
+        failed > 0.0 && failed < 0.3 * completed,
+        "{failed} failed, {completed} completed"
+    );
+    assert!(
+        !r.hotspots.iter().any(|h| h.category == "throughput"),
+        "{:?}",
+        r.hotspots.iter().map(|h| &h.title).collect::<Vec<_>>()
+    );
+}

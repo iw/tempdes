@@ -312,6 +312,9 @@ pub struct ActInfo {
     pub timers: u8,
     /// fire time of the current heartbeat timer task
     pub hb_timer_at: Time,
+    /// attempts the activity makes, the last succeeding (0: each attempt fails at the step's
+    /// failure rate)
+    pub planned_attempts: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

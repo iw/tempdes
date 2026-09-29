@@ -921,7 +921,11 @@ pub async fn process_activity(ctx: Ctx, wk: usize, info: ActTaskInfo, permit: Pe
         drop(permit);
         return;
     }
-    let failed = ctx.rand() < failure_rate;
+    let failed = if info.planned_attempts > 0 {
+        info.attempt < info.planned_attempts
+    } else {
+        ctx.rand() < failure_rate
+    };
     let api = if failed {
         Api::RespondActivityTaskFailed
     } else {

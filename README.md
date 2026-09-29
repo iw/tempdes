@@ -50,6 +50,7 @@ $ tempdes run examples/scenarios/hot-entity.yaml
 - [Sweeps: replicas × dynamic config](#sweeps-replicas--dynamic-config)
 - [Watching a run live](#watching-a-run-live)
 - [Feeding in Temporal metrics](#feeding-in-temporal-metrics)
+- [Importing workflow histories](#importing-workflow-histories)
 - [Saved run profiles](#saved-run-profiles)
 - [Reading the report](#reading-the-report)
 - [Scenario reference](#scenario-reference)
@@ -120,6 +121,9 @@ tempdes dc validate examples/dynamicconfig/with-mistakes.yaml
 tempdes metrics queries --window 15m     # PromQL to collect calibration inputs
 tempdes metrics template > observed.yaml
 tempdes metrics show examples/metrics/observed.yaml
+
+# workloads from exported workflow histories (steps, durations, attempts, retry policies)
+tempdes workload import histories/ --namespace orders --rate 150/s -o workflows.yaml
 ```
 
 `run` also writes `--json` (the full result), `--prom` (simulated metrics in Prometheus text
@@ -377,6 +381,49 @@ Turn individual calibrations off in the scenario with
 calibration still come from pilot runs at the observed load. The comparison with observed
 metrics is skipped, because the simulated workload is no longer the observed one.
 
+## Importing workflow histories
+
+Rather than writing a workflow's `steps` by hand, you can infer them from histories exported
+from your cluster, a few hundred executions of each workflow type:
+
+```bash
+temporal workflow show --workflow-id <id> --output json > histories/<id>.json   # or the Web UI's download
+tempdes workload import histories/ --namespace orders --rate 150/s -o workflows.yaml
+```
+
+The importer prints a `workflows:` block to paste into a scenario, and a summary of what it
+inferred. Both export spellings are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` and
+`ActivityTaskScheduled`, camelCase or snake_case keys).
+
+* **Steps.** The commands of one workflow task form a step: activities scheduled together run
+  in parallel, `LocalActivity` markers are local activities run inside that task, a timer on its
+  own is a sleep, and children started together are one child step. A signal that wakes an idle
+  workflow is a `wait_signal`, with the cancelled timer as its timeout; signals that arrive
+  while the workflow is busy are buffered and left out.
+* **Durations are each step's own time.** An activity's is its final attempt from start to
+  close, and a workflow task's from start to completion. Waits in the cluster (schedule-to-start,
+  throttled dispatch) are reported in the summary and left out, because a history from a busy
+  cluster would otherwise build its queueing into the workload.
+* **Attempts, retry policies and timeouts are as recorded.** A history keeps only an activity's
+  final attempt, with its number, so `attempts` gets the recorded counts, and the failed attempts
+  are assumed to take as long as successful ones. Heartbeats aren't recorded, so an activity
+  with a heartbeat timeout is assumed to heartbeat at the Go SDK's throttle, 0.8 × the timeout.
+* **Paths.** Executions of a type that took the same steps are pooled. A path taken by at least
+  5% of them (`--min-path-share`) becomes a workflow type of its own (`OrderWorkflow~2`) with its
+  share of the start rate; rarer paths are folded into the most common.
+* **Start rate.** `--rate` sets it; otherwise it is estimated from the start times, which is
+  right only if the export holds every execution in that time. Calibrating with observed
+  `service_requests` (`-o`) also sets it.
+* **Privacy.** Payloads are never read, but the output names your workflow and activity types
+  and task queues: keep it with your private profiles, not in a repository.
+
+Not modelled, and counted in the summary: updates, Nexus operations, search attribute upserts,
+markers other than local activities, and continue-as-new (each run is imported as its own
+execution). Parallel activities of different types are pooled into one distribution; an
+activity that failed without using up its retries (a non-retryable error) is imported as
+succeeding on its last attempt; and a child type whose histories weren't given is written as a
+stub with no steps.
+
 ## Saved run profiles
 
 A profile saves a scenario with the options of a run under a name, so the run can be repeated
@@ -521,6 +568,7 @@ workflows:
                     start_to_close_timeout: 2m, schedule_to_start_timeout: 1m,
                     retry_initial: 1s, backoff_coefficient: 2, max_interval: 1m, max_attempts: 5,
                     on_failure: fail }     # fail | continue: when an activity fails for good
+      - activity: { count: 1, duration: 3s, attempts: { 1: 0.8, 5: 0.2 } }   # instead of failure_rate
       - local_activity: { count: 1, duration: 5ms }
       - timer: 2s
       - child_workflow: { workflow_type: ShipmentWorkflow, count: 1 }
@@ -569,6 +617,12 @@ that heartbeats without a `heartbeat_timeout` gets twice its heartbeat interval.
 and schedule-to-close timeouts fail the activity; start-to-close and heartbeat timeouts retry the
 attempt while the policy allows. An activity that fails for good fails its workflow, unless
 the step says `on_failure: continue`.
+
+`failure_rate` fails each attempt independently, which gives a geometric number of attempts with
+a long tail. `attempts` instead sets how many attempts each activity makes, a count or shares
+by count (`{ 1: 0.8, 5: 0.2 }`): the attempts before the drawn count fail and the last one
+succeeds, unless the retry policy gives up first. It is what `workload import` writes, because a
+history records each activity's attempt count.
 
 ## Example scenarios
 

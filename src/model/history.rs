@@ -67,6 +67,8 @@ pub struct ActTaskInfo {
     pub scheduled_at: Time,
     /// when the activity was first scheduled (the poll response's `ScheduledTime`)
     pub first_scheduled_at: Time,
+    /// attempts the activity makes, the last succeeding (0: fail at the step's failure rate)
+    pub planned_attempts: u32,
 }
 
 /// Commands produced by a workflow task.
@@ -573,6 +575,12 @@ async fn respond_wft_inner(
                 if eager {
                     eager_left -= 1;
                 }
+                let planned_attempts = match ctx.p.wf_types[wf_type].steps.get(step) {
+                    Some(super::params::StepP::Activity {
+                        attempts: Some(a), ..
+                    }) => a.sample(ctx.rand()),
+                    _ => 0,
+                };
                 w.activities.push(ActInfo {
                     seq,
                     attempt: 1,
@@ -589,6 +597,7 @@ async fn respond_wft_inner(
                     last_heartbeat: 0,
                     timers: 0,
                     hb_timer_at: 0,
+                    planned_attempts,
                 });
                 if eager {
                     eager_out.push(ActTaskInfo {
@@ -600,6 +609,7 @@ async fn respond_wft_inner(
                         step,
                         scheduled_at: t,
                         first_scheduled_at: t,
+                        planned_attempts,
                     });
                 } else {
                     tasks.push(TaskSpec::now(TaskType::TransferActivityTask, seq, 1));
@@ -752,7 +762,7 @@ pub async fn record_activity_started(
         shard_ready(ctx, pod, shard, deadline).await?;
         let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
-        let (step, scheduled_at, first_scheduled_at, wf_type) = {
+        let (step, scheduled_at, first_scheduled_at, planned_attempts, wf_type) = {
             let wfs = ctx.wfs.borrow();
             let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
             if w.status != WfStatus::Running {
@@ -763,7 +773,13 @@ pub async fn record_activity_started(
                 .iter()
                 .find(|a| a.seq == seq && a.attempt == attempt && a.state == ActState::Scheduled)
                 .ok_or(Err::NotFound)?;
-            (a.step, a.scheduled_at, a.first_scheduled_at, w.wf_type)
+            (
+                a.step,
+                a.scheduled_at,
+                a.first_scheduled_at,
+                a.planned_attempts,
+                w.wf_type,
+            )
         };
         // scheduled event from the shard events cache (while holding the lock)
         let ev_key = {
@@ -827,6 +843,7 @@ pub async fn record_activity_started(
             step,
             scheduled_at,
             first_scheduled_at,
+            planned_attempts,
         })
     }
     .await;
