@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, bail};
 
-use crate::config::dynamic::{DcValue, DynamicConfig, TaskQueueType};
+use crate::config::dynamic::{Constraints, DcValue, DynamicConfig, TaskQueueType};
 use crate::config::scenario::*;
 use crate::sim::dist::Dist;
 use crate::sim::executor::Time;
@@ -61,7 +61,7 @@ impl Default for Costs {
                 Api::RecordActivityTaskHeartbeat => 90.0,
                 Api::QueryWorkflow => 130.0,
                 Api::DescribeWorkflowExecution => 110.0,
-                Api::GetWorkflowExecutionHistory => 160.0,
+                Api::GetWorkflowExecutionHistory | Api::PollWorkflowExecutionHistory => 160.0,
                 Api::ListWorkflowExecutions => 250.0,
                 Api::CountWorkflowExecutions => 180.0,
             };
@@ -280,6 +280,18 @@ pub struct NsParams {
     pub per_ns_worker_count: u32,
     pub scheduler_start_rps: f64,
     pub scheduler_la_sleep_limit: Time,
+    /// host task scheduler channel weights, `[category][priority]` with priorities high, low
+    /// and preemptable (`history.*ProcessorSchedulerActiveRoundRobinWeights`)
+    pub sched_weights: [[u32; 3]; 3],
+    /// namespace persistence limits (0 = fall back to the pod's rate):
+    /// `history.persistenceNamespaceMaxQPS`, `history.persistenceGlobalNamespaceMaxQPS` (split
+    /// by shard ownership), `history.persistencePerShardNamespaceMaxQPS`, and matching's
+    /// per-pod and cluster-wide (divided by pods) forms
+    pub hist_persist_ns_qps: f64,
+    pub hist_persist_global_ns_qps: f64,
+    pub hist_persist_shard_ns_qps: f64,
+    pub matching_persist_ns_qps: f64,
+    pub matching_persist_global_ns_qps: f64,
 }
 
 /// Dynamic config knobs that are global (not namespace / task queue scoped).
@@ -310,6 +322,12 @@ pub struct Knobs {
     pub task_sched_startup_delay: Time,
     pub task_sched_max_qps: f64,
     pub task_sched_global_max_qps: f64,
+    /// the execution queue scheduler for busy workflows
+    /// (`history.taskSchedulerEnableExecutionQueueScheduler` and its settings)
+    pub eqs_enabled: bool,
+    pub eqs_max_queues: usize,
+    pub eqs_queue_ttl: Time,
+    pub eqs_queue_concurrency: u32,
     pub task_batch: [u32; 3],
     pub max_poll_rps: [f64; 3],
     pub max_poll_host_rps: [f64; 3],
@@ -350,9 +368,82 @@ pub struct FleetParams {
     pub cpu: Option<f64>,
     pub activities_per_second: Option<f64>,
     pub poll_timeout: Time,
+    /// deadline of the workers' other SDK calls, retries included
+    pub rpc_timeout: Time,
     pub eager_activities: bool,
     /// internal fleet running on the worker service (per-namespace scheduler workers)
     pub system: bool,
+}
+
+/// An activity step's timeouts after the server fills them in (`validateAndNormalizeTimeouts`
+/// in `chasm/lib/activity/validator.go`); 0 means none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActTimeouts {
+    pub schedule_to_start: Time,
+    pub start_to_close: Time,
+    pub schedule_to_close: Time,
+    pub heartbeat: Time,
+}
+
+impl ActTimeouts {
+    /// Normalise as the server does, with no workflow run timeout: a schedule-to-close timeout
+    /// bounds and fills in schedule-to-start and start-to-close; without it, start-to-close is
+    /// required, and tempdes fills in `default_start_to_close` where an SDK would refuse the
+    /// command. The heartbeat timeout never exceeds start-to-close.
+    pub fn normalize(
+        schedule_to_start: Option<Time>,
+        start_to_close: Option<Time>,
+        schedule_to_close: Option<Time>,
+        heartbeat: Option<Time>,
+        default_start_to_close: Time,
+    ) -> ActTimeouts {
+        let set = |t: Option<Time>| t.filter(|&v| v > 0);
+        let (s2s, stc, s2c) = (
+            set(schedule_to_start),
+            set(start_to_close),
+            set(schedule_to_close),
+        );
+        let (schedule_to_start, start_to_close, schedule_to_close) = match (s2c, stc) {
+            (Some(c), _) => (s2s.map_or(c, |v| v.min(c)), stc.map_or(c, |v| v.min(c)), c),
+            (None, Some(v)) => (s2s.unwrap_or(0), v, 0),
+            (None, None) => (s2s.unwrap_or(0), default_start_to_close, 0),
+        };
+        ActTimeouts {
+            schedule_to_start,
+            start_to_close,
+            schedule_to_close,
+            heartbeat: set(heartbeat).map_or(0, |h| h.min(start_to_close)),
+        }
+    }
+}
+
+/// An activity's retry policy with the namespace defaults filled in
+/// (`retrypolicy.EnsureDefaults`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetryPolicyP {
+    pub initial: Time,
+    pub coefficient: f64,
+    pub max_interval: Time,
+    /// attempts in total, the first included; 0 = unlimited
+    pub max_attempts: u32,
+}
+
+impl RetryPolicyP {
+    /// `nextBackoffInterval` (`service/history/workflow/retry.go`): the wait before the attempt
+    /// after `attempt`, or `None` when the policy stops: the attempts are used up, or the next
+    /// attempt would start after `expiration` (the first schedule plus the schedule-to-close
+    /// timeout).
+    pub fn next_delay(&self, attempt: u32, now: Time, expiration: Option<Time>) -> Option<Time> {
+        if self.max_attempts > 0 && attempt >= self.max_attempts {
+            return None;
+        }
+        let interval = (self.initial as f64 * self.coefficient.powi(attempt as i32 - 1))
+            .min(self.max_interval as f64) as Time;
+        match expiration {
+            Some(e) if now.saturating_add(interval) > e => None,
+            _ => Some(interval),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -361,9 +452,12 @@ pub enum StepP {
         count: u32,
         parallel: bool,
         duration: Dist,
+        /// heartbeat interval of the activity code
         heartbeat: Option<Time>,
         failure_rate: f64,
-        retry_initial: Time,
+        retry: RetryPolicyP,
+        timeouts: ActTimeouts,
+        on_failure: OnFailure,
         tq: usize,
     },
     LocalActivity {
@@ -392,6 +486,8 @@ pub struct WfTypeParams {
     pub starters: u32,
     pub eager_start: bool,
     pub await_result: bool,
+    /// deadline of each start call, retries included
+    pub rpc_timeout: Time,
     pub wft_processing: Dist,
     pub replay_per_event: f64,
     pub steps: Vec<StepP>,
@@ -407,6 +503,7 @@ pub struct SignalParams {
     pub hot: bool,
     pub hot_workflows: u32,
     pub clients: u32,
+    pub rpc_timeout: Time,
 }
 
 #[derive(Clone, Debug)]
@@ -414,6 +511,7 @@ pub struct QueryParams {
     pub wf_type: usize,
     pub rate: f64,
     pub describe: bool,
+    pub rpc_timeout: Time,
 }
 
 #[derive(Clone, Debug)]
@@ -421,6 +519,7 @@ pub struct VisLoadParams {
     pub ns: usize,
     pub rate: f64,
     pub op: VisibilityOp,
+    pub rpc_timeout: Time,
 }
 
 #[derive(Clone, Debug)]
@@ -472,6 +571,10 @@ pub struct Params {
     pub max_conns: [u32; 4],
     pub db_capacity: u32,
     pub db_latency: Vec<Dist>, // indexed by PersistOp
+    /// operations whose service time already includes the history append that
+    /// Create/UpdateWorkflowExecution carry: set by calibration, since production's
+    /// `persistence_latency` measures the whole call (indexed by PersistOp)
+    pub db_includes_append: Vec<bool>,
     pub vis: VisParams,
     pub costs: Costs,
     pub k: Knobs,
@@ -514,6 +617,9 @@ pub const MODELED_KEYS: &[&str] = &[
     "history.rps",
     "history.persistenceMaxQPS",
     "history.persistenceGlobalMaxQPS",
+    "history.persistenceNamespaceMaxQPS",
+    "history.persistenceGlobalNamespaceMaxQPS",
+    "history.persistencePerShardNamespaceMaxQPS",
     "history.shardIOConcurrency",
     "history.hostLevelCacheMaxSize",
     "history.cacheNonUserContextLockTimeout",
@@ -528,6 +634,13 @@ pub const MODELED_KEYS: &[&str] = &[
     "history.taskSchedulerGlobalMaxQPS",
     "history.taskSchedulerNamespaceMaxQPS",
     "history.taskSchedulerGlobalNamespaceMaxQPS",
+    "history.transferProcessorSchedulerActiveRoundRobinWeights",
+    "history.timerProcessorSchedulerActiveRoundRobinWeights",
+    "history.visibilityProcessorSchedulerActiveRoundRobinWeights",
+    "history.taskSchedulerEnableExecutionQueueScheduler",
+    "history.taskSchedulerExecutionQueueSchedulerMaxQueues",
+    "history.taskSchedulerExecutionQueueSchedulerQueueTTL",
+    "history.taskSchedulerExecutionQueueSchedulerQueueConcurrency",
     "history.transferTaskBatchSize",
     "history.timerTaskBatchSize",
     "history.visibilityTaskBatchSize",
@@ -547,10 +660,13 @@ pub const MODELED_KEYS: &[&str] = &[
     "history.acquireShardConcurrency",
     "system.ringpopApproximateMaxPropagationTime",
     "history.defaultWorkflowTaskTimeout",
+    "history.defaultActivityRetryPolicy",
     "history.longPollExpirationInterval",
     "matching.rps",
     "matching.persistenceMaxQPS",
     "matching.persistenceGlobalMaxQPS",
+    "matching.persistenceNamespaceMaxQPS",
+    "matching.persistenceGlobalNamespaceMaxQPS",
     "matching.numTaskqueueReadPartitions",
     "matching.numTaskqueueWritePartitions",
     "matching.forwarderMaxOutstandingPolls",
@@ -582,6 +698,89 @@ pub const SCHEDULER_WF_TYPE: &str = "temporal-sys-scheduler-workflow";
 
 fn dur_t(us: f64) -> Time {
     us.max(0.0).round() as Time
+}
+
+/// `history.defaultActivityRetryPolicy`: the retry settings the server applies to fields an
+/// activity's retry policy leaves unset.
+struct RetryDefaults {
+    initial: Time,
+    max_interval_coefficient: f64,
+    coefficient: f64,
+    max_attempts: u32,
+}
+
+fn default_retry_policy(dc: &DynamicConfig, prec: &[Constraints]) -> RetryDefaults {
+    let mut d = RetryDefaults {
+        initial: 1_000_000,
+        max_interval_coefficient: 100.0,
+        coefficient: 2.0,
+        max_attempts: 0,
+    };
+    let num = |v: &DcValue| match v {
+        DcValue::Int(i) => Some(*i as f64),
+        DcValue::Float(f) => Some(*f),
+        _ => None,
+    };
+    if let Some(m) = dc.map("history.defaultActivityRetryPolicy", prec) {
+        for (k, v) in &m {
+            match k.as_str() {
+                "InitialIntervalInSeconds" => {
+                    let us = match v {
+                        DcValue::Str(s) => crate::config::dynamic::parse_temporal_duration(s),
+                        other => num(other).map(|secs| secs * SEC),
+                    };
+                    if let Some(us) = us.filter(|&us| us > 0.0) {
+                        d.initial = us as Time;
+                    }
+                }
+                "MaximumIntervalCoefficient" => {
+                    if let Some(c) = num(v).filter(|&c| c > 0.0) {
+                        d.max_interval_coefficient = c;
+                    }
+                }
+                "BackoffCoefficient" => {
+                    if let Some(c) = num(v).filter(|&c| c >= 1.0) {
+                        d.coefficient = c;
+                    }
+                }
+                "MaximumAttempts" => {
+                    if let Some(n) = num(v).filter(|&n| n >= 0.0) {
+                        d.max_attempts = n as u32;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    d
+}
+
+/// Task scheduler channel weights (high, low, preemptable) for one queue category and
+/// namespace. Temporal's default is 10 / 9 / 1 (`DefaultActiveTaskPriorityWeight`). A configured
+/// map with an unknown priority name or a non-numeric weight falls back to that default
+/// (`ConvertDynamicConfigValueToWeights`), and a priority left out, or given a weight of 0 or
+/// less, gets 1 (`DefaultPriorityWeight`).
+fn round_robin_weights(dc: &DynamicConfig, key: &str, prec: &[Constraints]) -> [u32; 3] {
+    const DEFAULT: [u32; 3] = [10, 9, 1];
+    let Some(m) = dc.map(key, prec) else {
+        return DEFAULT;
+    };
+    let mut weights = [1u32; 3];
+    for (name, v) in &m {
+        let i = match name.as_str() {
+            "high" => 0,
+            "low" => 1,
+            "preemptable" => 2,
+            _ => return DEFAULT,
+        };
+        let w = match v {
+            DcValue::Int(n) => *n,
+            DcValue::Float(f) => *f as i64,
+            _ => return DEFAULT,
+        };
+        weights[i] = if w > 0 { w as u32 } else { 1 };
+    }
+    weights
 }
 
 impl Params {
@@ -665,6 +864,30 @@ impl Params {
                     &p,
                     5.0 * SEC,
                 )),
+                sched_weights: [
+                    "history.transferProcessorSchedulerActiveRoundRobinWeights",
+                    "history.timerProcessorSchedulerActiveRoundRobinWeights",
+                    "history.visibilityProcessorSchedulerActiveRoundRobinWeights",
+                ]
+                .map(|key| round_robin_weights(&dc, key, &p)),
+                hist_persist_ns_qps: dc.int("history.persistenceNamespaceMaxQPS", &p, 0) as f64,
+                hist_persist_global_ns_qps: dc.int(
+                    "history.persistenceGlobalNamespaceMaxQPS",
+                    &p,
+                    0,
+                ) as f64,
+                hist_persist_shard_ns_qps: dc.int(
+                    "history.persistencePerShardNamespaceMaxQPS",
+                    &p,
+                    0,
+                ) as f64,
+                matching_persist_ns_qps: dc.int("matching.persistenceNamespaceMaxQPS", &p, 0)
+                    as f64,
+                matching_persist_global_ns_qps: dc.int(
+                    "matching.persistenceGlobalNamespaceMaxQPS",
+                    &p,
+                    0,
+                ) as f64,
             });
         }
         let ns_idx = |n: &str| namespaces.iter().position(|x| x.name == n).unwrap();
@@ -732,6 +955,31 @@ impl Params {
             )),
             task_sched_max_qps: dc.int("history.taskSchedulerMaxQPS", &g, 0) as f64,
             task_sched_global_max_qps: dc.int("history.taskSchedulerGlobalMaxQPS", &g, 0) as f64,
+            eqs_enabled: dc.boolean(
+                "history.taskSchedulerEnableExecutionQueueScheduler",
+                &g,
+                false,
+            ),
+            eqs_max_queues: dc
+                .int(
+                    "history.taskSchedulerExecutionQueueSchedulerMaxQueues",
+                    &g,
+                    500,
+                )
+                .max(0) as usize,
+            eqs_queue_ttl: dur_t(dc.duration_us(
+                "history.taskSchedulerExecutionQueueSchedulerQueueTTL",
+                &g,
+                5.0 * SEC,
+            )),
+            // values <= 0 are capped to 1
+            eqs_queue_concurrency: dc
+                .int(
+                    "history.taskSchedulerExecutionQueueSchedulerQueueConcurrency",
+                    &g,
+                    2,
+                )
+                .max(1) as u32,
             task_batch: [
                 dc.int("history.transferTaskBatchSize", &g, 100).max(1) as u32,
                 dc.int("history.timerTaskBatchSize", &g, 100).max(1) as u32,
@@ -936,6 +1184,7 @@ impl Params {
                 cpu: f.cpu,
                 activities_per_second: f.task_queue_activities_per_second,
                 poll_timeout: f.poll_timeout.us().max(2_000_000),
+                rpc_timeout: f.rpc_timeout.us().max(1_000),
                 eager_activities: f.eager_activities,
                 system: false,
             });
@@ -953,26 +1202,58 @@ impl Params {
                 &mut prov,
             );
             let mut steps = Vec::new();
+            let retry_defaults =
+                default_retry_policy(&dc, &DynamicConfig::prec_namespace(&w.namespace));
             for s in &w.steps {
                 steps.push(match s {
-                    Step::Activity(a) => StepP::Activity {
-                        count: a.count.max(1),
-                        parallel: a.parallel,
-                        duration: a
+                    Step::Activity(a) => {
+                        let duration = a
                             .duration
                             .build()
-                            .map_err(|e| anyhow::anyhow!("{}: {e}", w.type_name))?,
-                        heartbeat: a.heartbeat.map(|d| d.us().max(1_000)),
-                        failure_rate: a.failure_rate,
-                        retry_initial: a.retry_initial.map(|d| d.us()).unwrap_or(1_000_000),
-                        tq: tq_index(
-                            &w.namespace,
-                            a.task_queue.as_deref().unwrap_or(&w.task_queue),
-                            false,
-                            &mut task_queues,
-                            &mut prov,
-                        ),
-                    },
+                            .map_err(|e| anyhow::anyhow!("{}: {e}", w.type_name))?;
+                        let heartbeat = a.heartbeat.map(|d| d.us().max(1_000));
+                        let timeouts = ActTimeouts::normalize(
+                            a.schedule_to_start_timeout.map(|d| d.us()),
+                            a.start_to_close_timeout.map(|d| d.us()),
+                            a.schedule_to_close_timeout.map(|d| d.us()),
+                            a.heartbeat_timeout
+                                .map(|d| d.us())
+                                .or(heartbeat.map(|h| h * 2)),
+                            // no timeouts given: 10 × the duration's p99, 10s–1h
+                            (duration.quantile(0.99) * 10.0).clamp(10.0e6, 3_600.0e6) as Time,
+                        );
+                        let initial = a
+                            .retry_initial
+                            .map(|d| d.us().max(1))
+                            .unwrap_or(retry_defaults.initial);
+                        let retry = RetryPolicyP {
+                            initial,
+                            coefficient: a
+                                .backoff_coefficient
+                                .unwrap_or(retry_defaults.coefficient),
+                            max_interval: a.max_interval.map(|d| d.us()).unwrap_or(
+                                (initial as f64 * retry_defaults.max_interval_coefficient) as Time,
+                            ),
+                            max_attempts: a.max_attempts.unwrap_or(retry_defaults.max_attempts),
+                        };
+                        StepP::Activity {
+                            count: a.count.max(1),
+                            parallel: a.parallel,
+                            duration,
+                            heartbeat,
+                            failure_rate: a.failure_rate,
+                            retry,
+                            timeouts,
+                            on_failure: a.on_failure,
+                            tq: tq_index(
+                                &w.namespace,
+                                a.task_queue.as_deref().unwrap_or(&w.task_queue),
+                                false,
+                                &mut task_queues,
+                                &mut prov,
+                            ),
+                        }
+                    }
                     Step::LocalActivity(l) => StepP::LocalActivity {
                         count: l.count.max(1),
                         duration: l
@@ -1017,6 +1298,7 @@ impl Params {
                 starters: w.starters.max(1),
                 eager_start: w.eager_start && namespaces[ns].enable_eager_start,
                 await_result: w.await_result,
+                rpc_timeout: w.rpc_timeout.us().max(1_000),
                 wft_processing: w.wft_processing.build().map_err(|e| anyhow::anyhow!(e))?,
                 replay_per_event: w.replay_per_event.0,
                 steps,
@@ -1060,6 +1342,7 @@ impl Params {
                     cpu: None,
                     activities_per_second: None,
                     poll_timeout: 70_000_000,
+                    rpc_timeout: 10_000_000,
                     eager_activities: false,
                     system: true,
                 });
@@ -1080,6 +1363,7 @@ impl Params {
                         starters: 1,
                         eager_start: false,
                         await_result: false,
+                        rpc_timeout: 10_000_000,
                         wft_processing: Dist::lognormal_p50_p99(1_500.0, 8_000.0),
                         replay_per_event: 20.0,
                         steps: Vec::new(),
@@ -1117,6 +1401,7 @@ impl Params {
                 hot: s.target == SignalTarget::Hot,
                 hot_workflows: s.hot_workflows.max(1),
                 clients: s.clients.max(1),
+                rpc_timeout: s.rpc_timeout.us().max(1_000),
             });
         }
         let mut queries = Vec::new();
@@ -1125,6 +1410,7 @@ impl Params {
                 wf_type: find_type(&q.workflow_type)?,
                 rate: q.rate.0,
                 describe: false,
+                rpc_timeout: q.rpc_timeout.us().max(1_000),
             });
         }
         for q in &sc.load.describes {
@@ -1132,6 +1418,7 @@ impl Params {
                 wf_type: find_type(&q.workflow_type)?,
                 rate: q.rate.0,
                 describe: true,
+                rpc_timeout: q.rpc_timeout.us().max(1_000),
             });
         }
         let vis_loads = sc
@@ -1142,6 +1429,7 @@ impl Params {
                 ns: ns_idx(&v.namespace),
                 rate: v.rate.0,
                 op: v.op,
+                rpc_timeout: v.rpc_timeout.us().max(1_000),
             })
             .collect();
 
@@ -1298,6 +1586,29 @@ impl Params {
         for key in MODELED_KEYS {
             effective_dc.insert((*key).to_string(), dc.describe(key));
         }
+        // the registry shows these defaults as Go expressions
+        for (key, default) in [
+            (
+                "history.defaultActivityRetryPolicy",
+                "InitialIntervalInSeconds 1, MaximumIntervalCoefficient 100, BackoffCoefficient 2, MaximumAttempts 0 (default)",
+            ),
+            (
+                "history.transferProcessorSchedulerActiveRoundRobinWeights",
+                "high 10, low 9, preemptable 1 (default)",
+            ),
+            (
+                "history.timerProcessorSchedulerActiveRoundRobinWeights",
+                "high 10, low 9, preemptable 1 (default)",
+            ),
+            (
+                "history.visibilityProcessorSchedulerActiveRoundRobinWeights",
+                "high 10, low 9, preemptable 1 (default)",
+            ),
+        ] {
+            if !dc.is_set(key) {
+                effective_dc.insert(key.to_string(), default.to_string());
+            }
+        }
         for key in dc.configured_keys() {
             if !MODELED_KEYS.iter().any(|m| m.eq_ignore_ascii_case(&key)) {
                 prov.notes.push(format!(
@@ -1331,6 +1642,7 @@ impl Params {
             max_conns,
             db_capacity,
             db_latency,
+            db_includes_append: vec![false; PersistOp::ALL.len()],
             vis,
             costs,
             k,

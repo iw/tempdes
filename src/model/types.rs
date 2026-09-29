@@ -81,12 +81,17 @@ pub enum Api {
     QueryWorkflow,
     DescribeWorkflowExecution,
     GetWorkflowExecutionHistory,
+    /// `GetWorkflowExecutionHistory` with `WaitNewEvent`: a client long-polling for the result.
+    /// The frontend's namespace rate limiter renames it `PollWorkflowExecutionHistory`
+    /// (`service/frontend/configs/quotas.go`, `namespace_rate_limit.go`); its metrics keep the
+    /// `GetWorkflowExecutionHistory` operation name.
+    PollWorkflowExecutionHistory,
     ListWorkflowExecutions,
     CountWorkflowExecutions,
 }
 
 impl Api {
-    pub const ALL: [Api; 13] = [
+    pub const ALL: [Api; 14] = [
         Api::StartWorkflowExecution,
         Api::SignalWorkflowExecution,
         Api::PollWorkflowTaskQueue,
@@ -98,6 +103,7 @@ impl Api {
         Api::QueryWorkflow,
         Api::DescribeWorkflowExecution,
         Api::GetWorkflowExecutionHistory,
+        Api::PollWorkflowExecutionHistory,
         Api::ListWorkflowExecutions,
         Api::CountWorkflowExecutions,
     ];
@@ -115,6 +121,7 @@ impl Api {
             Api::QueryWorkflow => "QueryWorkflow",
             Api::DescribeWorkflowExecution => "DescribeWorkflowExecution",
             Api::GetWorkflowExecutionHistory => "GetWorkflowExecutionHistory",
+            Api::PollWorkflowExecutionHistory => "PollWorkflowExecutionHistory",
             Api::ListWorkflowExecutions => "ListWorkflowExecutions",
             Api::CountWorkflowExecutions => "CountWorkflowExecutions",
         }
@@ -124,15 +131,35 @@ impl Api {
         self as usize
     }
 
-    /// Priority in the frontend priority rate limiter (`service/frontend/configs/quotas.go`).
-    pub fn frontend_priority(self) -> usize {
+    /// The `operation` tag of Temporal's frontend metrics for this call: a history long poll is
+    /// still `GetWorkflowExecutionHistory` there.
+    pub fn metric_operation(self) -> &'static str {
+        match self {
+            Api::PollWorkflowExecutionHistory => Api::GetWorkflowExecutionHistory.as_str(),
+            _ => self.as_str(),
+        }
+    }
+
+    /// Priority in the frontend's per-namespace priority rate limiter
+    /// (`service/frontend/configs/quotas.go`). History long polls are renamed
+    /// `PollWorkflowExecutionHistory` there and run at P5, below worker polls.
+    pub fn namespace_priority(self) -> usize {
+        match self {
+            Api::PollWorkflowExecutionHistory => 5,
+            _ => self.host_priority(),
+        }
+    }
+
+    /// Priority in the frontend's host rate limiter (`frontend.rps`), which classifies calls by
+    /// their gRPC method, so a history long poll keeps `GetWorkflowExecutionHistory`'s P2.
+    pub fn host_priority(self) -> usize {
         match self {
             Api::StartWorkflowExecution
             | Api::SignalWorkflowExecution
             | Api::RespondWorkflowTaskCompleted
             | Api::RespondActivityTaskCompleted
             | Api::RecordActivityTaskHeartbeat => 1,
-            Api::GetWorkflowExecutionHistory => 2,
+            Api::GetWorkflowExecutionHistory | Api::PollWorkflowExecutionHistory => 2,
             Api::DescribeWorkflowExecution
             | Api::QueryWorkflow
             | Api::RespondActivityTaskFailed => 3,
@@ -150,11 +177,15 @@ impl Api {
     }
 
     /// Counted by the per-namespace concurrent long-running request limiter
-    /// (`frontend.namespaceCount`).
+    /// (`frontend.namespaceCount`, `ExecutionAPICountLimitOverride`): polls, queries and history
+    /// long polls, but not a plain `GetWorkflowExecutionHistory`.
     pub fn is_long_running(self) -> bool {
         matches!(
             self,
-            Api::PollWorkflowTaskQueue | Api::PollActivityTaskQueue | Api::QueryWorkflow
+            Api::PollWorkflowTaskQueue
+                | Api::PollActivityTaskQueue
+                | Api::QueryWorkflow
+                | Api::PollWorkflowExecutionHistory
         )
     }
 
@@ -164,7 +195,8 @@ impl Api {
         match self {
             Api::StartWorkflowExecution
             | Api::SignalWorkflowExecution
-            | Api::GetWorkflowExecutionHistory => 1,
+            | Api::GetWorkflowExecutionHistory
+            | Api::PollWorkflowExecutionHistory => 1,
             _ => 2,
         }
     }

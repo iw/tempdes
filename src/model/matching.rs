@@ -37,6 +37,13 @@ fn tqp(ctx: &Ctx, tq: usize, kind: TqKind) -> &super::params::TqTypeParams {
     }
 }
 
+/// Matching's task queue managers call persistence as the task queue's namespace
+/// (`task_queue_partition_manager.go`: `NewBackgroundHighCallerInfo(ns)`).
+fn partition_caller(ctx: &Ctx, pid: usize) -> Caller {
+    let tq = ctx.matching.borrow().parts[pid].tq;
+    Caller::BackgroundHigh(ctx.p.task_queues[tq].ns)
+}
+
 fn part_params(ctx: &Ctx, pid: usize) -> (usize, TqKind) {
     let m = ctx.matching.borrow();
     (m.parts[pid].tq, m.parts[pid].kind)
@@ -266,7 +273,8 @@ async fn writer(ctx: Ctx, pid: usize) {
             (p.write_queue.drain(..n).collect::<Vec<_>>(), p.host)
         };
         let n = batch.len();
-        let r = persist(&ctx, host, PersistOp::CreateTasks, Caller::BackgroundHigh).await;
+        let caller = partition_caller(&ctx, pid);
+        let r = persist(&ctx, host, PersistOp::CreateTasks, caller, None).await;
         cpu(&ctx, host, ctx.p.costs.matching_backlog_per_task * n as f64).await;
         match r {
             Err(e) => {
@@ -296,13 +304,7 @@ async fn writer(ctx: Ctx, pid: usize) {
                     renew
                 };
                 if renew {
-                    let _ = persist(
-                        &ctx,
-                        host,
-                        PersistOp::UpdateTaskQueue,
-                        Caller::BackgroundHigh,
-                    )
-                    .await;
+                    let _ = persist(&ctx, host, PersistOp::UpdateTaskQueue, caller, None).await;
                 }
                 for req in batch {
                     let _ = req.done.send(Ok(()));
@@ -347,9 +349,15 @@ async fn reader(ctx: Ctx, pid: usize) {
             }
             p.host
         };
-        if persist(&ctx, host, PersistOp::GetTasks, Caller::BackgroundHigh)
-            .await
-            .is_err()
+        if persist(
+            &ctx,
+            host,
+            PersistOp::GetTasks,
+            partition_caller(&ctx, pid),
+            None,
+        )
+        .await
+        .is_err()
         {
             sleep(3_000_000).await;
             continue;
@@ -444,14 +452,9 @@ fn try_dispatch(ctx: &Ctx, pid: usize) {
         };
         if let Some(host) = cleanup {
             let c = ctx.clone();
+            let caller = partition_caller(ctx, pid);
             spawn(async move {
-                let _ = persist(
-                    &c,
-                    host,
-                    PersistOp::CompleteTasksLessThan,
-                    Caller::BackgroundHigh,
-                )
-                .await;
+                let _ = persist(&c, host, PersistOp::CompleteTasksLessThan, caller, None).await;
             });
         }
     }

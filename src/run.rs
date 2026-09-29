@@ -71,27 +71,43 @@ pub fn apply_replicas(base: Replicas, ov: &[(String, u32)]) -> anyhow::Result<Re
     Ok(r)
 }
 
-/// Observed metrics plus what a pilot simulation derived from them.
+/// Observed metrics plus what pilot simulations derived from them.
 #[derive(Clone, Debug)]
 pub struct Calibration {
     pub obs: Observations,
     pub persistence_latency: bool,
     pub workload: bool,
-    /// per-service CPU cost multipliers from the pilot run
+    /// per-service CPU cost multipliers from the pilot runs
     pub cpu_scale: [Option<f64>; 4],
+    /// per persistence operation (indexed by `PersistOp`): the factor on the observed latency
+    /// distribution that gives its service time, so that the pilot's latency, queueing
+    /// included, matches the observed latency (`None` = not fitted)
+    pub persistence_fit: Vec<Option<f64>>,
     pub notes: Vec<String>,
 }
 
-/// Build a calibration from observations. When CPU usage is observed, a pilot simulation of the
-/// *base* configuration (the one the observations came from) measures simulated CPU demand
-/// and the cost tables are scaled to match; sweeps then reuse the same scales for every cell.
-/// The pilot runs at the observed load: a `--load` multiplier applies on top of calibration.
+/// Pilot runs at most, and the relative error that ends the fit early.
+const PILOT_RUNS: usize = 3;
+const FIT_TOLERANCE: f64 = 0.03;
+
+/// Build a calibration from observations. Pilot simulations of the *base* configuration (the one
+/// the observations came from), at the observed load, derive:
+///
+/// * CPU cost scales, when CPU usage is observed: observed cores ÷ simulated cores per service;
+/// * persistence service times, when persistence latency is observed: production measures the
+///   whole call, queueing in the connection pool and the database included, so using it as the
+///   service time would count the queueing twice. Each operation's service time is the observed
+///   distribution times a factor, adjusted until the pilot's mean latency matches the observed
+///   mean (a one-dimensional fit per operation, repeated because the operations share the
+///   database).
+///
+/// Sweeps reuse the results for every cell, and a `--load` multiplier applies on top.
 pub fn calibrate(
     sc: &Scenario,
     base: &Overrides,
     obs: Observations,
 ) -> anyhow::Result<Calibration> {
-    use crate::model::types::Service;
+    use crate::model::types::{PersistOp, Service};
     let flags = sc
         .calibration
         .clone()
@@ -106,37 +122,107 @@ pub fn calibrate(
         persistence_latency: flags.persistence_latency,
         workload: flags.workload,
         cpu_scale: [None; 4],
+        persistence_fit: vec![None; PersistOp::ALL.len()],
         notes: Vec::new(),
     };
-    let targets: Vec<(Service, f64)> = [Service::Frontend, Service::History, Service::Matching]
-        .into_iter()
-        .filter_map(|s| crate::calibrate::cpu_cores(&cal.obs, s).map(|c| (s, c)))
-        .collect();
-    if !flags.cpu || targets.is_empty() {
+    let cpu_targets: Vec<(Service, f64)> = if flags.cpu {
+        [Service::Frontend, Service::History, Service::Matching]
+            .into_iter()
+            .filter_map(|s| crate::calibrate::cpu_cores(&cal.obs, s).map(|c| (s, c)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // the database operations whose observed latency is fitted (visibility stores excluded)
+    let latency_targets: Vec<(PersistOp, f64)> = if flags.persistence_latency {
+        PersistOp::ALL
+            .into_iter()
+            .filter(|op| !op.is_visibility())
+            .filter_map(|op| {
+                crate::calibrate::observed_latency(&cal.obs, op).map(|d| (op, d.mean()))
+            })
+            .filter(|(_, mean)| *mean > 0.0)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if cpu_targets.is_empty() && latency_targets.is_empty() {
         return Ok(cal);
     }
     let mut pilot = base.clone();
-    pilot.start_rate_scale = None; // observed CPU belongs to the observed load
+    pilot.start_rate_scale = None; // observations belong to the observed load
     pilot.warmup_s = Some(sc.warmup().secs().min(15.0));
     pilot.duration_s = Some(sc.duration.secs().min(30.0));
-    let p = prepare(sc, &pilot, Some(&cal))?;
-    let out = run_params(p);
-    let pods = out.ctx.pods.borrow();
-    for (svc, observed) in targets {
-        let simulated: f64 = pods
-            .iter()
-            .filter(|p| p.svc == svc && p.alive)
-            .map(|p| {
-                p.cpu.demand_us() / p.cpu.window_us().max(1.0) * out.ctx.p.costs.scale[svc.idx()]
-            })
-            .sum();
-        if simulated > 0.0 {
-            let k = (observed / simulated).clamp(0.05, 20.0);
-            cal.cpu_scale[svc.idx()] = Some(k);
+    // per fitted operation: observed mean, the last pilot's mean and the factor it ran with
+    let mut last_errors: Vec<(PersistOp, f64, f64, f64)> = Vec::new();
+    for run in 0..PILOT_RUNS {
+        let p = prepare(sc, &pilot, Some(&cal))?;
+        let out = run_params(p);
+        let mut converged = true;
+        {
+            let pods = out.ctx.pods.borrow();
+            for &(svc, observed) in &cpu_targets {
+                // demand already includes the scale the pilot ran with
+                let simulated: f64 = pods
+                    .iter()
+                    .filter(|p| p.svc == svc && p.alive)
+                    .map(|p| p.cpu.demand_us() / p.cpu.window_us().max(1.0))
+                    .sum();
+                if simulated > 0.0 {
+                    let current = cal.cpu_scale[svc.idx()].unwrap_or(1.0);
+                    let k = (current * observed / simulated).clamp(0.05, 20.0);
+                    converged &= (k / current - 1.0).abs() < FIT_TOLERANCE;
+                    cal.cpu_scale[svc.idx()] = Some(k);
+                }
+            }
+        }
+        last_errors.clear();
+        {
+            let m = out.ctx.m.borrow();
+            for &(op, observed) in &latency_targets {
+                let o = &m.persist[op.idx()];
+                if o.count - o.error_count() < 50 {
+                    continue; // too few calls in the pilot to fit
+                }
+                let simulated = o.latency.mean();
+                if simulated <= 0.0 {
+                    continue;
+                }
+                let current = cal.persistence_fit[op.idx()].unwrap_or(1.0);
+                // latency can't be shorter than service time: the factor stays at or below 1
+                let k = (current * observed / simulated).clamp(0.05, 1.0);
+                converged &= (k / current - 1.0).abs() < FIT_TOLERANCE;
+                cal.persistence_fit[op.idx()] = Some(k);
+                last_errors.push((op, observed, simulated, current));
+            }
+        }
+        if converged || run + 1 == PILOT_RUNS {
+            break;
+        }
+    }
+    for (svc, observed) in &cpu_targets {
+        if let Some(k) = cal.cpu_scale[svc.idx()] {
             cal.notes.push(format!(
-                "calibrated {svc} CPU costs x{k:.2}: pilot simulation of the observed configuration used {simulated:.2} cores, production {observed:.2}"
+                "calibrated {svc} CPU costs x{k:.2}: pilot simulations of the observed configuration matched production's {observed:.2} cores"
             ));
         }
+    }
+    for (op, observed, simulated, pilot_k) in last_errors {
+        let (Some(k), Some(d)) = (
+            cal.persistence_fit[op.idx()],
+            crate::calibrate::observed_latency(&cal.obs, op),
+        ) else {
+            continue;
+        };
+        let d = d.scaled(k);
+        cal.notes.push(format!(
+            "calibrated {} service time as the observed latency ×{k:.2}, p50 {} p99 {}: a pilot at ×{pilot_k:.2} measured a mean latency of {}, queueing included, against production's {}",
+            op.as_str(),
+            crate::util::units::fmt_us(d.quantile(0.5)),
+            crate::util::units::fmt_us(d.quantile(0.99)),
+            crate::util::units::fmt_us(simulated),
+            crate::util::units::fmt_us(observed)
+        ));
     }
     Ok(cal)
 }
@@ -174,7 +260,14 @@ pub fn prepare(sc: &Scenario, ov: &Overrides, cal: Option<&Calibration>) -> anyh
     let mut p = Params::build(&sc, dc, replicas)?;
     if let Some(c) = cal {
         let load = ov.start_rate_scale.unwrap_or(1.0);
-        crate::calibrate::apply(&mut p, &c.obs, c.persistence_latency, c.workload, load);
+        crate::calibrate::apply(
+            &mut p,
+            &c.obs,
+            c.persistence_latency,
+            c.workload,
+            load,
+            &c.persistence_fit,
+        );
         if !is_observed_load(ov) {
             p.prov.notes.push(format!(
                 "load ×{load} applied on top of the calibrated workload; the comparison with observed metrics is skipped"

@@ -11,7 +11,10 @@ metrics:
     labels: { service_name: frontend, operation: StartWorkflowExecution }
     rate: 180/s
 
-  # database service times (p50/p90/p99 from persistence_latency histograms)
+  # database latency (p50/p90/p99 from persistence_latency histograms). tempdes fits service
+  # times so that its simulated latency, queueing included, matches these. Create and
+  # UpdateWorkflowExecution latency includes the history append made inside the call, so
+  # production shows no separate AppendHistoryNodes latency for normal workflow writes.
   - name: persistence_latency
     labels: { operation: UpdateWorkflowExecution }
     p50: 3.4ms
@@ -24,10 +27,6 @@ metrics:
   - name: persistence_latency
     labels: { operation: GetWorkflowExecution }
     quantiles: { 0.5: 1.3ms, 0.9: 3.1ms, 0.99: 11ms }
-  - name: persistence_latency
-    labels: { operation: AppendHistoryNodes }
-    p50: 1.8ms
-    p99: 12ms
   - name: persistence_latency
     labels: { operation: ReadHistoryBranch }
     p50: 2.2ms

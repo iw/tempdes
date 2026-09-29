@@ -94,17 +94,20 @@ pub fn render(ctx: &Ctx) -> String {
     for (id, pod) in pods.iter().enumerate() {
         let inst = pod.addr.clone();
         let svc = pod.svc.as_str().to_string();
-        let ops: Vec<(String, &crate::model::metrics::OpStats)> = match pod.svc {
+        let ops: Vec<(String, crate::model::metrics::OpStats)> = match pod.svc {
             Service::Frontend => {
-                m.fe.get(id)
-                    .map(|v| {
-                        Api::ALL
-                            .iter()
-                            .zip(v.iter())
-                            .map(|(a, o)| (a.as_str().to_string(), o))
-                            .collect()
-                    })
-                    .unwrap_or_default()
+                // a history long poll is a GetWorkflowExecutionHistory call in Temporal's metrics
+                let mut by_op: std::collections::BTreeMap<&str, crate::model::metrics::OpStats> =
+                    std::collections::BTreeMap::new();
+                if let Some(v) = m.fe.get(id) {
+                    for (a, o) in Api::ALL.iter().zip(v.iter()) {
+                        by_op.entry(a.metric_operation()).or_default().merge(o);
+                    }
+                }
+                by_op
+                    .into_iter()
+                    .map(|(op, o)| (op.to_string(), o))
+                    .collect()
             }
             Service::History => m
                 .hist
@@ -113,7 +116,7 @@ pub fn render(ctx: &Ctx) -> String {
                     HistApi::ALL
                         .iter()
                         .zip(v.iter())
-                        .map(|(a, o)| (a.as_str().to_string(), o))
+                        .map(|(a, o)| (a.as_str().to_string(), o.clone()))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -124,7 +127,7 @@ pub fn render(ctx: &Ctx) -> String {
                     MatchApi::ALL
                         .iter()
                         .zip(v.iter())
-                        .map(|(a, o)| (a.as_str().to_string(), o))
+                        .map(|(a, o)| (a.as_str().to_string(), o.clone()))
                         .collect()
                 })
                 .unwrap_or_default(),

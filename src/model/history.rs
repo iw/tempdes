@@ -12,6 +12,7 @@
 use crate::sim::executor::{Time, now};
 use crate::util::farmhash::workflow_id_to_history_shard;
 
+use super::activity;
 use super::infra::*;
 use super::queues::{TaskSpec, commit_tasks};
 use super::types::*;
@@ -31,6 +32,8 @@ pub struct ProgState {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Snapshot {
     pub completed_in_step: u32,
+    /// activities of the step that failed for good
+    pub failed_in_step: u32,
     pub timer_fired: bool,
     pub children_done: u32,
     pub signals_received: u32,
@@ -62,6 +65,8 @@ pub struct ActTaskInfo {
     pub attempt: u32,
     pub step: usize,
     pub scheduled_at: Time,
+    /// when the activity was first scheduled (the poll response's `ScheduledTime`)
+    pub first_scheduled_at: Time,
 }
 
 /// Commands produced by a workflow task.
@@ -72,6 +77,8 @@ pub struct Commands {
     pub start_timer: Option<Time>,
     pub start_children: Option<(usize, u32)>,
     pub complete: bool,
+    /// close the workflow as failed (with `complete`): an activity failed for good
+    pub fail: bool,
     pub markers: u32,
     pub new_prog: ProgState,
     pub sticky_worker: Option<usize>,
@@ -127,7 +134,7 @@ pub async fn start_workflow(
     eager: bool,
     deadline: Time,
 ) -> Res<(WfId, u32, Option<WftInfo>)> {
-    let caller = Caller::Api(1);
+    let caller = Caller::Api(1, ctx.p.wf_types[wf_type].ns);
     history_admit(ctx, pod, caller)?;
     let t0 = now();
     let r = start_inner(ctx, pod, shard, key, wf_type, origin, eager, deadline).await;
@@ -165,7 +172,7 @@ async fn start_inner(
         shard,
         PersistOp::CreateWorkflowExecution,
         true,
-        Caller::Api(1),
+        Caller::Api(1, tp.ns),
         deadline,
     )
     .await?;
@@ -210,6 +217,7 @@ async fn start_inner(
         step_started: false,
         step_remaining: 0,
         completed_in_step: 0,
+        failed_in_step: 0,
         timer_seq: 0,
         timer_pending: None,
         timer_fired: false,
@@ -279,6 +287,7 @@ fn snapshot(w: &Wf) -> (ProgState, Snapshot) {
         },
         Snapshot {
             completed_in_step: w.completed_in_step,
+            failed_in_step: w.failed_in_step,
             timer_fired: w.timer_fired,
             children_done: w.children_done,
             signals_received: w.signals_received,
@@ -296,7 +305,7 @@ pub async fn record_wft_started(
     seq: u32,
     deadline: Time,
 ) -> Res<WftInfo> {
-    let caller = Caller::Api(2);
+    let caller = Caller::Api(2, ctx.wf_ns(wf, wgen));
     history_admit(ctx, pod, caller)?;
     let t0 = now();
     let r = record_wft_started_inner(ctx, pod, wf, wgen, seq, deadline).await;
@@ -315,7 +324,7 @@ async fn record_wft_started_inner(
     seq: u32,
     deadline: Time,
 ) -> Res<WftInfo> {
-    let caller = Caller::Api(2);
+    let caller = Caller::Api(2, ctx.wf_ns(wf, wgen));
     cpu(
         ctx,
         pod,
@@ -405,7 +414,7 @@ async fn record_wft_started_inner(
     );
     drop(lock);
     // first page of history for the poll response (outside the lock)
-    persist(ctx, pod, PersistOp::ReadHistoryBranch, caller).await?;
+    persist(ctx, pod, PersistOp::ReadHistoryBranch, caller, Some(shard)).await?;
     cpu(
         ctx,
         pod,
@@ -460,7 +469,7 @@ pub async fn respond_wft_completed(
     cmds: Commands,
     deadline: Time,
 ) -> Res<RespondResult> {
-    let caller = Caller::Api(2);
+    let caller = Caller::Api(2, ctx.wf_ns(info.wf, info.wgen));
     history_admit(ctx, pod, caller)?;
     let t0 = now();
     let r = respond_wft_inner(ctx, pod, info, cmds, deadline).await;
@@ -478,7 +487,7 @@ async fn respond_wft_inner(
     cmds: Commands,
     deadline: Time,
 ) -> Res<RespondResult> {
-    let caller = Caller::Api(2);
+    let caller = Caller::Api(2, ctx.wf_ns(info.wf, info.wgen));
     let n_cmds = cmds.schedule_activities.iter().map(|x| x.2).sum::<u32>()
         + u32::from(cmds.start_timer.is_some())
         + cmds.start_children.map(|c| c.1).unwrap_or(0)
@@ -540,6 +549,7 @@ async fn respond_wft_inner(
         // apply program state; step change resets per-step counters
         if cmds.new_prog.step != w.step {
             w.completed_in_step = 0;
+            w.failed_in_step = 0;
             w.timer_fired = false;
             w.children_done = 0;
             // the SDK cancels a timer whose step completed early (e.g. a wait-signal timeout)
@@ -555,7 +565,6 @@ async fn respond_wft_inner(
         }
         // activities
         let mut eager_left = eager_n;
-        let mut earliest_timeout = false;
         for &(step, tq, count) in &cmds.schedule_activities {
             for _ in 0..count {
                 w.next_act_seq += 1;
@@ -575,7 +584,11 @@ async fn respond_wft_inner(
                     step,
                     tq,
                     scheduled_at: t,
-                    started_at: t,
+                    first_scheduled_at: t,
+                    started_at: if eager { t } else { 0 },
+                    last_heartbeat: 0,
+                    timers: 0,
+                    hb_timer_at: 0,
                 });
                 if eager {
                     eager_out.push(ActTaskInfo {
@@ -586,22 +599,14 @@ async fn respond_wft_inner(
                         attempt: 1,
                         step,
                         scheduled_at: t,
+                        first_scheduled_at: t,
                     });
                 } else {
                     tasks.push(TaskSpec::now(TaskType::TransferActivityTask, seq, 1));
                 }
-                if !earliest_timeout {
-                    // at most one outstanding activity timeout timer (the earliest)
-                    earliest_timeout = true;
-                    tasks.push(TaskSpec::at(
-                        TaskType::TimerActivityTimeout,
-                        t + activity_timeout(ctx, wf_type, step),
-                        seq,
-                        1,
-                    ));
-                }
             }
         }
+        activity::create_next_timer(ctx, w, &mut tasks);
         if let Some(d) = cmds.start_timer {
             w.timer_seq += 1;
             w.timer_pending = Some(w.timer_seq);
@@ -670,12 +675,12 @@ async fn respond_wft_inner(
     };
     let _ = ns;
     if closed {
-        close_workflow(ctx, wf, wgen, wf_type, parent);
+        close_workflow(ctx, wf, wgen, wf_type, parent, cmds.fail);
     }
     commit_tasks(ctx, shard, wf, wgen, &tasks);
     drop(lock);
     if new_wft.is_some() {
-        persist(ctx, pod, PersistOp::ReadHistoryBranch, caller).await?;
+        persist(ctx, pod, PersistOp::ReadHistoryBranch, caller, Some(shard)).await?;
     }
     {
         let mut m = ctx.m.borrow_mut();
@@ -687,18 +692,15 @@ async fn respond_wft_inner(
     })
 }
 
-fn activity_timeout(ctx: &Ctx, wf_type: usize, step: usize) -> Time {
-    match ctx.p.wf_types[wf_type].steps.get(step) {
-        Some(super::params::StepP::Activity { duration, .. }) => {
-            let p99 = duration.quantile(0.99);
-            (p99 * 10.0).clamp(10.0e6, 3_600.0e6) as Time
-        }
-        _ => 60_000_000,
-    }
-}
-
-/// Bookkeeping when a workflow closes.
-fn close_workflow(ctx: &Ctx, wf: WfId, wgen: u32, wf_type: usize, _parent: Option<(WfId, u32)>) {
+/// Bookkeeping when a workflow closes, completed or `failed`.
+fn close_workflow(
+    ctx: &Ctx,
+    wf: WfId,
+    wgen: u32,
+    wf_type: usize,
+    _parent: Option<(WfId, u32)>,
+    failed: bool,
+) {
     let (waiters, hwaiters, start) = {
         let mut wfs = ctx.wfs.borrow_mut();
         let Some(w) = wfs.get_mut(wf, wgen) else {
@@ -717,8 +719,12 @@ fn close_workflow(ctx: &Ctx, wf: WfId, wgen: u32, wf_type: usize, _parent: Optio
         let _ = tx.send(());
     }
     let mut m = ctx.m.borrow_mut();
-    m.wf[wf_type].completed += 1;
-    m.wf[wf_type].e2e.record(now() - start);
+    if failed {
+        m.wf[wf_type].failed += 1;
+    } else {
+        m.wf[wf_type].completed += 1;
+        m.wf[wf_type].e2e.record(now() - start);
+    }
     // remove from sticky caches lazily (worker side handles missing entries)
 }
 
@@ -732,7 +738,7 @@ pub async fn record_activity_started(
     attempt: u32,
     deadline: Time,
 ) -> Res<ActTaskInfo> {
-    let caller = Caller::Api(2);
+    let caller = Caller::Api(2, ctx.wf_ns(wf, wgen));
     history_admit(ctx, pod, caller)?;
     let t0 = now();
     let r = async {
@@ -746,7 +752,7 @@ pub async fn record_activity_started(
         shard_ready(ctx, pod, shard, deadline).await?;
         let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
-        let (step, scheduled_at, wf_type) = {
+        let (step, scheduled_at, first_scheduled_at, wf_type) = {
             let wfs = ctx.wfs.borrow();
             let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
             if w.status != WfStatus::Running {
@@ -757,7 +763,7 @@ pub async fn record_activity_started(
                 .iter()
                 .find(|a| a.seq == seq && a.attempt == attempt && a.state == ActState::Scheduled)
                 .ok_or(Err::NotFound)?;
-            (a.step, a.scheduled_at, w.wf_type)
+            (a.step, a.scheduled_at, a.first_scheduled_at, w.wf_type)
         };
         // scheduled event from the shard events cache (while holding the lock)
         let ev_key = {
@@ -779,7 +785,7 @@ pub async fn record_activity_started(
             }
         }
         if !ev_hit {
-            persist(ctx, pod, PersistOp::ReadHistoryBranch, caller).await?;
+            persist(ctx, pod, PersistOp::ReadHistoryBranch, caller, Some(shard)).await?;
         }
         let r = shard_write(
             ctx,
@@ -803,20 +809,10 @@ pub async fn record_activity_started(
             if let Some(a) = w.activities.iter_mut().find(|a| a.seq == seq) {
                 a.state = ActState::Started;
                 a.started_at = t;
+                a.last_heartbeat = 0;
             }
-            if let Some(super::params::StepP::Activity {
-                heartbeat: Some(hb),
-                ..
-            }) = ctx.p.wf_types[w.wf_type].steps.get(step)
-            {
-                // heartbeat timeout timer (2x interval)
-                tasks.push(TaskSpec::at(
-                    TaskType::TimerActivityTimeout,
-                    t + hb * 2,
-                    seq,
-                    attempt,
-                ));
-            }
+            // the attempt's start-to-close or heartbeat timer, if it is now the earliest
+            activity::create_next_timer(ctx, w, &mut tasks);
         }
         if !tasks.is_empty() {
             commit_tasks(ctx, shard, wf, wgen, &tasks);
@@ -830,6 +826,7 @@ pub async fn record_activity_started(
             attempt,
             step,
             scheduled_at,
+            first_scheduled_at,
         })
     }
     .await;
@@ -848,7 +845,7 @@ pub async fn respond_activity(
     failed: bool,
     deadline: Time,
 ) -> Res<()> {
-    let caller = Caller::Api(2);
+    let caller = Caller::Api(2, ctx.wf_ns(info.wf, info.wgen));
     history_admit(ctx, pod, caller)?;
     let api = if failed {
         HistApi::RespondActivityTaskFailed
@@ -863,6 +860,7 @@ pub async fn respond_activity(
         shard_ready(ctx, pod, shard, deadline).await?;
         let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
+        let t0w = now();
         let retry = {
             let wfs = ctx.wfs.borrow();
             let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
@@ -876,8 +874,14 @@ pub async fn respond_activity(
                     a.seq == info.seq && a.attempt == info.attempt && a.state == ActState::Started
                 })
                 .ok_or(Err::NotFound)?;
-            failed.then_some(a.attempt)
+            // RespondActivityTaskFailed: the retry policy decides between a new attempt and
+            // failing the activity
+            match failed.then(|| activity::retry_decision(ctx, w.wf_type, a, None, t0w)) {
+                Some(activity::Next::Retry(d)) => Some(d),
+                _ => None,
+            }
         };
+        let gave_up = failed && retry.is_none();
         // failure with retry is a mutable-state-only write (server-side retry)
         let r = shard_write(
             ctx,
@@ -898,36 +902,34 @@ pub async fn respond_activity(
         {
             let mut wfs = ctx.wfs.borrow_mut();
             let w = wfs.get_mut(wf, wgen).ok_or(Err::NotFound)?;
-            if let Some(attempt) = retry {
+            if let Some(delay) = retry {
                 if let Some(a) = w.activities.iter_mut().find(|a| a.seq == info.seq) {
-                    a.state = ActState::Backoff;
-                    a.attempt = attempt + 1;
+                    tasks.push(activity::schedule_retry(a, t, delay));
                 }
-                let initial = match ctx.p.wf_types[w.wf_type].steps.get(info.step) {
-                    Some(super::params::StepP::Activity { retry_initial, .. }) => *retry_initial,
-                    _ => 1_000_000,
-                };
-                let delay = (initial as f64 * 2f64.powi(attempt as i32 - 1)).min(100e6) as Time;
-                tasks.push(TaskSpec::at(
-                    TaskType::TimerActivityRetryTimer,
-                    t + delay,
-                    info.seq,
-                    attempt + 1,
-                ));
             } else {
                 w.activities.retain(|a| a.seq != info.seq);
                 w.history_events += 2;
                 w.history_bytes += ctx.p.wf_types[w.wf_type].payload_bytes;
-                w.completed_in_step += 1;
+                if gave_up {
+                    w.failed_in_step += 1;
+                } else {
+                    w.completed_in_step += 1;
+                }
                 deliver_event(ctx, w, t, &mut tasks);
             }
+            activity::create_next_timer(ctx, w, &mut tasks);
         }
         commit_tasks(ctx, shard, wf, wgen, &tasks);
         drop(lock);
-        if retry.is_none() {
-            ctx.m.borrow_mut().wf[info.wf_type].activities_completed += 1;
+        let mut m = ctx.m.borrow_mut();
+        let ws = &mut m.wf[info.wf_type];
+        if failed {
+            ws.activity_failures += 1;
+            if gave_up {
+                ws.activities_failed += 1;
+            }
         } else {
-            ctx.m.borrow_mut().wf[info.wf_type].activity_failures += 1;
+            ws.activities_completed += 1;
         }
         Ok(())
     }
@@ -956,7 +958,7 @@ pub fn deliver_event(ctx: &Ctx, w: &mut Wf, t: Time, tasks: &mut Vec<TaskSpec>) 
 
 /// RecordActivityTaskHeartbeat.
 pub async fn heartbeat(ctx: &Ctx, pod: PodId, info: ActTaskInfo, deadline: Time) -> Res<()> {
-    let caller = Caller::Api(2);
+    let caller = Caller::Api(2, ctx.wf_ns(info.wf, info.wgen));
     history_admit(ctx, pod, caller)?;
     let t0 = now();
     let r = async {
@@ -970,6 +972,18 @@ pub async fn heartbeat(ctx: &Ctx, pod: PodId, info: ActTaskInfo, deadline: Time)
         shard_ready(ctx, pod, shard, deadline).await?;
         let lock = lock_wf(ctx, info.wf, info.wgen, caller, deadline).await?;
         load_ms(ctx, pod, shard, info.wf, info.wgen, caller).await?;
+        {
+            // only the running attempt may heartbeat
+            let wfs = ctx.wfs.borrow();
+            let w = wfs.get(info.wf, info.wgen).ok_or(Err::NotFound)?;
+            let running = w.status == WfStatus::Running
+                && w.activities.iter().any(|a| {
+                    a.seq == info.seq && a.attempt == info.attempt && a.state == ActState::Started
+                });
+            if !running {
+                return Err(Err::NotFound);
+            }
+        }
         let r = shard_write(
             ctx,
             pod,
@@ -980,6 +994,22 @@ pub async fn heartbeat(ctx: &Ctx, pod: PodId, info: ActTaskInfo, deadline: Time)
             deadline,
         )
         .await;
+        if r.is_ok() {
+            let t = now();
+            let mut tasks = Vec::new();
+            {
+                let mut wfs = ctx.wfs.borrow_mut();
+                if let Some(w) = wfs.get_mut(info.wf, info.wgen) {
+                    if let Some(a) = w.activities.iter_mut().find(|a| a.seq == info.seq) {
+                        a.last_heartbeat = t;
+                    }
+                    activity::create_next_timer(ctx, w, &mut tasks);
+                }
+            }
+            commit_tasks(ctx, shard, info.wf, info.wgen, &tasks);
+        } else {
+            evict_ms(ctx, pod, shard, info.wf, info.wgen);
+        }
         drop(lock);
         r
     }
@@ -993,7 +1023,7 @@ pub async fn heartbeat(ctx: &Ctx, pod: PodId, info: ActTaskInfo, deadline: Time)
 
 /// SignalWorkflowExecution.
 pub async fn signal(ctx: &Ctx, pod: PodId, wf: WfId, wgen: u32, deadline: Time) -> Res<()> {
-    let caller = Caller::Api(1);
+    let caller = Caller::Api(1, ctx.wf_ns(wf, wgen));
     history_admit(ctx, pod, caller)?;
     let t0 = now();
     let r = async {
@@ -1006,7 +1036,14 @@ pub async fn signal(ctx: &Ctx, pod: PodId, wf: WfId, wgen: u32, deadline: Time) 
         let shard = ctx.wf_shard(wf, wgen).ok_or(Err::NotFound)?;
         shard_ready(ctx, pod, shard, deadline).await?;
         // signal without RunID: GetCurrentExecution
-        persist(ctx, pod, PersistOp::GetCurrentExecution, caller).await?;
+        persist(
+            ctx,
+            pod,
+            PersistOp::GetCurrentExecution,
+            caller,
+            Some(shard),
+        )
+        .await?;
         let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
         {
@@ -1060,7 +1097,8 @@ pub async fn record_child_completed(
     wgen: u32,
     deadline: Time,
 ) -> Res<()> {
-    let caller = Caller::BackgroundHigh;
+    let ns = ctx.wf_ns(wf, wgen);
+    let caller = Caller::BackgroundHigh(ns);
     history_admit(ctx, pod, caller)?;
     let t0 = now();
     let r = async {
@@ -1072,7 +1110,7 @@ pub async fn record_child_completed(
         .await;
         let shard = ctx.wf_shard(wf, wgen).ok_or(Err::NotFound)?;
         shard_ready(ctx, pod, shard, deadline).await?;
-        let lock = lock_wf(ctx, wf, wgen, Caller::Api(2), deadline).await?;
+        let lock = lock_wf(ctx, wf, wgen, Caller::Api(2, ns), deadline).await?;
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
         {
             let wfs = ctx.wfs.borrow();
@@ -1126,7 +1164,7 @@ pub async fn describe(
     api: HistApi,
     deadline: Time,
 ) -> Res<()> {
-    let caller = Caller::Api(2);
+    let caller = Caller::Api(2, ctx.wf_ns(wf, wgen));
     history_admit(ctx, pod, caller)?;
     let t0 = now();
     let r = async {
@@ -1157,7 +1195,7 @@ pub async fn get_history(
     wait_close: bool,
     deadline: Time,
 ) -> Res<bool> {
-    let caller = Caller::Api(1);
+    let caller = Caller::Api(1, ctx.wf_ns(wf, wgen));
     history_admit(ctx, pod, caller)?;
     let t0 = now();
     let r = async {
@@ -1192,7 +1230,7 @@ pub async fn get_history(
             }
         }
         for _ in 0..pages.max(1) {
-            persist(ctx, pod, PersistOp::ReadHistoryBranch, caller).await?;
+            persist(ctx, pod, PersistOp::ReadHistoryBranch, caller, Some(shard)).await?;
             cpu(
                 ctx,
                 pod,

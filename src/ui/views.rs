@@ -1209,6 +1209,7 @@ pub async fn detail(analysis: Option<&RunResult>) -> Result<impl View> {
                             fmt_rate(w.offered_start_rate),
                             fmt_rate(w.started_per_s),
                             fmt_rate(w.completed_per_s),
+                            fmt_rate(w.failed_per_s),
                             ms(w.e2e.p50_ms),
                             ms(w.e2e.p99_ms),
                             ms(w.wft_schedule_to_start.p99_ms),
@@ -1278,7 +1279,7 @@ pub async fn detail(analysis: Option<&RunResult>) -> Result<impl View> {
                 <details>
                     <summary><span>"Workflows and client-observed APIs"</span><span class="muted">(format!("sync match {}", fmt_pct(r.matching.sync_match_ratio)))</span></summary>
                     <div class="inner">
-                        table(head: vec!["workflow type", "offered", "started", "completed", "e2e p50", "e2e p99", "WFT s2s p99", "act s2s p99", "sticky hit", "WFT timeouts"], numeric_from: 1, rows: wf_rows)
+                        table(head: vec!["workflow type", "offered", "started", "completed", "failed", "e2e p50", "e2e p99", "WFT s2s p99", "act s2s p99", "sticky hit", "WFT timeouts"], numeric_from: 1, rows: wf_rows)
                         table(head: vec!["API", "rate", "p50", "p95", "p99", "errors"], numeric_from: 1, rows: api_rows)
                     </div>
                 </details>
