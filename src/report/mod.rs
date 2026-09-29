@@ -108,6 +108,11 @@ pub struct WorkflowResult {
     pub activities_failed: u64,
     /// of those, activities that failed with a non-retryable error, as the scenario plans
     pub activities_non_retryable: u64,
+    /// workflows the server terminated as their history grew over `limit.historySize.error`
+    pub terminated: u64,
+    /// workflows whose history grew over `limit.historySize.warn`, and the largest history
+    pub histories_over_warn: u64,
+    pub max_history_bytes: f64,
     pub signals_per_s: f64,
     pub signals_failed: u64,
     pub eager_starts: u64,
@@ -277,6 +282,9 @@ pub struct HistoryResult {
     pub hot_workflows: Vec<LockResult>,
     pub cache_hit_ratio: f64,
     pub events_cache_hit_ratio: f64,
+    /// event lookups (activity starts, child starts and closes) that missed the shard events
+    /// cache and read the event's batch back from the database
+    pub events_cache_misses_per_s: f64,
     pub tasks: Vec<TaskResult>,
     pub task_scheduler: TaskSchedulerResult,
     /// present when the execution queue scheduler is on
@@ -462,6 +470,9 @@ pub fn analyze_window(
                 .collect(),
             activities_failed: w.activities_failed,
             activities_non_retryable: w.activities_non_retryable,
+            terminated: w.terminated,
+            histories_over_warn: w.over_size_warn,
+            max_history_bytes: w.max_history_bytes,
             signals_per_s: w.signals_sent as f64 / dur,
             signals_failed: w.signals_failed,
             eager_starts: w.eager_starts,
@@ -893,6 +904,7 @@ pub fn analyze_window(
                 1.0
             }
         },
+        events_cache_misses_per_s: m.events_cache_misses as f64 / dur,
         tasks,
         shards_per_pod,
         shard_moves: m.shard_moves,

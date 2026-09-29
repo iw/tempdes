@@ -64,6 +64,11 @@ pub struct WfStats {
     pub completed: u64,
     /// workflows that closed as failed (an activity failed for good)
     pub failed: u64,
+    /// workflows the server terminated as their history grew over `limit.historySize.error`
+    pub terminated: u64,
+    /// workflows whose history grew over `limit.historySize.warn`, and the largest history
+    pub over_size_warn: u64,
+    pub max_history_bytes: f64,
     pub e2e: Histogram,
     pub wft_completed: u64,
     pub wft_timeouts: u64,

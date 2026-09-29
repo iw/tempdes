@@ -861,7 +861,7 @@ workers:
     processes: 2
     workflow_pollers: 8
     activity_pollers: 8
-    activity_slots: 50
+    activity_slots: 40
 workflows:
   - type: OrderWorkflow
     namespace: orders
@@ -874,7 +874,7 @@ workflows:
 
 #[test]
 fn schedule_to_start_timeouts_fail_activities() {
-    // 100 slots for about 130 concurrent activities: tasks queue, and those waiting longer than
+    // 80 slots for about 130 concurrent activities: tasks queue, and those waiting longer than
     // the schedule-to-start timeout fail without a retry, failing their workflows
     let sc = Scenario::parse_str(&TIMEOUTS.replace("EXTRA", "")).expect("scenario parses");
     let r = simulate_scenario(&sc, short());
@@ -920,7 +920,7 @@ fn start_to_close_timeouts_retry_until_attempts_run_out() {
     let sc = Scenario::parse_str(
         &TIMEOUTS
             .replace("start_rate: 40/s", "start_rate: 5/s")
-            .replace("activity_slots: 50", "activity_slots: 200")
+            .replace("activity_slots: 40", "activity_slots: 200")
             .replace(
                 "heartbeat: 1s, schedule_to_start_timeout: 5s EXTRA",
                 "start_to_close_timeout: 1s, max_attempts: 3, retry_initial: 100ms",
@@ -1346,6 +1346,202 @@ fn eager_activities_are_only_those_on_the_workers_task_queue() {
         "{} adds/s for {} orders/s",
         adds("default/q"),
         w.started_per_s
+    );
+}
+
+/// Orders that fan out to `STEPS`, with payloads of `PAYLOAD`; `DC` is replaced by dynamic config.
+const PAYLOADS: &str = r#"
+name: payloads
+warmup: 10s
+duration: 20s
+cluster:
+  num_history_shards: 64
+  replicas: { frontend: 1, history: 2, matching: 1, worker: 1 }
+  persistence: { store: postgresql }
+DC
+namespaces:
+  - name: default
+workers:
+  - { name: main, namespace: default, task_queue: q, processes: 2, workflow_pollers: 8, activity_pollers: 16, workflow_slots: 200, activity_slots: 800 }
+workflows:
+  - type: OrderWorkflow
+    namespace: default
+    task_queue: q
+    start_rate: 40/s
+    payload_bytes: PAYLOAD
+    steps:
+STEPS
+"#;
+
+fn payloads(payload: &str, steps: &str, dc: &str) -> Scenario {
+    Scenario::parse_str(
+        &PAYLOADS
+            .replace("PAYLOAD", payload)
+            .replace("STEPS", steps)
+            .replace("DC", dc),
+    )
+    .expect("scenario parses")
+}
+
+#[test]
+fn payloads_cost_database_time_and_events_cache_space() {
+    // ten activities scheduled together: their scheduled events go into the shard's 512 KiB
+    // events cache, which holds all of them at 1 KiB, and two at 200 KiB
+    let fan_out = "      - activity: { count: 10, duration: 50ms }";
+    let small = simulate_scenario(&payloads("1KiB", fan_out, ""), Overrides::default());
+    let large = simulate_scenario(&payloads("200KiB", fan_out, ""), Overrides::default());
+    assert!(
+        small.history.events_cache_hit_ratio > 0.95,
+        "{}",
+        small.history.events_cache_hit_ratio
+    );
+    assert!(
+        large.history.events_cache_hit_ratio < 0.5,
+        "{}",
+        large.history.events_cache_hit_ratio
+    );
+    // a start that misses reads its whole batch back: ten inputs, about 2 MiB at 5ms per MiB
+    let mean = |r: &RunResult, op: &str| {
+        r.persistence
+            .ops
+            .iter()
+            .find(|o| o.op == op)
+            .map_or(0.0, |o| o.latency.mean_ms)
+    };
+    assert!(
+        mean(&large, "ReadHistoryBranch") > mean(&small, "ReadHistoryBranch") + 5.0,
+        "{} vs {}ms",
+        mean(&large, "ReadHistoryBranch"),
+        mean(&small, "ReadHistoryBranch")
+    );
+    // writes carry their payloads at 20ms per MiB: the ten inputs, then each result
+    assert!(
+        mean(&large, "UpdateWorkflowExecution") > mean(&small, "UpdateWorkflowExecution") + 3.0,
+        "{} vs {}ms",
+        mean(&large, "UpdateWorkflowExecution"),
+        mean(&small, "UpdateWorkflowExecution")
+    );
+    assert!(
+        large
+            .hotspots
+            .iter()
+            .any(|h| h.title.contains("events cache")),
+        "{:?}",
+        large.hotspots.iter().map(|h| &h.title).collect::<Vec<_>>()
+    );
+    assert!(
+        !small
+            .hotspots
+            .iter()
+            .any(|h| h.title.contains("events cache"))
+    );
+}
+
+#[test]
+fn child_starts_read_their_initiated_events_through_the_events_cache() {
+    // ten children started together, with no activities in the parent: at 200 KiB their
+    // initiated events push each other out of the cache before the transfer tasks that start
+    // the children read them
+    let children = "      - child_workflow: { workflow_type: ShipmentWorkflow, count: 10 }
+  - type: ShipmentWorkflow
+    namespace: default
+    task_queue: q
+    payload_bytes: 1KiB
+    steps:
+      - activity: { duration: 50ms }";
+    let at = |payload: &str| {
+        let mut sc = payloads(payload, children, "");
+        sc.workflows[0].start_rate = Some(tempdes::util::units::Rate(10.0));
+        simulate_scenario(&sc, Overrides::default())
+    };
+    let (small, large) = (at("1KiB"), at("200KiB"));
+    assert!(
+        small.history.events_cache_hit_ratio > 0.95,
+        "{}",
+        small.history.events_cache_hit_ratio
+    );
+    // ten orders a second, most of whose ten child starts miss and read their 2 MiB batch
+    assert!(
+        large.history.events_cache_misses_per_s > 40.0,
+        "{} misses/s, hit ratio {}",
+        large.history.events_cache_misses_per_s,
+        large.history.events_cache_hit_ratio
+    );
+    let order = large
+        .workflows
+        .iter()
+        .find(|w| w.workflow_type == "OrderWorkflow")
+        .unwrap();
+    assert!(
+        order.completed_per_s > 0.9 * order.started_per_s,
+        "{order:#?}"
+    );
+}
+
+#[test]
+fn histories_over_the_size_limit_are_terminated() {
+    // twenty activities one after another, each adding a 256 KiB input and result: the history
+    // passes 5 MiB about halfway
+    let chain = "      - activity: { count: 20, parallel: false, duration: 10ms }";
+    let limits = |error: &str| {
+        format!(
+            "dynamic_config:\n  limit.historySize.error: [ {{ value: {error} }} ]\n  limit.historySize.warn: [ {{ value: 2097152 }} ]"
+        )
+    };
+    let order = |r: &RunResult| r.workflows[0].clone();
+    // at 10 orders/s, so the cluster keeps up with their twenty workflow tasks
+    let slower = |sc: Scenario| {
+        let mut sc = sc;
+        sc.workflows[0].start_rate = Some(tempdes::util::units::Rate(10.0));
+        sc
+    };
+    let r = simulate_scenario(
+        &slower(payloads("256KiB", chain, &limits("5242880"))),
+        Overrides::default(),
+    );
+    let w = order(&r);
+    assert!(w.terminated > 0 && w.completed_per_s == 0.0, "{w:#?}");
+    assert!(w.max_history_bytes > 5.0 * 1024.0 * 1024.0, "{w:#?}");
+    assert!(
+        r.hotspots
+            .iter()
+            .any(|h| h.category == "history-size" && h.severity == Severity::Critical),
+        "{:?}",
+        r.hotspots.iter().map(|h| &h.title).collect::<Vec<_>>()
+    );
+    // under the error limit they complete, and passing the warn limit is a warning
+    let r = simulate_scenario(
+        &slower(payloads("256KiB", chain, &limits("52428800"))),
+        Overrides::default(),
+    );
+    let w = order(&r);
+    assert!(w.terminated == 0 && w.completed_per_s > 0.0, "{w:#?}");
+    assert!(w.histories_over_warn > 0, "{w:#?}");
+    assert!(
+        r.hotspots
+            .iter()
+            .any(|h| h.category == "history-size" && h.severity == Severity::Warning),
+        "{:?}",
+        r.hotspots.iter().map(|h| &h.title).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn payloads_over_the_blob_size_limit_are_rejected() {
+    let steps = "      - activity: { duration: 10ms }";
+    let prepared =
+        |payload: &str| run::prepare(&payloads(payload, steps, ""), &Overrides::default(), None);
+    let e = prepared("3MiB").expect_err("over limit.blobSize.error");
+    assert!(e.to_string().contains("limit.blobSize.error"), "{e}");
+    // over the warn limit it runs, with a warning
+    let p = prepared("600KiB").expect("under limit.blobSize.error");
+    assert!(
+        p.prov
+            .warnings
+            .iter()
+            .any(|w| w.contains("limit.blobSize.warn")),
+        "{:?}",
+        p.prov.warnings
     );
 }
 

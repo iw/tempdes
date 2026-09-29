@@ -299,6 +299,13 @@ pub struct PersistenceSpec {
     /// (`UpdateWorkflowExecution`, ...) or `default`.
     #[serde(default)]
     pub latency: BTreeMap<String, DurDist>,
+    /// Time a statement adds per MiB of history it writes: `AppendHistoryNodes`, or the append
+    /// inside Create/UpdateWorkflowExecution (default 20ms, about 50 MiB/s).
+    #[serde(default)]
+    pub write_per_mib: Option<Dur>,
+    /// Time a `ReadHistoryBranch` statement adds per MiB of history it reads (default 5ms).
+    #[serde(default)]
+    pub read_per_mib: Option<Dur>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -475,7 +482,8 @@ pub struct WorkflowSpec {
     pub replay_per_event: Dur,
     #[serde(default)]
     pub steps: Vec<Step>,
-    /// Typical payload size (inputs/results); affects history size.
+    /// Size of each input and result in the type's history (1 KiB by default): what writes,
+    /// reads, the events cache and the history size limits weigh.
     #[serde(default = "WorkflowSpec::payload")]
     pub payload_bytes: Bytes,
     #[serde(default)]

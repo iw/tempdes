@@ -3,7 +3,8 @@
 //! Reads histories as the Temporal CLI, Web UI and tctl export them, turns each into a sequence
 //! of steps ([`trace`]), and pools executions that took the same steps into the scenario's
 //! `workflows:` entries ([`program`]): step durations, attempts, retry policies and timeouts
-//! as recorded, with waits in the cluster left out. Payloads are never read.
+//! as recorded, with waits in the cluster left out, and each type's payload size from the
+//! history sizes the server recorded (`historySizeBytes`). Payloads are never read.
 
 pub mod parse;
 pub mod program;

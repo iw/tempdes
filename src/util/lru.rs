@@ -1,7 +1,8 @@
 //! Fixed-capacity LRU set keyed by `u64` (intrusive doubly linked list over a slab).
 //!
 //! Used for the history host-level mutable state cache (`history.hostLevelCacheMaxSize`) and
-//! the SDK sticky workflow cache.
+//! the SDK sticky workflow cache, whose entries count one each, and for the shard events cache,
+//! whose entries weigh their size in bytes (`history.eventsCacheMaxSizeBytes`).
 
 use std::collections::HashMap;
 
@@ -10,12 +11,15 @@ const NIL: u32 = u32::MAX;
 #[derive(Clone, Copy)]
 struct Node {
     key: u64,
+    size: u64,
     prev: u32,
     next: u32,
 }
 
 pub struct Lru {
-    cap: usize,
+    /// capacity in entries, or in bytes where entries have sizes
+    cap: u64,
+    used: u64,
     map: HashMap<u64, u32>,
     nodes: Vec<Node>,
     free: Vec<u32>,
@@ -27,10 +31,21 @@ pub struct Lru {
 }
 
 impl Lru {
+    /// A cache of `cap` entries.
     pub fn new(cap: usize) -> Self {
         Lru {
-            cap: cap.max(1),
             map: HashMap::with_capacity(cap.min(1 << 20)),
+            ..Lru::sized(cap as u64)
+        }
+    }
+
+    /// A cache of `cap` bytes, for entries `put` with their sizes; it grows as they arrive
+    /// rather than reserving room up front.
+    pub fn sized(cap: u64) -> Self {
+        Lru {
+            cap: cap.max(1),
+            used: 0,
+            map: HashMap::new(),
             nodes: Vec::new(),
             free: Vec::new(),
             head: NIL,
@@ -50,7 +65,7 @@ impl Lru {
     }
 
     pub fn capacity(&self) -> usize {
-        self.cap
+        self.cap as usize
     }
 
     fn unlink(&mut self, i: u32) {
@@ -95,45 +110,68 @@ impl Lru {
             return (true, None);
         }
         self.misses += 1;
-        let evicted = self.insert_new(key);
+        let evicted = self.insert_new(key, 1);
         (false, evicted)
     }
 
     /// Insert without counting a hit/miss (pre-warming).
     pub fn warm(&mut self, key: u64) {
         if !self.map.contains_key(&key) {
-            self.insert_new(key);
+            self.insert_new(key, 1);
         }
     }
 
-    fn insert_new(&mut self, key: u64) -> Option<u64> {
-        let mut evicted = None;
-        if self.map.len() >= self.cap && self.tail != NIL {
-            let t = self.tail;
-            let old = self.nodes[t as usize].key;
-            self.unlink(t);
-            self.map.remove(&old);
-            self.free.push(t);
-            self.evictions += 1;
-            evicted = Some(old);
+    /// Look `key` up, counting a hit or a miss; a hit makes it the most recent.
+    pub fn get(&mut self, key: u64) -> bool {
+        if let Some(&i) = self.map.get(&key) {
+            self.hits += 1;
+            if self.head != i {
+                self.unlink(i);
+                self.push_front(i);
+            }
+            return true;
         }
+        self.misses += 1;
+        false
+    }
+
+    /// Insert `key` weighing `size`, evicting the least recent entries to make room. An entry
+    /// larger than the whole capacity isn't kept.
+    pub fn put(&mut self, key: u64, size: u64) {
+        self.remove(key);
+        if size <= self.cap {
+            self.insert_new(key, size);
+        }
+    }
+
+    fn insert_new(&mut self, key: u64, size: u64) -> Option<u64> {
+        let mut evicted = None;
+        while self.used + size > self.cap && self.tail != NIL {
+            let t = self.tail;
+            let old = self.nodes[t as usize];
+            self.unlink(t);
+            self.map.remove(&old.key);
+            self.free.push(t);
+            self.used -= old.size;
+            self.evictions += 1;
+            evicted = Some(old.key);
+        }
+        let node = Node {
+            key,
+            size,
+            prev: NIL,
+            next: NIL,
+        };
         let i = if let Some(i) = self.free.pop() {
-            self.nodes[i as usize] = Node {
-                key,
-                prev: NIL,
-                next: NIL,
-            };
+            self.nodes[i as usize] = node;
             i
         } else {
-            self.nodes.push(Node {
-                key,
-                prev: NIL,
-                next: NIL,
-            });
+            self.nodes.push(node);
             (self.nodes.len() - 1) as u32
         };
         self.push_front(i);
         self.map.insert(key, i);
+        self.used += size;
         evicted
     }
 
@@ -141,6 +179,7 @@ impl Lru {
         if let Some(i) = self.map.remove(&key) {
             self.unlink(i);
             self.free.push(i);
+            self.used -= self.nodes[i as usize].size;
             true
         } else {
             false
@@ -153,6 +192,7 @@ impl Lru {
         self.free.clear();
         self.head = NIL;
         self.tail = NIL;
+        self.used = 0;
     }
 
     pub fn reset_stats(&mut self) {
@@ -186,5 +226,21 @@ mod tests {
         assert!(c.remove(1));
         assert_eq!(c.access(4), (false, None));
         assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn sized_entries_evict_until_they_fit() {
+        let mut c = Lru::sized(1000);
+        c.put(1, 400);
+        c.put(2, 400);
+        assert!(c.get(1));
+        // 1 is the most recent: 2 goes to make room
+        c.put(3, 500);
+        assert!(c.contains(1) && c.contains(3) && !c.contains(2));
+        assert!(!c.get(2));
+        // an entry larger than the cache isn't kept
+        c.put(4, 2000);
+        assert!(!c.contains(4) && c.contains(1));
+        assert_eq!((c.hits, c.misses), (1, 1));
     }
 }

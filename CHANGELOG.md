@@ -152,8 +152,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - before, activities and children started together ran one after the other in the
     simulation;
   - before, children of several types were imported as the most common type.
+- **Payload sizes cost time and room.** A workflow type's `payload_bytes` (1 KiB by default) is
+  carried by the events that hold inputs and results: the workflow's input and result,
+  activities' and children's inputs and results, and local activities' markers. Every event
+  weighs 128 bytes besides, as measured in histories that record their size, and a signal's
+  input 256.
+  - Writes take `cluster.persistence.write_per_mib` (20 ms by default) for each MiB of history
+    they append, and `ReadHistoryBranch` takes `read_per_mib` (5 ms) for each MiB it reads.
+    Calibration's pilot runs fit the rest of each operation's latency at the scenario's sizes.
+  - Each shard's events cache holds `history.eventsCacheMaxSizeBytes` (512 KiB) of events: the
+    start event, activities' scheduled events, children's initiated events and the close event.
+    Activity starts, child starts and children reporting to their parents read their event from
+    it; a miss reads the whole batch the event was written in. Large payloads leave room for
+    fewer events, and the report raises an events cache hotspot.
+  - A history over `limit.historySize.error` (50 MiB) is terminated at its next workflow task
+    completion, as `enforceHistorySizeCheck` does; one over `limit.historySize.warn` (10 MiB)
+    is counted. The report adds a `history-size` hotspot, and `terminated`,
+    `histories_over_warn` and `max_history_bytes` for each workflow type.
+  - A `payload_bytes` over `limit.blobSize.error` (2 MiB) for its namespace is refused when the
+    scenario loads; one over `limit.blobSize.warn` (512 KiB) runs with a warning.
+
+  99 dynamic config keys are now simulated.
+- **`workload import` estimates payload sizes.** Servers record on each workflow task the size
+  of the history before it (`historySizeBytes`). Less 128 bytes an event and 256 a signal, over
+  the events that carry payloads, it gives each type's `payload_bytes`, still without reading
+  payloads. The summary gives the range for events of 95–180 bytes, and notes when events that
+  aren't modelled (markers, search attribute upserts, updates) may inflate the estimate.
 
 ### Fixed
+
+- **The events cache was never filled.** Activity starts looked their scheduled event up in the
+  shard's events cache, but nothing put events in, so every start read history from the
+  database. The cache is now filled as Temporal fills it, weighed in bytes, and emptied when its
+  shard changes owner. In the example scenarios, `ReadHistoryBranch` calls fall by 17–48%.
 
 - **Schedule-to-start is measured as the SDK measures it.** Workflow task and activity
   schedule-to-start now run from the task's scheduled time, as the SDK's

@@ -20,7 +20,7 @@ use crate::sim::executor::{Time, now, sleep, sleep_until, spawn};
 use crate::sim::sync::{Permit, Prio, Semaphore, WeightedPermit};
 
 use super::activity;
-use super::history::{self, StartOrigin, record_child_completed, start_workflow};
+use super::history::{self, Cached, StartOrigin, record_child_completed, start_workflow};
 use super::infra::*;
 use super::matching;
 use super::types::*;
@@ -33,6 +33,7 @@ pub struct TaskSpec {
     pub fire_at: Time,
     pub r: u32,
     pub r2: u32,
+    pub bytes: f64,
 }
 
 impl TaskSpec {
@@ -42,6 +43,7 @@ impl TaskSpec {
             fire_at: 0,
             r,
             r2,
+            bytes: 0.0,
         }
     }
     pub fn at(kind: TaskType, fire_at: Time, r: u32, r2: u32) -> Self {
@@ -50,7 +52,12 @@ impl TaskSpec {
             fire_at,
             r,
             r2,
+            bytes: 0.0,
         }
+    }
+    /// The size of the batch of events the task's event was written in.
+    pub fn batch(self, bytes: f64) -> Self {
+        TaskSpec { bytes, ..self }
     }
 }
 
@@ -74,6 +81,7 @@ pub fn commit_tasks(ctx: &Ctx, shard: ShardId, wf: WfId, wgen: u32, specs: &[Tas
                 fire_at: if sp.fire_at == 0 { t } else { sp.fire_at },
                 r: sp.r,
                 r2: sp.r2,
+                bytes: sp.bytes,
             };
             let c = sp.kind.category();
             match c {
@@ -593,7 +601,7 @@ async fn checkpoint_shard(ctx: &Ctx, shard: ShardId, c: Category) {
             owner,
             shard,
             PersistOp::UpdateShard,
-            false,
+            0.0,
             Caller::ShardMgmt,
             deadline,
         )
@@ -750,7 +758,28 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             if let Err(e) = load_ms(ctx, pod, shard, wf, wgen, caller).await {
                 return Outcome::Retry(e);
             }
-            let parent = ctx.wfs.borrow().get(wf, wgen).and_then(|w| w.parent);
+            let (parent, key) = ctx
+                .wfs
+                .borrow()
+                .get(wf, wgen)
+                .map_or((None, 0), |w| (w.parent, w.key));
+            // a child reads its close event, with the result it reports to the parent, through
+            // the events cache (`GetCompletionEvent`)
+            let result = f64::from(task.r);
+            if parent.is_some()
+                && let Err(e) = history::get_event(
+                    ctx,
+                    pod,
+                    shard,
+                    history::event_key(key, Cached::Closed, 0),
+                    EVENT_BYTES + result,
+                    task.bytes,
+                    caller,
+                )
+                .await
+            {
+                return Outcome::Retry(e);
+            }
             drop(lock);
             let out = if let Some((pw, pg)) = parent {
                 let Some(pshard) = ctx.wf_shard(pw, pg) else {
@@ -758,7 +787,9 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                 };
                 let r = history_call(ctx, pshard, |c, hp| {
                     let c = c.clone();
-                    async move { record_child_completed(&c, hp, pw, pg, now() + 3_000_000).await }
+                    async move {
+                        record_child_completed(&c, hp, pw, pg, result, now() + 3_000_000).await
+                    }
                 })
                 .await;
                 match r {
@@ -783,16 +814,33 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             if let Err(e) = load_ms(ctx, pod, shard, wf, wgen, caller).await {
                 return Outcome::Retry(e);
             }
-            let running = ctx
-                .wfs
-                .borrow()
-                .get(wf, wgen)
-                .map(|w| w.status == WfStatus::Running)
-                .unwrap_or(false);
-            drop(lock);
+            let (running, key, payload) =
+                ctx.wfs.borrow().get(wf, wgen).map_or((false, 0, 0.0), |w| {
+                    (
+                        w.status == WfStatus::Running,
+                        w.key,
+                        ctx.p.wf_types[w.wf_type].payload_bytes,
+                    )
+                });
             if !running {
                 return Outcome::Noop;
             }
+            // the initiated event, with the child's input, through the events cache
+            // (`GetChildExecutionInitiatedEvent`)
+            if let Err(e) = history::get_event(
+                ctx,
+                pod,
+                shard,
+                history::event_key(key, Cached::ChildInitiated, task.r2),
+                EVENT_BYTES + payload,
+                task.bytes,
+                caller,
+            )
+            .await
+            {
+                return Outcome::Retry(e);
+            }
+            drop(lock);
             let child_type = task.r as usize;
             let key = history::alloc_key(ctx);
             let ns = ctx.p.wf_types[child_type].ns;
@@ -824,18 +872,19 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                         Ok(l) => l,
                         Err(_) => return Outcome::Done,
                     };
+                    let started = Append::new(1, 0.0);
                     let _ = shard_write(
                         ctx,
                         pod,
                         shard,
                         PersistOp::UpdateWorkflowExecution,
-                        true,
+                        started.bytes(),
                         caller,
                         now() + 3_000_000,
                     )
                     .await;
                     if let Some(w) = ctx.wfs.borrow_mut().get_mut(wf, wgen) {
-                        w.history_events += 1;
+                        w.grow(started);
                     }
                     drop(lock);
                     Outcome::Done
@@ -877,12 +926,14 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                 return Outcome::Noop;
             }
             cpu(ctx, pod, base_cost).await;
+            // WorkflowTaskTimedOut and the next WorkflowTaskScheduled
+            let timed_out = Append::new(2, 0.0);
             if let Err(e) = shard_write(
                 ctx,
                 pod,
                 shard,
                 PersistOp::UpdateWorkflowExecution,
-                true,
+                timed_out.bytes(),
                 caller,
                 deadline,
             )
@@ -913,7 +964,7 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                     sticky: false,
                     at: t,
                 };
-                w.history_events += 2;
+                w.grow(timed_out);
                 tasks.push(TaskSpec::now(TaskType::TransferWorkflowTask, w.wft_seq, 0));
                 w.wf_type
             };
@@ -951,12 +1002,13 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             cpu(ctx, pod, base_cost).await;
             // a failed activity adds ActivityTaskTimedOut (and a workflow task) to history
             let events = !plan.failed_steps.is_empty();
+            let timed_out = Append::new(plan.failed_steps.len() as u32, 0.0);
             if let Err(e) = shard_write(
                 ctx,
                 pod,
                 shard,
                 PersistOp::UpdateWorkflowExecution,
-                events,
+                timed_out.bytes(),
                 caller,
                 deadline,
             )
@@ -982,8 +1034,8 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                             w.completed_in_step += 1;
                         }
                     }
-                    w.history_events += 1;
                 }
+                w.grow(timed_out);
                 if events {
                     history::deliver_event(ctx, w, t, &mut tasks);
                 }
@@ -1021,12 +1073,13 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                 return Outcome::Noop;
             }
             cpu(ctx, pod, base_cost).await;
+            let fired = Append::new(1, 0.0);
             if let Err(e) = shard_write(
                 ctx,
                 pod,
                 shard,
                 PersistOp::UpdateWorkflowExecution,
-                true,
+                fired.bytes(),
                 caller,
                 deadline,
             )
@@ -1044,7 +1097,7 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                 };
                 w.timer_pending = None;
                 w.timer_fired = true;
-                w.history_events += 1;
+                w.grow(fired);
                 if let Some(s) = w.schedule.as_mut() {
                     // scheduler workflow timer: an action becomes due at each nominal fire time
                     // (rate-limit retry timers don't add actions)

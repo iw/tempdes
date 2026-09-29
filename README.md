@@ -113,7 +113,7 @@ tempdes profile save prod my-cluster.yaml -r history=4 -o observed.yaml
 tempdes run --profile prod --load 1.5
 
 # dynamic config tooling
-tempdes dc modeled                       # the 95 simulated keys, with 1.31.0 defaults
+tempdes dc modeled                       # the 99 simulated keys, with 1.31.0 defaults
 tempdes dc explain history.shardIOConcurrency
 tempdes dc validate examples/dynamicconfig/with-mistakes.yaml
 
@@ -217,13 +217,14 @@ useful fix for a hotspot, the report marks it *(not simulated)*.
 
 ### Simulated settings (highlights)
 
-Run `tempdes dc modeled` for the full list of 95 keys with their defaults and descriptions.
+Run `tempdes dc modeled` for the full list of 99 keys with their defaults and descriptions.
 
 | Area | Keys |
 |---|---|
 | Frontend limits | `frontend.rps`, `frontend.globalRPS`, `frontend.namespaceRPS`, `frontend.globalNamespaceRPS`, `frontend.namespaceBurstRatio`, `frontend.namespaceCount` / `globalNamespaceCount`, `frontend.namespaceRPS.visibility` (+ global/burst), `frontend.pollWaitForNamespaceRateLimitToken`, `frontend.keepAliveMaxConnectionAge`, `system.operatorRPSRatio` |
 | Persistence | `{frontend,history,matching,worker}.persistenceMaxQPS`, `{history,matching}.persistenceGlobalMaxQPS`, the per-namespace limits `{history,matching}.persistence{,Global}NamespaceMaxQPS` and `history.persistencePerShardNamespaceMaxQPS`, `system.persistenceQPSBurstRatio` |
 | History | `history.rps`, `history.shardIOConcurrency`, `history.hostLevelCacheMaxSize`, `history.cacheNonUserContextLockTimeout`, `history.eventsCacheMaxSizeBytes`, `history.acquireShardConcurrency`, `history.defaultWorkflowTaskTimeout`, `history.defaultActivityRetryPolicy`, `history.longPollExpirationInterval` |
+| Size limits | `limit.historySize.error`, `limit.historySize.warn`, `limit.blobSize.error`, `limit.blobSize.warn` |
 | History task queues | `*ProcessorSchedulerWorkerCount`, `*TaskBatchSize`, `*ProcessorMaxPollRPS`, `*ProcessorMaxPollHostRPS`, `*ProcessorUpdateAckInterval`, `history.queuePendingTasksMaxCount`, `history.timerProcessorMaxTimeShift`, `history.shardUpdateMin{Interval,TasksCompleted}`, the task scheduler's rate limiter: `history.taskSchedulerEnableRateLimiter{,ShadowMode}`, `history.taskSchedulerRateLimiterStartupDelay`, `history.taskScheduler{,Global}{,Namespace}MaxQPS`, the scheduler's weights per priority `history.{transfer,timer,visibility}ProcessorSchedulerActiveRoundRobinWeights`, and the execution queue scheduler `history.taskSchedulerEnableExecutionQueueScheduler`, `history.taskSchedulerExecutionQueueScheduler{MaxQueues,QueueTTL,QueueConcurrency}` |
 | Matching | `matching.rps`, `matching.numTaskqueue{Read,Write}Partitions`, `matching.forwarderMax{OutstandingPolls,OutstandingTasks,RatePerSecond,ChildrenPerNode}`, `matching.outstandingTaskAppendsThreshold`, `matching.maxTaskBatchSize`, `matching.getTasksBatchSize`, `matching.getTasksReloadAt`, `matching.maxWaitForPollerBeforeFwd`, `matching.backlogNegligibleAge`, `matching.longPollExpirationInterval`, `admin.matching*DispatchRate` |
 | Worker service | `worker.perNamespaceWorkerCount`, `worker.schedulerNamespaceStartWorkflowRPS`, `worker.schedulerLocalActivitySleepLimit`, `worker.ESProcessor{BulkActions,FlushInterval,NumOfWorkers}` |
@@ -427,6 +428,11 @@ inferred. Both export spellings are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` a
 * **Start rate.** `--rate` sets it; otherwise it is estimated from the start times, which is
   right only if the export holds every execution in that time. Calibrating with observed
   `service_requests` (`-o`) also sets it.
+* **Payload sizes are estimated.** Servers record on each workflow task the size of the history
+  before it (`historySizeBytes`). Less 128 bytes an event and 256 a signal, over the events
+  that carry payloads, that gives each type's `payload_bytes`. The summary gives the range for
+  events of 95–180 bytes, and notes when events that aren't modelled (markers, search attribute
+  upserts, updates) may inflate it. Histories that don't record their size leave the default.
 * **Privacy.** Payloads are never read, but the output names your workflow and activity types
   and task queues: keep it with your private profiles, not in a repository.
 
@@ -505,6 +511,7 @@ single hot workflow writing to it.
 | `rate-limit` | limiters rejecting requests, e.g. `frontend.namespaceRPS`, `history.rps`, `matching.rps`, persistence QPS, `namespaceCount` |
 | `headroom` | a limiter running at ≥70% of its limit on some pod, before rejections start |
 | `cache`, `sticky-cache` | mutable-state / events cache misses; sticky-queue misses and non-sticky workflow tasks |
+| `history-size` | workflows terminated as their history grew over `limit.historySize.error`, or histories over the warn limit |
 | `workers`, `workflow-tasks` | worker slots or pollers limiting throughput; schedule-to-start latency; workflow task timeouts |
 | `schedules` | schedule actions delayed or rate-limited on the per-namespace worker |
 | `api-latency`, `api-errors` | client-observed p99 over `report.api_p99_slo`; error rates |
@@ -537,6 +544,7 @@ cluster:
     store: postgresql          # postgresql | mysql | cassandra | sqlite
     max_conns: { frontend: 20, history: 50, matching: 30, worker: 10 }
     capacity: 160              # concurrent DB operations before queueing (calibratable)
+    # write_per_mib: 20ms, read_per_mib: 5ms   # time per MiB of history written / read
     latency:                   # per Temporal persistence operation, or `default`
       UpdateWorkflowExecution: { p50: 3ms, p99: 14ms }
   visibility: { store: elasticsearch }
@@ -653,6 +661,21 @@ member keeps its own settings: duration, attempts, retry policy, timeouts, task 
 `on_failure`. An activity member that fails for good fails the workflow, unless that member says
 `on_failure: continue`. An activity member's `count` activities all start together.
 
+**Payloads.** `payload_bytes` (1 KiB by default) is the size of each input and result a
+workflow type's history holds: the workflow's input and result, its activities' and children's
+inputs and results, and its local activities' markers. Every event also weighs 128 bytes, and a
+signal's input 256. Sizes cost time and room:
+
+* a write takes `write_per_mib` (20 ms by default) for each MiB of history it appends, and a
+  `ReadHistoryBranch` takes `read_per_mib` (5 ms) for each MiB it reads;
+* each shard's events cache holds `history.eventsCacheMaxSizeBytes` (512 KiB) of events. An
+  activity or child start, or a child reporting to its parent, that doesn't find its event
+  there reads the whole batch the event was written in;
+* a history over `limit.historySize.error` (50 MiB) is terminated at its next workflow task,
+  and one over `limit.historySize.warn` (10 MiB) is counted;
+* a `payload_bytes` over `limit.blobSize.error` (2 MiB) is refused when the scenario loads, and
+  one over `limit.blobSize.warn` (512 KiB) runs with a warning.
+
 ## Example scenarios
 
 | Scenario | What it shows |
@@ -688,7 +711,9 @@ source. In summary:
   * The visibility limiter.
 * **History.**
   * Per-workflow lock, with API deadline versus the non-user lock timeout.
-  * Host-level mutable-state LRU cache and events cache.
+  * Host-level mutable-state LRU cache, and the shard events cache sized in bytes.
+  * History size: payloads and events add bytes that writes and reads take time for, and
+    histories over `limit.historySize.error` are terminated.
   * Shard IO semaphore.
   * Persistence priority rate limiters per pod, per namespace and per shard and namespace,
     which reject immediately.
@@ -747,6 +772,11 @@ Don't treat them as guarantees.
   * Pod restarts other than scaling.
 * **SDK behaviour.** Workers follow the Go SDK's poller and sticky-cache behaviour. Other SDKs
   differ in detail.
+* **History size.** Sizes cost database time only, not CPU or network. The size limit is checked
+  when a workflow task completes, where Temporal checks it on every update, and the caller gets
+  `NotFound` where Temporal returns `InvalidArgument`. The event count limit
+  (`limit.historyCount.error`), the mutable state size limit and the gRPC message size limit are
+  not enforced, and neither is continue-as-new.
 * **Settings without an effect.** Dynamic config keys outside `tempdes dc modeled` are
   validated and shown, but they don't change the simulation.
 

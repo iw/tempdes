@@ -173,8 +173,9 @@ fn admit_persistence(
 }
 
 /// One database statement from `pod`: the persistence client's CPU, a connection from the pod's
-/// pool, then the database station.
-async fn db_statement(ctx: &Ctx, pod: PodId, op: PersistOp) {
+/// pool, then the database station, for the operation's service time plus the time its `bytes`
+/// of history take to write, or to read for `ReadHistoryBranch`.
+async fn db_statement(ctx: &Ctx, pod: PodId, op: PersistOp, bytes: f64) {
     cpu(ctx, pod, ctx.p.costs.persistence_client).await;
     let start = now();
     let (pool, svc) = {
@@ -183,9 +184,14 @@ async fn db_statement(ctx: &Ctx, pod: PodId, op: PersistOp) {
     };
     let conn = pool.acquire().await;
     let conn_wait = now() - start;
+    let per_byte = if op == PersistOp::ReadHistoryBranch {
+        ctx.p.db_read_us_per_byte
+    } else {
+        ctx.p.db_write_us_per_byte
+    };
     let service = {
         let mut rng = ctx.rng.borrow_mut();
-        ctx.p.db_latency[op.idx()].sample(&mut rng)
+        ctx.p.db_latency[op.idx()].sample(&mut rng) + bytes * per_byte
     };
     let end = ctx.db.borrow_mut().servers.schedule(service);
     sleep_until(end).await;
@@ -202,22 +208,43 @@ pub async fn persist(
     caller: Caller,
     shard: Option<ShardId>,
 ) -> Res<()> {
-    persist_call(ctx, pod, op, false, caller, shard).await
+    persist_call(ctx, pod, op, 0.0, caller, shard).await
 }
 
-/// A persistence call, optionally carrying new history events. Create/UpdateWorkflowExecution
-/// persist their events inside the same call: the SQL and Cassandra stores append the history
-/// nodes, then write the mutable state (`UpdateWorkflowExecution` in
-/// `common/persistence/sql/execution.go` and `cassandra/execution_store.go`). The append is not
-/// charged to the rate limiters, and the call's latency, including both statements, is recorded
-/// under the call's own operation, as Temporal's `persistence_latency` does. When calibration has
-/// fitted the operation's latency to production, whose measurements already include the append,
-/// the call is one statement drawn from that distribution.
+/// `ReadHistoryBranch` of `bytes` of history from `pod`.
+pub async fn read_history(
+    ctx: &Ctx,
+    pod: PodId,
+    bytes: f64,
+    caller: Caller,
+    shard: Option<ShardId>,
+) -> Res<()> {
+    if PersistOp::ReadHistoryBranch.rate_limited() {
+        admit_persistence(ctx, pod, PersistOp::ReadHistoryBranch, caller, shard)?;
+    }
+    let start = now();
+    db_statement(ctx, pod, PersistOp::ReadHistoryBranch, bytes).await;
+    let lat = now() - start;
+    let mut m = ctx.m.borrow_mut();
+    m.persist[PersistOp::ReadHistoryBranch.idx()].record(lat, None);
+    m.persist_pod(pod);
+    Ok(())
+}
+
+/// A persistence call, optionally carrying `append` bytes of new history events.
+/// Create/UpdateWorkflowExecution persist their events inside the same call: the SQL and
+/// Cassandra stores append the history nodes, then write the mutable state
+/// (`UpdateWorkflowExecution` in `common/persistence/sql/execution.go` and
+/// `cassandra/execution_store.go`). The append is not charged to the rate limiters, and the
+/// call's latency, including both statements, is recorded under the call's own operation, as
+/// Temporal's `persistence_latency` does. When calibration has fitted the operation's latency to
+/// production, whose measurements already include the append, the call is one statement drawn
+/// from that distribution, carrying the append's bytes.
 async fn persist_call(
     ctx: &Ctx,
     pod: PodId,
     op: PersistOp,
-    append_history: bool,
+    append: f64,
     caller: Caller,
     shard: Option<ShardId>,
 ) -> Res<()> {
@@ -225,10 +252,15 @@ async fn persist_call(
         admit_persistence(ctx, pod, op, caller, shard)?;
     }
     let start = now();
-    if append_history && !ctx.p.db_includes_append[op.idx()] {
-        db_statement(ctx, pod, PersistOp::AppendHistoryNodes).await;
+    let mut bytes = 0.0;
+    if append > 0.0 {
+        if ctx.p.db_includes_append[op.idx()] {
+            bytes = append;
+        } else {
+            db_statement(ctx, pod, PersistOp::AppendHistoryNodes, append).await;
+        }
     }
-    db_statement(ctx, pod, op).await;
+    db_statement(ctx, pod, op, bytes).await;
     let lat = now() - start;
     let mut m = ctx.m.borrow_mut();
     m.persist[op.idx()].record(lat, None);
@@ -399,7 +431,7 @@ pub async fn shard_write(
     pod: PodId,
     shard: ShardId,
     op: PersistOp,
-    append_history: bool,
+    append: f64,
     caller: Caller,
     deadline: Time,
 ) -> Res<()> {
@@ -420,7 +452,7 @@ pub async fn shard_write(
     if ctx.shard_owner(shard) != pod {
         return Err(Err::ShardOwnershipLost);
     }
-    let r = persist_call(ctx, pod, op, append_history, caller, Some(shard)).await;
+    let r = persist_call(ctx, pod, op, append, caller, Some(shard)).await;
     drop(permit);
     {
         let mut shards = ctx.shards.borrow_mut();

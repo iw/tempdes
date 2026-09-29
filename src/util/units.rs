@@ -105,6 +105,19 @@ pub fn parse_bytes(s: &str) -> Result<f64, String> {
     Ok(v * mult)
 }
 
+/// Format a size in bytes for humans, in the units `parse_bytes` reads: `512B`, `4.0KiB`.
+pub fn fmt_bytes(b: f64) -> String {
+    if b < 1024.0 {
+        format!("{b:.0}B")
+    } else if b < 1024.0 * 1024.0 {
+        format!("{:.1}KiB", b / 1024.0)
+    } else if b < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1}MiB", b / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1}GiB", b / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 /// Format microseconds for humans.
 pub fn fmt_us(us: f64) -> String {
     if !us.is_finite() {
@@ -291,6 +304,8 @@ mod tests {
         assert_eq!(parse_rate_per_sec("600/min").unwrap(), 10.0);
         assert_eq!(parse_rate_per_sec("7").unwrap(), 7.0);
         assert_eq!(parse_bytes("4KiB").unwrap(), 4096.0);
+        assert_eq!(fmt_bytes(512.0), "512B");
+        assert_eq!(fmt_bytes(2.5 * 1024.0 * 1024.0), "2.5MiB");
         assert_eq!(parse_bytes("2MB").unwrap(), 2e6);
     }
 }

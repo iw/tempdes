@@ -316,7 +316,8 @@ pub fn build(p: Params) -> (Ctx, Executor) {
         if let Some(h) = pods[owner].hist.as_mut() {
             h.owned_shards += 1;
         }
-        let ev_cap = (p.k.events_cache_max_bytes / 1024.0).max(8.0) as usize;
+        // the shard events cache, sized in bytes (`history.eventsCacheMaxSizeBytes`)
+        let ev_cap = p.k.events_cache_max_bytes.max(1024.0) as u64;
         shards.push(Shard {
             id,
             owner,
@@ -328,7 +329,7 @@ pub fn build(p: Params) -> (Ctx, Executor) {
                 ShardQueue::new(p.k.max_poll_rps[1]),
                 ShardQueue::new(p.k.max_poll_rps[2]),
             ],
-            events_cache: Lru::new(ev_cap),
+            events_cache: Lru::sized(ev_cap),
             tasks_completed_since_update: 0,
             last_shard_update: rng.below(300_000_000),
             writes: 0,
@@ -908,6 +909,8 @@ async fn rebalance_history(ctx: &Ctx) {
                 s.owner = owner;
                 s.epoch += 1;
                 s.available_at = Time::MAX / 4;
+                // the new owner's shard context starts with an empty events cache
+                s.events_cache.clear();
                 moved.entry(owner).or_default().push(s.id);
             }
         }

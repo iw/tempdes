@@ -186,9 +186,13 @@ pub struct HistTask {
     pub wf_gen: u32,
     pub created: Time,
     pub fire_at: Time,
-    /// type-specific reference (activity seq, wft seq, timer seq, child index)
+    /// type-specific reference (activity seq, wft seq, timer seq, child index; the size of the
+    /// result a close reports to the parent)
     pub r: u32,
     pub r2: u32,
+    /// the size of the batch of events the task's event was written in, read back when the
+    /// event isn't in the events cache (child starts and closes)
+    pub bytes: f64,
 }
 
 pub struct ShardQueue {
@@ -314,6 +318,9 @@ pub struct ActInfo {
     pub timers: u8,
     /// fire time of the current heartbeat timer task
     pub hb_timer_at: Time,
+    /// the size of the batch of events it was scheduled in: what a `ReadHistoryBranch` for its
+    /// scheduled event reads when the events cache misses
+    pub batch_bytes: f64,
     /// how its attempts go, drawn when it was scheduled (none: each attempt fails at the
     /// step's failure rate)
     pub plan: super::params::AttemptPlan,
@@ -323,6 +330,32 @@ pub struct ActInfo {
 pub enum WfStatus {
     Running,
     Closed,
+}
+
+/// Serialized size of a history event without its payload. Exported histories that record
+/// `historySizeBytes` weigh 95–180 bytes per event besides their payload data (median 141, 123
+/// pooled over 1,308 events of the Go SDK's replay tests).
+pub const EVENT_BYTES: f64 = 128.0;
+
+/// The input a signal carries.
+pub const SIGNAL_BYTES: f64 = 256.0;
+
+/// History events a write appends: how many, and the payload bytes they carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Append {
+    pub events: u32,
+    pub payload: f64,
+}
+
+impl Append {
+    pub fn new(events: u32, payload: f64) -> Append {
+        Append { events, payload }
+    }
+
+    /// The serialized size of the events.
+    pub fn bytes(self) -> f64 {
+        f64::from(self.events) * EVENT_BYTES + self.payload
+    }
 }
 
 pub struct Wf {
@@ -336,6 +369,7 @@ pub struct Wf {
     pub start_time: Time,
     pub parent: Option<(WfId, u32)>,
     pub history_events: u32,
+    /// the history's size as Temporal counts it (`ExecutionStats.HistorySize`)
     pub history_bytes: f64,
     pub wft: WftState,
     pub wft_seq: u32,
@@ -361,6 +395,8 @@ pub struct Wf {
     pub next_act_seq: u32,
     pub children_pending: u32,
     pub children_done: u32,
+    /// StartChildWorkflowExecutionInitiated events so far: numbers them in the events cache
+    pub children_initiated: u32,
     /// hot entity workflows loop on signals forever
     pub entity: bool,
     pub close_waiters: Vec<Sender<()>>,
@@ -369,6 +405,23 @@ pub struct Wf {
     pub running_idx: usize,
     /// schedule bookkeeping (scheduler workflows)
     pub schedule: Option<ScheduleState>,
+}
+
+impl Wf {
+    /// Add appended events to the history's count and size.
+    pub fn grow(&mut self, a: Append) {
+        self.history_events += a.events;
+        self.history_bytes += a.bytes();
+    }
+
+    /// The mean serialized size of its history's events.
+    pub fn event_bytes(&self) -> f64 {
+        if self.history_events == 0 {
+            EVENT_BYTES
+        } else {
+            self.history_bytes / f64::from(self.history_events)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
