@@ -72,6 +72,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Otherwise refused tasks wait in the rescheduler, and a long wait is reported as a rate-limit
   hotspot.
 
+- **Markdown reports.** `run --md FILE` writes the report as Markdown, with GitHub-flavoured
+  tables, for pull requests, issues and docs; `--verbose` applies to it as to the text report.
+  `sweep --md FILE` writes one table per metric and each cell's top hotspot.
+
 ### Fixed
 
 - **Schedule-to-start is measured as the SDK measures it.** Workflow task and activity
