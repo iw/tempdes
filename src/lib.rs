@@ -4,6 +4,7 @@ pub mod calibrate;
 pub mod cli;
 pub mod config;
 pub mod dccmd;
+pub mod histories;
 pub mod metrics;
 pub mod model;
 pub mod profile;

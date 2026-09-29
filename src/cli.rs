@@ -46,6 +46,44 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProfileCmd,
     },
+    /// Build scenario workloads from exported workflow histories.
+    Workload {
+        #[command(subcommand)]
+        cmd: WorkloadCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkloadCmd {
+    /// Infer `workflows:` entries from exported histories (`temporal workflow show --output
+    /// json`, or the Web UI's download): steps, durations, attempts, retry policies and
+    /// timeouts, with waits in the cluster left out. Payloads are not read.
+    Import(ImportArgs),
+}
+
+#[derive(Args)]
+struct ImportArgs {
+    /// History files, or directories of `*.json` history files.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+    /// Namespace of the imported workflow types.
+    #[arg(long, default_value = "default")]
+    namespace: String,
+    /// Start rate of each imported workflow type (`100/s`), split across its paths. By default
+    /// it is estimated from the histories' start times.
+    #[arg(long, value_parser = parse_rate)]
+    rate: Option<f64>,
+    /// Paths (step sequences) that at least this share of a type's executions took become
+    /// workflow types of their own; rarer ones are folded into the most common.
+    #[arg(long, default_value_t = 0.05)]
+    min_path_share: f64,
+    /// Write the `workflows:` YAML here instead of to standard output.
+    #[arg(long, short = 'o')]
+    output: Option<PathBuf>,
+}
+
+fn parse_rate(s: &str) -> Result<f64, String> {
+    crate::util::units::parse_rate_per_sec(s)
 }
 
 #[derive(Args, Clone)]
@@ -306,7 +344,32 @@ pub fn main() -> anyhow::Result<ExitCode> {
         }),
         #[cfg(feature = "ui")]
         Cmd::Ui(a) => cmd_ui(a),
+        Cmd::Workload {
+            cmd: WorkloadCmd::Import(a),
+        } => cmd_import(a),
     }
+}
+
+fn cmd_import(a: ImportArgs) -> anyhow::Result<ExitCode> {
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&a.min_path_share),
+        "--min-path-share must be between 0 and 1"
+    );
+    let opts = crate::histories::Options {
+        namespace: a.namespace,
+        rate: a.rate,
+        min_path_share: a.min_path_share,
+    };
+    let program = crate::histories::import(&a.paths, &opts)?;
+    eprint!("{}", program.summary);
+    match a.output {
+        Some(f) => {
+            std::fs::write(&f, &program.yaml)?;
+            eprintln!("wrote {}", f.display());
+        }
+        None => print!("{}", program.yaml),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(feature = "ui")]

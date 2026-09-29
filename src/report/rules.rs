@@ -243,6 +243,7 @@ fn sample_run_time(
                 parallel,
                 duration,
                 failure_rate,
+                attempts,
                 retry,
                 timeouts,
                 on_failure,
@@ -256,7 +257,14 @@ fn sample_run_time(
                     if !parallel && i > 0 {
                         sum += STEP_OVERHEAD_S;
                     }
-                    let (d, ok) = sample_activity(duration, *failure_rate, retry, timeouts, rng);
+                    let (d, ok) = sample_activity(
+                        duration,
+                        *failure_rate,
+                        attempts.as_ref(),
+                        retry,
+                        timeouts,
+                        rng,
+                    );
                     if !ok && *on_failure == OnFailure::Fail {
                         failed_at = failed_at.min(if parallel { d } else { sum + d });
                         if !parallel {
@@ -290,13 +298,15 @@ fn sample_run_time(
 }
 
 /// One activity's time from its first schedule to its outcome, in seconds, and whether it
-/// succeeded. An attempt fails at `failure_rate`, or when it runs past start-to-close or
-/// schedule-to-close (the worker stops at its deadline); a failed attempt retries after the
-/// policy's next interval (`nextBackoffInterval`) until the attempts are used up or the retry
-/// would start after the schedule-to-close deadline.
+/// succeeded. An attempt fails at `failure_rate`, or before the planned count of `attempts`,
+/// or when it runs past start-to-close or schedule-to-close (the worker stops at its
+/// deadline); a failed attempt retries after the policy's next interval
+/// (`nextBackoffInterval`) until the attempts are used up or the retry would start after the
+/// schedule-to-close deadline.
 fn sample_activity(
     duration: &crate::sim::dist::Dist,
     failure_rate: f64,
+    attempts: Option<&crate::model::params::AttemptsP>,
     retry: &crate::model::params::RetryPolicyP,
     timeouts: &crate::model::params::ActTimeouts,
     rng: &mut crate::sim::rng::Rng,
@@ -304,6 +314,7 @@ fn sample_activity(
     // retries beyond this count run past any measurement window
     const MAX_ATTEMPTS: u32 = 1_000;
     let expiration = (timeouts.schedule_to_close > 0).then_some(timeouts.schedule_to_close);
+    let planned = attempts.map(|a| a.sample(rng.f64()));
     let mut now: u64 = 0;
     let mut attempt = 1;
     loop {
@@ -315,7 +326,10 @@ fn sample_activity(
             deadline = deadline.min(e.max(now));
         }
         let end = now.saturating_add(duration.sample_us(rng));
-        let failed = rng.f64() < failure_rate;
+        let failed = match planned {
+            Some(n) => attempt < n,
+            None => rng.f64() < failure_rate,
+        };
         if end < deadline && !failed {
             return (end as f64 / 1e6, true);
         }
@@ -2141,14 +2155,33 @@ mod tests {
         // a 10s attempt times out at 2s: attempts at 0-2s, 3-5s and 7-9s, then the policy stops
         let long = Dist::Const(10_000_000.0);
         assert_eq!(
-            sample_activity(&long, 0.0, &retry, &timeouts, &mut rng),
+            sample_activity(&long, 0.0, None, &retry, &timeouts, &mut rng),
             (9.0, false)
         );
         // a fast attempt that never fails succeeds at once
         let fast = Dist::Const(500_000.0);
         assert_eq!(
-            sample_activity(&fast, 0.0, &retry, &timeouts, &mut rng),
+            sample_activity(&fast, 0.0, None, &retry, &timeouts, &mut rng),
             (0.5, true)
+        );
+        // three planned attempts of 0.5s: fail at 0.5s, retry at 1.5s, fail at 2s, retry at 4s,
+        // succeed at 4.5s
+        let three =
+            crate::model::params::AttemptsP::new(&crate::config::scenario::AttemptsSpec::Count(3));
+        let unlimited_retry = RetryPolicyP {
+            max_attempts: 0,
+            ..retry
+        };
+        assert_eq!(
+            sample_activity(
+                &fast,
+                0.0,
+                Some(&three),
+                &unlimited_retry,
+                &timeouts,
+                &mut rng
+            ),
+            (4.5, true)
         );
         // schedule-to-close ends the retries: attempts at 0-2s and 3-5s, a third would start
         // after the 6s deadline
@@ -2162,7 +2195,7 @@ mod tests {
             ..retry
         };
         assert_eq!(
-            sample_activity(&long, 0.0, &unlimited, &bounded, &mut rng),
+            sample_activity(&long, 0.0, None, &unlimited, &bounded, &mut rng),
             (5.0, false)
         );
     }

@@ -1043,6 +1043,44 @@ fn retry_tails_are_not_mistaken_for_falling_behind() {
     );
 }
 
+#[test]
+fn attempts_plan_the_retries_of_each_activity() {
+    // a status poll that always takes three attempts: two fail, the third succeeds
+    let with = |attempts: &str| {
+        Scenario::parse_str(&RETRY_TAIL.replace(
+            "failure_rate: 0.8, duration: 100ms",
+            &format!("{attempts}, duration: 100ms"),
+        ))
+    };
+    let ratio = |r: &RunResult| {
+        let per_s = |api: &str| {
+            r.apis
+                .iter()
+                .find(|a| a.api == api)
+                .map_or(0.0, |a| a.per_s)
+        };
+        per_s("RespondActivityTaskFailed") / per_s("RespondActivityTaskCompleted")
+    };
+    let r = simulate_scenario(
+        &with("attempts: 3").expect("scenario parses"),
+        Overrides::default(),
+    );
+    assert!((ratio(&r) - 2.0).abs() < 0.1, "{}", ratio(&r));
+    // no retry tail: a run takes about 3.3s, so the workflows close as fast as they start
+    let w = &r.workflows[0];
+    assert!(w.completed_per_s > 0.95 * w.started_per_s, "{w:#?}");
+    assert!(!r.hotspots.iter().any(|h| h.category == "throughput"));
+    // half the activities succeed at once, half need three attempts: one failure on average
+    let r = simulate_scenario(
+        &with("attempts: { 1: 0.5, 3: 0.5 }").expect("shares parse"),
+        Overrides::default(),
+    );
+    assert!((ratio(&r) - 1.0).abs() < 0.15, "{}", ratio(&r));
+    // attempts replaces failure_rate
+    assert!(with("failure_rate: 0.5, attempts: 3").is_err());
+    assert!(with("attempts: 0").is_err());
+}
+
 /// Two tenants on one cluster; `LIMIT` is replaced by dynamic config.
 const TENANTS: &str = r#"
 name: two-tenants

@@ -111,6 +111,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   95 dynamic config keys are now simulated, 13 of them new.
 
+- **Workloads from workflow histories.** `tempdes workload import` reads exported histories
+  (`temporal workflow show --output json`, or the Web UI's download) and writes the
+  `workflows:` entries of a scenario:
+  - each step's durations, from its own time with waits in the cluster left out;
+  - attempt counts, retry policies and timeouts, as recorded;
+  - parallel groups, local activities, timers, children and waits for signals;
+  - workflow task processing times.
+
+  Executions that took different paths become workflow types of their own, with their share of
+  the start rate. Payloads are never read. The summary reports the waits in the cluster that
+  were left out and the event kinds that aren't modelled.
+- **Planned activity attempts.** `attempts: 5` or `attempts: { 1: 0.8, 5: 0.2 }` on an activity
+  step sets how many attempts each activity makes, instead of failing every attempt at
+  `failure_rate`. A per-attempt failure rate gives a geometric number of attempts with a long
+  tail; a status poll that always takes about five attempts doesn't have one.
+
 ### Fixed
 
 - **Schedule-to-start is measured as the SDK measures it.** Workflow task and activity

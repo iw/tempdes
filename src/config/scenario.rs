@@ -532,6 +532,11 @@ pub struct ActivityStep {
     /// Probability an attempt fails (retried by the server with backoff).
     #[serde(default)]
     pub failure_rate: f64,
+    /// Attempts each activity makes, the first included, instead of `failure_rate`: a count
+    /// (`attempts: 5`) or shares by count (`attempts: { 1: 0.9, 4: 0.1 }`). The attempts before
+    /// the drawn count fail and the last one succeeds, unless the retry policy gives up first.
+    #[serde(default)]
+    pub attempts: Option<AttemptsSpec>,
     /// Retry policy: initial interval. Unset fields of the policy come from the namespace's
     /// `history.defaultActivityRetryPolicy` (1s initial, coefficient 2, maximum interval 100 ×
     /// initial, unlimited attempts).
@@ -568,6 +573,14 @@ pub struct ActivityStep {
     /// Dispatch to a different task queue than the workflow's.
     #[serde(default)]
     pub task_queue: Option<String>,
+}
+
+/// How many attempts an activity makes: a fixed count or shares by count.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum AttemptsSpec {
+    Count(u32),
+    Shares(BTreeMap<u32, f64>),
 }
 
 /// A workflow's reaction to an activity that failed for good.
@@ -893,6 +906,25 @@ impl Scenario {
                         anyhow::ensure!(
                             (0.0..1.0).contains(&a.failure_rate),
                             "workflow {}: failure_rate must be in [0,1)",
+                            w.type_name
+                        );
+                        match &a.attempts {
+                            Some(AttemptsSpec::Count(n)) => anyhow::ensure!(
+                                *n >= 1,
+                                "workflow {}: attempts must be at least 1",
+                                w.type_name
+                            ),
+                            Some(AttemptsSpec::Shares(m)) => anyhow::ensure!(
+                                !m.is_empty()
+                                    && m.iter().all(|(n, s)| *n >= 1 && s.is_finite() && *s > 0.0),
+                                "workflow {}: attempts shares need counts of at least 1 with positive shares",
+                                w.type_name
+                            ),
+                            None => {}
+                        }
+                        anyhow::ensure!(
+                            a.attempts.is_none() || a.failure_rate == 0.0,
+                            "workflow {}: set either attempts or failure_rate, not both",
                             w.type_name
                         );
                         anyhow::ensure!(
