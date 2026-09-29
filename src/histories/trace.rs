@@ -2,7 +2,8 @@
 //!
 //! Commands issued by the same workflow task form one batch: activities scheduled together run
 //! in parallel, local activities (`LocalActivity` markers) ran inside that workflow task,
-//! children started together run in parallel, and a timer on its own is a sleep. A timer next
+//! children started together run in parallel, as do activities and children started together,
+//! and a timer on its own is a sleep. A timer next
 //! to activities or children is a timeout guard and is left out. A batch that leaves nothing
 //! running, followed by a signal that wakes the workflow, is a wait for signals; a timer in that
 //! batch, cancelled by the signal, is the wait's timeout.
@@ -205,6 +206,11 @@ pub enum Step {
     },
     /// child workflows started by one workflow task, by type
     Children(Vec<String>),
+    /// activities and child workflows started by one workflow task
+    Parallel {
+        activities: Vec<Activity>,
+        children: Vec<String>,
+    },
     /// the workflow waited for `count` signals, with an optional timeout
     SignalWait {
         count: u32,
@@ -213,9 +219,33 @@ pub enum Step {
 }
 
 impl Step {
+    /// The activities it started.
+    pub fn activities(&self) -> &[Activity] {
+        match self {
+            Step::Activities(a) | Step::Parallel { activities: a, .. } => a,
+            _ => &[],
+        }
+    }
+
+    /// The types of the child workflows it started.
+    pub fn children(&self) -> &[String] {
+        match self {
+            Step::Children(c) | Step::Parallel { children: c, .. } => c,
+            _ => &[],
+        }
+    }
+
     /// The step's shape, to tell apart executions that took different paths.
     pub fn signature(&self) -> String {
         match self {
+            Step::Parallel {
+                activities,
+                children,
+            } => format!(
+                "{} with {}",
+                Step::Activities(activities.clone()).signature(),
+                Step::Children(children.clone()).signature()
+            ),
             Step::Activities(a) => {
                 let mut types: Vec<&str> = a.iter().map(|x| x.activity_type.as_str()).collect();
                 types.sort_unstable();
@@ -520,16 +550,19 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
         } else {
             t.wft_processing_us.push(b.span_us);
         }
-        if !b.activities.is_empty() {
-            t.steps.push(Step::Activities(
-                b.activities
-                    .iter()
-                    .filter_map(|id| activities.get(id).cloned())
-                    .collect(),
-            ));
-        }
-        if !b.children.is_empty() {
-            t.steps.push(Step::Children(b.children.clone()));
+        let started: Vec<Activity> = b
+            .activities
+            .iter()
+            .filter_map(|id| activities.get(id).cloned())
+            .collect();
+        match (started.is_empty(), b.children.is_empty()) {
+            (false, false) => t.steps.push(Step::Parallel {
+                activities: started,
+                children: b.children.clone(),
+            }),
+            (false, true) => t.steps.push(Step::Activities(started)),
+            (true, false) => t.steps.push(Step::Children(b.children.clone())),
+            (true, true) => {}
         }
         if !b.activities.is_empty() || !b.children.is_empty() {
             guards += b.timers.len();

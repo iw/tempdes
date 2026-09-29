@@ -973,9 +973,14 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                     return Outcome::Drop;
                 };
                 w.activities = plan.activities;
-                for &step in &plan.failed_steps {
+                for &(step, member) in &plan.failed_steps {
                     if step == w.step {
-                        w.failed_in_step += 1;
+                        // a step that goes on after a failure counts the activity as done
+                        if ctx.p.wf_types[w.wf_type].fails_workflow(step, member) {
+                            w.failed_in_step += 1;
+                        } else {
+                            w.completed_in_step += 1;
+                        }
                     }
                     w.history_events += 1;
                 }

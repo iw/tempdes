@@ -143,6 +143,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `failed_duration`: the time before the last attempt, less the retry intervals and queue
     waits.
   - Attempt shares are written to three significant digits, so rare counts aren't rounded to 0.
+- **Parallel steps.** A `parallel` step starts its members, `activity` and `child_workflow`
+  steps, in one workflow task, and ends when they all have. Each member keeps its own settings,
+  `on_failure` included. `workload import` writes one when a workflow task starts activities
+  of several types, activities and children, or children of several types:
+  - each type is a member with its own durations, attempts and retry policy;
+  - before, parallel activities of different types were pooled into one distribution;
+  - before, activities and children started together ran one after the other in the
+    simulation;
+  - before, children of several types were imported as the most common type.
 
 ### Fixed
 

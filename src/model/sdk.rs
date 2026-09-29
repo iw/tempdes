@@ -6,7 +6,9 @@ use crate::sim::executor::{Time, now, sleep, spawn};
 use crate::sim::sync::Permit;
 
 use super::frontend;
-use super::history::{self, ActTaskInfo, Commands, HISTORY_PAGE, ProgState, StartOrigin, WftInfo};
+use super::history::{
+    self, ActTaskInfo, Commands, HISTORY_PAGE, ProgState, ScheduleActivities, StartOrigin, WftInfo,
+};
 use super::infra::*;
 use super::matching::{self, Polled};
 use super::params::{SCHEDULER_WF_TYPE, StepP};
@@ -558,7 +560,12 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
                     prog.step_started = true;
                     let n = if *parallel { *count } else { 1 };
                     prog.step_scheduled = n;
-                    cmds.schedule_activities.push((prog.step, *tq, n));
+                    cmds.schedule_activities.push(ScheduleActivities {
+                        step: prog.step,
+                        member: 0,
+                        tq: *tq,
+                        count: n,
+                    });
                     break;
                 }
                 if failed_in_step > 0 && *on_failure == OnFailure::Fail {
@@ -580,7 +587,12 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
                 }
                 if !*parallel && done >= prog.step_scheduled && prog.step_scheduled < *count {
                     prog.step_scheduled += 1;
-                    cmds.schedule_activities.push((prog.step, *tq, 1));
+                    cmds.schedule_activities.push(ScheduleActivities {
+                        step: prog.step,
+                        member: 0,
+                        tq: *tq,
+                        count: 1,
+                    });
                 }
                 break;
             }
@@ -615,10 +627,54 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
             StepP::Child { wf_type, count } => {
                 if !prog.step_started {
                     prog.step_started = true;
-                    cmds.start_children = Some((*wf_type, *count));
+                    cmds.start_children.push((*wf_type, *count));
                     break;
                 }
                 if children_done >= *count {
+                    advance(&mut prog);
+                    completed_in_step = 0;
+                    failed_in_step = 0;
+                    timer_fired = false;
+                    children_done = 0;
+                    continue;
+                }
+                break;
+            }
+            StepP::Parallel {
+                members,
+                activities,
+                children,
+            } => {
+                if !prog.step_started {
+                    prog.step_started = true;
+                    prog.step_scheduled = *activities;
+                    for (m, member) in members.iter().enumerate() {
+                        match member {
+                            StepP::Activity { count, tq, .. } => {
+                                cmds.schedule_activities.push(ScheduleActivities {
+                                    step: prog.step,
+                                    member: m as u8,
+                                    tq: *tq,
+                                    count: *count,
+                                })
+                            }
+                            StepP::Child { wf_type, count } => {
+                                cmds.start_children.push((*wf_type, *count))
+                            }
+                            _ => {}
+                        }
+                    }
+                    break;
+                }
+                if failed_in_step > 0 {
+                    // an activity whose member doesn't say `on_failure: continue` failed for
+                    // good: the workflow returns its error
+                    cmds.complete = true;
+                    cmds.fail = true;
+                    prog.done = true;
+                    break;
+                }
+                if completed_in_step >= *activities && children_done >= *children {
                     advance(&mut prog);
                     completed_in_step = 0;
                     failed_in_step = 0;
@@ -771,8 +827,8 @@ pub async fn process_wft(ctx: Ctx, wk: usize, first: WftInfo, permit: Permit) {
             let mut want: u32 = cmds
                 .schedule_activities
                 .iter()
-                .filter(|(_, tq, _)| *tq == f.tq)
-                .map(|x| x.2)
+                .filter(|a| a.tq == f.tq)
+                .map(|a| a.count)
                 .sum();
             want = want.min(3); // SDK caps eager activities per workflow task
             for _ in 0..want {
@@ -782,6 +838,7 @@ pub async fn process_wft(ctx: Ctx, wk: usize, first: WftInfo, permit: Permit) {
                 }
             }
             cmds.eager_activities = eager_permits.len() as u32;
+            cmds.eager_tq = f.tq;
         }
         let result = respond_wft_full(&ctx, wk, ns, info, cmds).await;
         match result {
@@ -862,7 +919,7 @@ pub async fn process_activity(ctx: Ctx, wk: usize, info: ActTaskInfo, permit: Pe
     // whether the attempt fails, and non-retryably: planned when the activity was scheduled, or
     // drawn at the failure rate, up front when a failed attempt has its own duration
     let (duration, heartbeat, outcome, failure_rate, timeouts) =
-        match ctx.p.wf_types[info.wf_type].steps.get(info.step) {
+        match ctx.p.wf_types[info.wf_type].activity(info.step, info.member) {
             Some(StepP::Activity {
                 duration,
                 failed_duration,
