@@ -76,6 +76,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tables, for pull requests, issues and docs; `--verbose` applies to it as to the text report.
   `sweep --md FILE` writes one table per metric and each cell's top hotspot.
 
+- **Activity timeouts and retry policies.** Schedule-to-start, start-to-close,
+  schedule-to-close and heartbeat timeouts are enforced by history's timer queue, as in
+  Temporal, with one activity timer task per workflow for its earliest timeout. Start-to-close
+  and heartbeat timeouts retry the attempt while the retry policy allows. The other two fail
+  the activity, as do used-up retries. New activity fields set the timeouts
+  (`schedule_to_start_timeout`, `start_to_close_timeout`, `schedule_to_close_timeout`,
+  `heartbeat_timeout`) and the retry policy (`backoff_coefficient`, `max_interval`,
+  `max_attempts`, alongside `retry_initial`). `history.defaultActivityRetryPolicy` fills in
+  what an activity leaves unset. `on_failure: fail | continue` sets whether a failed activity
+  fails its workflow. Workers stop at their attempt's deadline and drop the result, as the Go
+  SDK does. The report adds an `activity-timeouts` hotspot and a `failed` column for
+  workflows.
+- **Per-call SDK deadlines.** `rpc_timeout` (10 s by default) sets the deadline of each SDK
+  call, retries included. It can be set for worker fleets, workflow starters, and signal,
+  query, describe and visibility load.
+- **"Not keeping up" throughput rule.** Workflows that close more slowly than they start,
+  once their own run time (estimated from their steps) and the warm-up are allowed for, are
+  reported with the rate at which running workflows pile up. Workflows with no known run time,
+  such as entities waiting for signals, keep only the start-shortfall test.
+- **Multi-tenant scheduling and limits.**
+  - The history task scheduler interleaves (namespace, priority) channels by weight, as
+    Temporal's interleaved weighted round robin does
+    (`history.*ProcessorSchedulerActiveRoundRobinWeights`, high 10, low 9, preemptable 1).
+  - The execution queue scheduler (`history.taskSchedulerEnableExecutionQueueScheduler` and
+    its `MaxQueues`, `QueueTTL` and `QueueConcurrency` settings) moves a busy workflow's tasks
+    into a queue of its own.
+  - Per-namespace persistence limits are checked before the pod's limit:
+    `persistenceNamespaceMaxQPS` and `persistenceGlobalNamespaceMaxQPS` for history and
+    matching, and `history.persistencePerShardNamespaceMaxQPS`. Their rejections name the
+    namespace.
+
+  95 dynamic config keys are now simulated, 13 of them new.
+
 ### Fixed
 
 - **Schedule-to-start is measured as the SDK measures it.** Workflow task and activity
@@ -93,5 +126,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   split by the shards each pod owns, as in Temporal, instead of evenly across pods. Pods that
   own more shards get more of the budget, so an even split overstated persistence throttling
   when ownership was uneven. The JSON report lists each pod's `persistence_qps_limit`.
+- **SDK retries share one deadline per call.** As in the Go SDK, a call's retries happen inside
+  its one context deadline (backoff 200 ms × 2ⁿ ±20%, at most 6 s apart), and a call still
+  failing at the deadline returns `DeadlineExceeded`. Before, each attempt had its own
+  timeout, so a signal queued behind a hot workflow's lock could take 20 s at p99; it now
+  stops at 10 s.
+- **History long polls run at the lowest priority.** A client waiting for a result
+  (`await_result`) long-polls `GetWorkflowExecutionHistory`. The frontend's namespace limiter
+  admits that as `PollWorkflowExecutionHistory` at priority 5, below worker polls, and
+  `frontend.namespaceCount` counts it. Before, it ran at priority 2 and wasn't counted. Metrics
+  still report it under `GetWorkflowExecutionHistory`.
+- **History task retries follow `executable.go`.** A failed task is resubmitted at once until its
+  tenth attempt, but throttling allows only one immediate resubmit. After that it backs off
+  1 s × 1.1ⁿ⁻¹, or when throttled the larger of that and 3 s × 1.5ᵐ⁻¹ for the m-th throttle in
+  a row. Before, a throttled task always backed off first, scaled by its attempts rather than
+  its throttles in a row, and other errors were resubmitted at once only after their first
+  failure. That overstated throttling delays; the immediate resubmit can raise rejection counts.
+- **Calibration no longer counts queueing and history appends twice.** Observed
+  `persistence_latency` includes queueing, and for Create/UpdateWorkflowExecution the history
+  append inside the call. Calibrated writes no longer add a separate `AppendHistoryNodes`, and
+  pilot runs fit each operation's service time so that the simulated mean latency, queueing
+  included, matches the observed mean. Uncalibrated writes run the append inside the write, with
+  one rate-limiter charge and one latency, as Temporal's SQL and Cassandra stores do.
+- **Documentation.** The README and model docs described activity timeouts before they were
+  simulated. They also described only one of the throughput tests, and gave stale counts of
+  simulated keys. All three are corrected.
 
 [Unreleased]: https://github.com/iw/tempdes/commits/main

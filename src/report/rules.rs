@@ -317,7 +317,7 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                     fmt_rate(w.offered_start_rate)
                 ),
                 format!(
-                    "{:.0}% of offered starts did not complete successfully within the SDK retry window ({} start failures). See the rate-limit and saturation hotspots below for the cause.",
+                    "{:.0}% of offered starts did not succeed before the SDK call's deadline, retries included ({} start failures). See the rate-limit and saturation hotspots below for the cause.",
                     short * 100.0,
                     w.start_failures
                 ),
@@ -1323,7 +1323,7 @@ fn limits(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 vec![c.knob("frontend.rps", "per-instance RPS"), c.knob("frontend.globalRPS", "cluster-wide"), c.replicas("frontend", "more frontends add host capacity")],
             ),
             "frontend.namespaceCount" => (
-                format!("Concurrent long-running requests (polls, queries) per namespace per API exceed the per-frontend quota. SDK pollers across all workers count here. {}", c.frontend_spread()),
+                format!("Concurrent long-running requests (polls, queries, history long polls from clients waiting for results) per namespace per API exceed the per-frontend quota. SDK pollers across all workers count here. {}", c.frontend_spread()),
                 vec!["service_errors_resource_exhausted{resource_exhausted_cause=\"RESOURCE_EXHAUSTED_CAUSE_CONCURRENT_LIMIT\"}", "service_pending_requests"],
                 vec![c.knob("frontend.namespaceCount", "per instance per API"), c.knob("frontend.globalNamespaceCount", "cluster-wide / #frontends")],
             ),
