@@ -994,6 +994,55 @@ fn long_workflows_are_not_mistaken_for_falling_behind() {
     );
 }
 
+/// A healthy cluster running a status poll that fails four attempts in five, retried with the
+/// default policy (1s, doubling, at most 100s apart, unlimited attempts).
+const RETRY_TAIL: &str = r#"
+name: retry-tail
+warmup: 30s
+duration: 30s
+cluster:
+  num_history_shards: 64
+  replicas: { frontend: 1, history: 1, matching: 1, worker: 1 }
+  persistence: { store: postgresql }
+namespaces:
+  - name: default
+workers:
+  - name: pollers
+    namespace: default
+    task_queue: q
+    processes: 2
+    workflow_pollers: 8
+    activity_pollers: 8
+    workflow_slots: 200
+    activity_slots: 400
+workflows:
+  - type: StatusWorkflow
+    namespace: default
+    task_queue: q
+    start_rate: 20/s
+    steps:
+      - activity: { count: 1, failure_rate: 0.8, duration: 100ms }
+"#;
+
+#[test]
+fn retry_tails_are_not_mistaken_for_falling_behind() {
+    // Five attempts on average, but the intervals double: a third of the runs need six or more
+    // attempts and take over half a minute, so fewer workflows close than start during the
+    // window even though nothing waits in the cluster.
+    let sc = Scenario::parse_str(RETRY_TAIL).expect("scenario parses");
+    let r = simulate_scenario(&sc, Overrides::default());
+    let w = &r.workflows[0];
+    assert!(
+        w.completed_per_s < 0.85 * w.started_per_s,
+        "the retry tail should hold back completions: {w:#?}"
+    );
+    assert!(
+        !r.hotspots.iter().any(|h| h.category == "throughput"),
+        "{:#?}",
+        r.hotspots.iter().map(|h| &h.title).collect::<Vec<_>>()
+    );
+}
+
 /// Two tenants on one cluster; `LIMIT` is replaced by dynamic config.
 const TENANTS: &str = r#"
 name: two-tenants

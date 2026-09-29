@@ -423,12 +423,19 @@ knobs.
   * *start shortfall*: accepted starts fall short of the offered rate, or more than 1% of
     starts fail;
   * *not keeping up*: workflows close (complete or fail) more slowly than a healthy cluster
-    would close them. The expected rate allows for the workflow's own run time, estimated from
-    its steps (activities, timers, children, signal timeouts and a workflow task per step), and
-    for the warm-up: a workflow that runs longer than the warm-up closes during only part of
-    the window. It needs a 10% shortfall at least, and shows how fast the number of running
-    workflows grew. Workflows with no known run time (waiting for signals without a timeout)
-    get only the start test.
+    would close them. The expected rate comes from the workflow's own run time, sampled 2,000
+    times from its steps, and from the warm-up.
+    * Each sample includes activity durations, failed attempts and the retry policy's
+      intervals, timers, children, signal timeouts and a workflow task per step.
+    * With starts at a steady rate from time zero, a healthy cluster closes, at each moment of
+      the window, the workflows started at least their run time earlier.
+    * So a long retry tail counts: with intervals that double up to 100 s, a few runs take
+      many minutes, and a workflow that runs longer than the warm-up closes during only part
+      of the window, or not at all.
+
+    It needs a 10% shortfall at least, and shows how fast the number of running workflows grew.
+    Workflows with no known run time (waiting for signals without a timeout) get only the start
+    test.
 * **Activity timeouts.** Timeouts that fired, by kind, are an `activity-timeouts` hotspot:
   critical when activities failed for good or more than 1% of attempts timed out.
 * **Causal ranking.** After detection, a causal pass re-ranks results:
@@ -436,7 +443,8 @@ knobs.
     worker schedule-to-start latency and the matching backlog they cause;
   * a `history.rps`, `matching.rps` or persistence limit that rejects calls outranks the
     schedule-to-start latency, backlog, timeouts, throttled queue tasks and API symptoms that
-    its retries cause;
+    its retries cause. Limiters raised together keep their own order, so the one rejecting
+    more calls comes first;
   * database saturation outranks the shard, lock, connection-pool and dispatch symptoms it
     causes;
   * the shard rule attributes a hot shard to the one workflow whose lock drives it.

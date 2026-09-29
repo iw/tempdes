@@ -436,7 +436,7 @@ single hot workflow writing to it.
 
 | Category | Meaning |
 |---|---|
-| `throughput` | accepted starts fall short of the offered load, or workflows close more slowly than they start once their own run time (from their steps) is allowed for, so the number running grows. Both use a Poisson 3σ test, so noise isn't flagged. Workflows that wait for signals without a timeout have no known run time and get only the start test. |
+| `throughput` | accepted starts fall short of the offered load, or workflows close more slowly than they start once their own run time (sampled from their steps, retries included) is allowed for, so the number running grows. Both use a Poisson 3σ test, so noise isn't flagged. Workflows that wait for signals without a timeout have no known run time and get only the start test. |
 | `cpu`, `imbalance` | pod CPU saturation; uneven load across pods of one service |
 | `database`, `connection-pool` | database busy; per-pod SQL `maxConns` pools saturated (bursty pools are labelled as such) |
 | `shard` | a shard's IO semaphore is busy, or bursty write contention |
