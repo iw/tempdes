@@ -207,7 +207,11 @@ fn run_times_at(p: &crate::model::params::Params, t: usize, depth: u32) -> Optio
     }
     // the run times of the child workflow types it starts, sampled first
     let mut children = std::collections::BTreeMap::new();
-    for step in &p.wf_types[t].steps {
+    let members = p.wf_types[t].steps.iter().flat_map(|s| match s {
+        StepP::Parallel { members, .. } => members.iter().collect::<Vec<_>>(),
+        s => vec![s],
+    });
+    for step in members {
         if let StepP::Child { wf_type, .. } = step
             && !children.contains_key(wf_type)
         {
@@ -234,52 +238,61 @@ fn sample_run_time(
     use crate::config::scenario::OnFailure;
     use crate::model::params::StepP;
     const STEP_OVERHEAD_S: f64 = 0.05;
+    /// How long the activities of activity step `step` take together, in parallel or one after
+    /// another, and when the first to fail for good fails the workflow (infinity if none does).
+    fn activities(step: &StepP, rng: &mut crate::sim::rng::Rng) -> (f64, f64) {
+        let StepP::Activity {
+            count,
+            parallel,
+            duration,
+            failed_duration,
+            failure_rate,
+            attempts,
+            retry,
+            timeouts,
+            on_failure,
+            ..
+        } = step
+        else {
+            return (0.0, f64::INFINITY);
+        };
+        let parallel = *parallel && *count > 1;
+        let (mut longest, mut sum) = (0.0f64, 0.0);
+        let mut failed_at = f64::INFINITY;
+        for i in 0..*count {
+            if !parallel && i > 0 {
+                sum += STEP_OVERHEAD_S;
+            }
+            let (d, ok) = sample_activity(
+                duration,
+                failed_duration.as_deref(),
+                *failure_rate,
+                attempts.as_ref(),
+                retry,
+                timeouts,
+                rng,
+            );
+            if !ok && *on_failure == OnFailure::Fail {
+                failed_at = failed_at.min(if parallel { d } else { sum + d });
+                if !parallel {
+                    break;
+                }
+            }
+            longest = longest.max(d);
+            sum += d;
+        }
+        (if parallel { longest } else { sum }, failed_at)
+    }
     let mut total = STEP_OVERHEAD_S;
     for step in &p.wf_types[t].steps {
         total += STEP_OVERHEAD_S;
         match step {
-            StepP::Activity {
-                count,
-                parallel,
-                duration,
-                failed_duration,
-                failure_rate,
-                attempts,
-                retry,
-                timeouts,
-                on_failure,
-                ..
-            } => {
-                let parallel = *parallel && *count > 1;
-                let (mut longest, mut sum) = (0.0f64, 0.0);
-                // when the first activity to fail for good fails the workflow
-                let mut failed_at = f64::INFINITY;
-                for i in 0..*count {
-                    if !parallel && i > 0 {
-                        sum += STEP_OVERHEAD_S;
-                    }
-                    let (d, ok) = sample_activity(
-                        duration,
-                        failed_duration.as_deref(),
-                        *failure_rate,
-                        attempts.as_ref(),
-                        retry,
-                        timeouts,
-                        rng,
-                    );
-                    if !ok && *on_failure == OnFailure::Fail {
-                        failed_at = failed_at.min(if parallel { d } else { sum + d });
-                        if !parallel {
-                            break;
-                        }
-                    }
-                    longest = longest.max(d);
-                    sum += d;
-                }
+            StepP::Activity { .. } => {
+                let (d, failed_at) = activities(step, rng);
                 if failed_at.is_finite() {
                     return Some(total + failed_at);
                 }
-                total += if parallel { longest } else { sum };
+                total += d;
             }
             StepP::LocalActivity { count, duration } => {
                 for _ in 0..*count {
@@ -294,6 +307,24 @@ fn sample_run_time(
             }
             // signals may arrive sooner; the timeout bounds the wait
             StepP::WaitSignal { timeout, .. } => total += *timeout.as_ref()? as f64 / 1e6,
+            // the members run together: the slowest, unless one fails the workflow first
+            StepP::Parallel { members, .. } => {
+                let (mut longest, mut failed_at) = (0.0f64, f64::INFINITY);
+                for m in members {
+                    if let StepP::Child { wf_type, count } = m {
+                        let q = rng.f64().powf(1.0 / f64::from(*count));
+                        longest = longest.max(sample_quantile(&children[wf_type], q));
+                    } else {
+                        let (d, f) = activities(m, rng);
+                        longest = longest.max(d);
+                        failed_at = failed_at.min(f);
+                    }
+                }
+                if failed_at.is_finite() {
+                    return Some(total + failed_at);
+                }
+                total += longest;
+            }
         }
     }
     Some(total)

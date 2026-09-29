@@ -397,7 +397,10 @@ inferred. Both export spellings are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` a
 
 * **Steps.** The commands of one workflow task form a step: activities scheduled together run
   in parallel, `LocalActivity` markers are local activities run inside that task, a timer on its
-  own is a sleep, and children started together are one child step. A signal that wakes an idle
+  own is a sleep, and children started together are one child step. When a workflow task starts
+  activities of several types, or activities and children, or children of several types, they
+  make a `parallel` step with a member per type, each with its own durations, attempts and
+  settings. A signal that wakes an idle
   workflow is a `wait_signal`, with the cancelled timer as its timeout; signals that arrive
   while the workflow is busy are buffered and left out.
 * **Durations are each step's own time.** An activity's is its final attempt from start to
@@ -429,8 +432,7 @@ inferred. Both export spellings are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` a
 
 Not modelled, and counted in the summary: updates, Nexus operations, search attribute upserts,
 markers other than local activities, and continue-as-new (each run is imported as its own
-execution). Parallel activities of different types are pooled into one distribution, and a
-child type whose histories weren't given is written as a stub with no steps.
+execution). A child type whose histories weren't given is written as a stub with no steps.
 
 ## Saved run profiles
 
@@ -581,6 +583,10 @@ workflows:
       - local_activity: { count: 1, duration: 5ms }
       - timer: 2s
       - child_workflow: { workflow_type: ShipmentWorkflow, count: 1 }
+      - parallel:              # started by one workflow task; done when all are
+          - activity: { count: 2, duration: 1s }
+          - activity: { duration: 3s, attempts: { 1: 0.9, 3: 0.1 }, on_failure: continue }
+          - child_workflow: { workflow_type: ShipmentWorkflow }
       - wait_signal: { count: 1, timeout: 1h }
 
 load:                          # traffic that is not workflow starts; each takes an rpc_timeout
@@ -640,6 +646,12 @@ outcome, not a symptom. `failed_duration` sets how long a failed attempt runs (b
 `duration`): quick rejections run shorter, and attempts that hang past
 `start_to_close_timeout` time out instead of failing. These are what `workload import` writes,
 because a history records each activity's attempt count and why its retries stopped.
+
+**Parallel steps.** A `parallel` step starts its members, `activity` and `child_workflow` steps,
+in one workflow task, and ends when they all have, so it takes as long as the slowest. Each
+member keeps its own settings: duration, attempts, retry policy, timeouts, task queue and
+`on_failure`. An activity member that fails for good fails the workflow, unless that member says
+`on_failure: continue`. An activity member's `count` activities all start together.
 
 ## Example scenarios
 

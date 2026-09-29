@@ -283,7 +283,9 @@ History enforces activity timeouts with timer tasks, as Temporal does
   `RETRY_STATE_NON_RETRYABLE_FAILURE` (`service/history/workflow/mutable_state_impl.go`) and
   `respondactivitytaskfailed/api.go` records the failure and schedules a workflow task.
 * **The workflow's reaction.** An activity that fails for good fails its workflow, as a Go
-  workflow returning the error does, unless the step says `on_failure: continue`.
+  workflow returning the error does, unless its step, or its member of a parallel step, says
+  `on_failure: continue`. History counts such a failure as the step's progress (the activity is
+  done) rather than as a failure, so the workflow task sees only failures that fail it.
 * Timeouts are counted by kind; the server metrics for activities that fail on them are
   `schedule_to_start_timeout`, `start_to_close_timeout`, `schedule_to_close_timeout` and
   `heartbeat_timeout`.
@@ -343,6 +345,10 @@ Workers follow the Go SDK.
   * Local activities run inside the workflow task and add their duration to its processing
     time. The workflow-task heartbeat that the SDK sends for very long local activities is not
     modelled.
+  * A `parallel` step issues the commands of all its members, activities and child workflows,
+    in one workflow task, and the program moves on once every member's activities and children
+    are done. Each activity carries its member, whose settings (duration, attempts, retry
+    policy, timeouts, task queue, `on_failure`) apply to it.
   * Eager activities are requested on `RespondWorkflowTaskCompleted`.
 * **Retries** follow the SDK's gRPC retry interceptor (`internal/common/retry/interceptor.go`).
   * Each call gets one context deadline and every retry happens inside it. The deadline is
@@ -397,7 +403,10 @@ Workers follow the Go SDK.
 * **Events to steps.** The commands issued by one workflow task form a step: activities
   scheduled together run in parallel, `LocalActivity` (or `core_local_activity`) markers are
   local activities run inside that task, a timer on its own is a sleep, and children started
-  together are one child step. A timer started with activities or children is a timeout guard
+  together are one child step. A task that starts activities of several types, activities and
+  children, or children of several types makes a `parallel` step with a member per type, each
+  pooled over the executions on its own, with its own `on_failure` from what the workflows did
+  after that type's failures. A timer started with activities or children is a timeout guard
   and is left out. A signal that wakes a workflow with nothing running is a wait for signals,
   and a timer cancelled by it is the wait's timeout.
 * **Own time only.** An activity's duration is its final attempt from `ActivityTaskStarted` to
@@ -475,7 +484,8 @@ knobs.
     times from its steps, and from the warm-up.
     * Each sample includes activity durations, failed attempts (with `failed_duration` when
       set, and ending the activity when non-retryable) and the retry policy's intervals,
-      timers, children, signal timeouts and a workflow task per step.
+      timers, children, signal timeouts and a workflow task per step. A parallel step takes
+      as long as its slowest member.
     * With starts at a steady rate from time zero, a healthy cluster closes, at each moment of
       the window, the workflows started at least their run time earlier.
     * So a long retry tail counts: with intervals that double up to 100 s, a few runs take

@@ -50,9 +50,7 @@ pub fn build(traces: &[Trace], opts: &Options) -> Program {
     let mut child_types: Vec<&str> = Vec::new();
     for t in traces {
         for s in &t.steps {
-            if let Step::Children(c) = s {
-                child_types.extend(c.iter().map(String::as_str));
-            }
+            child_types.extend(s.children().iter().map(String::as_str));
         }
     }
     let mut yaml = String::new();
@@ -85,7 +83,7 @@ pub fn build(traces: &[Trace], opts: &Options) -> Program {
             .find(|t| {
                 t.steps
                     .iter()
-                    .any(|s| matches!(s, Step::Children(c) if c.iter().any(|x| x == name)))
+                    .any(|s| s.children().iter().any(|x| x == name))
             })
             .map_or("", |t| t.task_queue.as_str());
         let _ = writeln!(
@@ -312,37 +310,8 @@ fn entry(
     for i in 0..steps {
         let at: Vec<&Step> = runs.iter().map(|t| &t.steps[i]).collect();
         match at[0] {
-            Step::Activities(group) => {
-                let acts: Vec<&Activity> = at
-                    .iter()
-                    .flat_map(|s| match s {
-                        Step::Activities(a) => a.iter().collect::<Vec<_>>(),
-                        _ => Vec::new(),
-                    })
-                    .collect();
-                // did a workflow go on after an activity of this step failed for good?
-                let (mut went_on, mut stopped) = (0, 0);
-                for (t, s) in runs.iter().zip(&at) {
-                    if let Step::Activities(a) = s
-                        && a.iter().any(|x| failed(x.outcome))
-                    {
-                        if i + 1 < t.steps.len() || t.outcome == Outcome::Completed {
-                            went_on += 1;
-                        } else {
-                            stopped += 1;
-                        }
-                    }
-                }
-                activity_step(
-                    group,
-                    &acts,
-                    &task_queue,
-                    went_on > stopped,
-                    at.len(),
-                    type_wait,
-                    yaml,
-                    notes,
-                );
+            Step::Activities(_) | Step::Children(_) | Step::Parallel { .. } => {
+                started_together(runs, &at, i, &task_queue, type_wait, yaml, notes);
             }
             Step::LocalActivities { count, .. } => {
                 let mut d: Vec<f64> = at
@@ -374,23 +343,6 @@ fn entry(
                     dist(&mut d).unwrap_or_else(|| "1s".into())
                 );
             }
-            Step::Children(types) => {
-                let child = most_common(types.iter().cloned()).unwrap_or_default();
-                if types.iter().any(|t| *t != child) {
-                    note(
-                        notes,
-                        "children of several types started together were imported as the most common type",
-                        Unit::Steps,
-                        1,
-                    );
-                }
-                let _ = writeln!(
-                    yaml,
-                    "      - child_workflow: {{ workflow_type: {}, count: {} }}",
-                    quote(&child),
-                    types.len()
-                );
-            }
             Step::SignalWait { count, .. } => {
                 let timeout = most_common(at.iter().map(|s| match s {
                     Step::SignalWait { timeout_us, .. } => *timeout_us,
@@ -414,11 +366,87 @@ fn failed(o: ActOutcome) -> bool {
     matches!(o, ActOutcome::Failed | ActOutcome::TimedOut)
 }
 
+/// Step `i` of `runs` (`at`), which started activities, child workflows or both, pooled over its
+/// executions: an `activity` or `child_workflow` step when all it started is of one type, else a
+/// `parallel` step with a member per type.
+fn started_together(
+    runs: &[&Trace],
+    at: &[&Step],
+    i: usize,
+    workflow_tq: &str,
+    type_wait: u64,
+    yaml: &mut String,
+    notes: &mut Notes,
+) {
+    let first = at[0];
+    let mut activity_types: Vec<&str> = first
+        .activities()
+        .iter()
+        .map(|a| a.activity_type.as_str())
+        .collect();
+    activity_types.sort_unstable();
+    activity_types.dedup();
+    let mut child_types: Vec<&str> = first.children().iter().map(String::as_str).collect();
+    child_types.sort_unstable();
+    child_types.dedup();
+    let pre = if activity_types.len() + child_types.len() > 1 {
+        let _ = writeln!(yaml, "      - parallel:");
+        "          "
+    } else {
+        "      "
+    };
+    for ty in activity_types {
+        let group: Vec<Activity> = first
+            .activities()
+            .iter()
+            .filter(|a| a.activity_type == ty)
+            .cloned()
+            .collect();
+        let acts: Vec<&Activity> = at
+            .iter()
+            .flat_map(|s| s.activities())
+            .filter(|a| a.activity_type == ty)
+            .collect();
+        // did a workflow go on after an activity of this type failed for good?
+        let (mut went_on, mut stopped) = (0, 0);
+        for (t, s) in runs.iter().zip(at) {
+            if s.activities()
+                .iter()
+                .any(|a| a.activity_type == ty && failed(a.outcome))
+            {
+                if i + 1 < t.steps.len() || t.outcome == Outcome::Completed {
+                    went_on += 1;
+                } else {
+                    stopped += 1;
+                }
+            }
+        }
+        activity_step(
+            &group,
+            &acts,
+            workflow_tq,
+            went_on > stopped,
+            at.len(),
+            type_wait,
+            pre,
+            yaml,
+            notes,
+        );
+    }
+    for ty in child_types {
+        let count = first.children().iter().filter(|c| *c == ty).count();
+        let _ = writeln!(
+            yaml,
+            "{pre}- child_workflow: {{ workflow_type: {}, count: {count} }}",
+            quote(ty)
+        );
+    }
+}
+
 /// What a summary note counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Unit {
     Histories,
-    Steps,
     Activities,
 }
 
@@ -426,7 +454,6 @@ impl Unit {
     fn count(self, n: usize) -> String {
         let (one, many) = match self {
             Unit::Histories => ("history", "histories"),
-            Unit::Steps => ("step", "steps"),
             Unit::Activities => ("activity", "activities"),
         };
         format!("{n} {}", if n == 1 { one } else { many })
@@ -508,8 +535,8 @@ fn earlier_attempts_us(a: &Activity, gap: u64, wait: u64) -> Vec<u64> {
     out
 }
 
-/// An activity step pooled over its executions; `type_wait` is the typical queue wait of the
-/// workflow type's first attempts.
+/// An activity step pooled over its executions, written at indentation `pre`; `type_wait` is
+/// the typical queue wait of the workflow type's first attempts.
 #[allow(clippy::too_many_arguments)]
 fn activity_step(
     group: &[Activity],
@@ -518,6 +545,7 @@ fn activity_step(
     continue_on_failure: bool,
     executions: usize,
     type_wait: u64,
+    pre: &str,
     yaml: &mut String,
     notes: &mut Notes,
 ) {
@@ -538,22 +566,14 @@ fn activity_step(
     }
     let _ = writeln!(
         yaml,
-        "      # {}: {} activities in {executions} executions{shares}",
+        "{pre}# {}: {} activities in {executions} executions{shares}",
         types.join(", "),
         acts.len(),
     );
-    if types.len() > 1 {
-        note(
-            notes,
-            "parallel activities of different types were pooled into one distribution",
-            Unit::Steps,
-            1,
-        );
-    }
-    let _ = writeln!(yaml, "      - activity:");
-    let _ = writeln!(yaml, "          count: {count}");
+    let _ = writeln!(yaml, "{pre}- activity:");
+    let _ = writeln!(yaml, "{pre}    count: {count}");
     if count > 1 {
-        let _ = writeln!(yaml, "          parallel: true");
+        let _ = writeln!(yaml, "{pre}    parallel: true");
     }
     // plans: the attempt that succeeds, or fails with a non-retryable error; one whose attempts
     // kept failing until its policy or schedule-to-close stopped them needs one it can't reach
@@ -627,13 +647,13 @@ fn activity_step(
     let failed_dist = dist(&mut failed_runs);
     let _ = writeln!(
         yaml,
-        "          duration: {}",
+        "{pre}    duration: {}",
         dist(&mut runs)
             .or_else(|| failed_dist.clone())
             .unwrap_or_else(|| "1s".into())
     );
     if let Some(d) = failed_dist {
-        let _ = writeln!(yaml, "          failed_duration: {d}");
+        let _ = writeln!(yaml, "{pre}    failed_duration: {d}");
     }
     let planned = succeeds.values().sum::<usize>() + rejected.values().sum::<usize>();
     let shares_of = |m: &BTreeMap<u32, usize>| {
@@ -648,41 +668,37 @@ fn activity_step(
         1 => {
             let k = *succeeds.keys().next().unwrap();
             if k > 1 {
-                let _ = writeln!(yaml, "          attempts: {k}");
+                let _ = writeln!(yaml, "{pre}    attempts: {k}");
             }
         }
         _ => {
-            let _ = writeln!(yaml, "          attempts: {{ {} }}", shares_of(&succeeds));
+            let _ = writeln!(yaml, "{pre}    attempts: {{ {} }}", shares_of(&succeeds));
         }
     }
     if !rejected.is_empty() {
         let _ = writeln!(
             yaml,
-            "          non_retryable: {{ {} }}",
+            "{pre}    non_retryable: {{ {} }}",
             shares_of(&rejected)
         );
     }
     let retry = most_common(acts.iter().map(|a| a.retry.map(RetryKey::from))).flatten();
     if let Some(r) = retry {
+        let _ = writeln!(yaml, "{pre}    retry_initial: {}", dur(r.initial_us as f64));
         let _ = writeln!(
             yaml,
-            "          retry_initial: {}",
-            dur(r.initial_us as f64)
-        );
-        let _ = writeln!(
-            yaml,
-            "          backoff_coefficient: {}",
+            "{pre}    backoff_coefficient: {}",
             num(r.coefficient_milli as f64 / 1000.0)
         );
         if r.max_interval_us > 0 {
             let _ = writeln!(
                 yaml,
-                "          max_interval: {}",
+                "{pre}    max_interval: {}",
                 dur(r.max_interval_us as f64)
             );
         }
         if r.max_attempts > 0 {
-            let _ = writeln!(yaml, "          max_attempts: {}", r.max_attempts);
+            let _ = writeln!(yaml, "{pre}    max_attempts: {}", r.max_attempts);
         }
     }
     let timeouts = most_common(acts.iter().map(|a| a.timeouts)).unwrap_or_default();
@@ -693,23 +709,23 @@ fn activity_step(
         ("heartbeat_timeout", timeouts.heartbeat),
     ] {
         if v > 0 {
-            let _ = writeln!(yaml, "          {key}: {}", dur(v as f64));
+            let _ = writeln!(yaml, "{pre}    {key}: {}", dur(v as f64));
         }
     }
     if timeouts.heartbeat > 0 {
         // histories don't record heartbeats; the Go SDK sends at most one per 0.8 × the timeout
         let _ = writeln!(
             yaml,
-            "          heartbeat: {}   # assumed: the SDK's throttle, 0.8 × heartbeat_timeout",
+            "{pre}    heartbeat: {}   # assumed: the SDK's throttle, 0.8 × heartbeat_timeout",
             dur(timeouts.heartbeat as f64 * 0.8)
         );
     }
     if continue_on_failure {
-        let _ = writeln!(yaml, "          on_failure: continue");
+        let _ = writeln!(yaml, "{pre}    on_failure: continue");
     }
     let tq = most_common(acts.iter().map(|a| a.task_queue.clone())).unwrap_or_default();
     if !tq.is_empty() && tq != workflow_tq {
-        let _ = writeln!(yaml, "          task_queue: {}", quote(&tq));
+        let _ = writeln!(yaml, "{pre}    task_queue: {}", quote(&tq));
     }
 }
 

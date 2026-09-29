@@ -300,6 +300,8 @@ pub struct ActInfo {
     pub attempt: u32,
     pub state: ActState,
     pub step: usize,
+    /// its member of a parallel step (0 otherwise)
+    pub member: u8,
     pub tq: usize,
     /// when the current attempt was scheduled (a retry: when it became due)
     pub scheduled_at: Time,
@@ -344,8 +346,11 @@ pub struct Wf {
     pub step: usize,
     pub step_started: bool,
     pub step_remaining: u32,
+    /// activities of the current step that are done: completed, or failed for good where the
+    /// step goes on (`on_failure: continue`)
     pub completed_in_step: u32,
-    /// activities of the current step that failed for good (timed out or out of retries)
+    /// activities of the current step that failed for good (timed out, out of retries or a
+    /// non-retryable error) and fail the workflow
     pub failed_in_step: u32,
     pub timer_seq: u32,
     pub timer_pending: Option<u32>,

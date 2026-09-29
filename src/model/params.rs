@@ -550,6 +550,13 @@ pub enum StepP {
         count: u32,
         timeout: Option<Time>,
     },
+    /// `Activity` and `Child` members started by one workflow task; the step ends when all
+    /// `activities` and `children` have
+    Parallel {
+        members: Vec<StepP>,
+        activities: u32,
+        children: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -571,6 +578,30 @@ pub struct WfTypeParams {
     pub payload_bytes: f64,
     /// scheduler (system) workflow type
     pub system_scheduler: bool,
+}
+
+impl WfTypeParams {
+    /// The activity step an activity runs for: step `step`, or its member `member` when the
+    /// step is parallel.
+    pub fn activity(&self, step: usize, member: u8) -> Option<&StepP> {
+        match self.steps.get(step)? {
+            StepP::Parallel { members, .. } => members.get(usize::from(member)),
+            s => Some(s),
+        }
+        .filter(|s| matches!(s, StepP::Activity { .. }))
+    }
+
+    /// Whether an activity of step `step` (member `member`) that fails for good fails the
+    /// workflow, rather than counting as done (`on_failure: continue`).
+    pub fn fails_workflow(&self, step: usize, member: u8) -> bool {
+        !matches!(
+            self.activity(step, member),
+            Some(StepP::Activity {
+                on_failure: OnFailure::Continue,
+                ..
+            })
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1281,8 +1312,11 @@ impl Params {
             let mut steps = Vec::new();
             let retry_defaults =
                 default_retry_policy(&dc, &DynamicConfig::prec_namespace(&w.namespace));
-            for s in &w.steps {
-                steps.push(match s {
+            let build = |s: &Step,
+                         task_queues: &mut Vec<TqParams>,
+                         prov: &mut Provenance|
+             -> anyhow::Result<StepP> {
+                Ok(match s {
                     Step::Activity(a) => {
                         let duration = a
                             .duration
@@ -1341,8 +1375,8 @@ impl Params {
                                 &w.namespace,
                                 a.task_queue.as_deref().unwrap_or(&w.task_queue),
                                 false,
-                                &mut task_queues,
-                                &mut prov,
+                                task_queues,
+                                prov,
                             ),
                         }
                     }
@@ -1368,6 +1402,33 @@ impl Params {
                         count: ws.count.max(1),
                         timeout: ws.timeout.map(|d| d.us()),
                     },
+                    Step::Parallel(_) => {
+                        anyhow::bail!("{}: parallel steps don't nest", w.type_name)
+                    }
+                })
+            };
+            for s in &w.steps {
+                steps.push(match s {
+                    Step::Parallel(members) => {
+                        let members = members
+                            .iter()
+                            .map(|m| build(m, &mut task_queues, &mut prov))
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        let (mut activities, mut children) = (0, 0);
+                        for m in &members {
+                            match m {
+                                StepP::Activity { count, .. } => activities += count,
+                                StepP::Child { count, .. } => children += count,
+                                _ => {}
+                            }
+                        }
+                        StepP::Parallel {
+                            members,
+                            activities,
+                            children,
+                        }
+                    }
+                    s => build(s, &mut task_queues, &mut prov)?,
                 });
             }
             let ns = ns_idx(&w.namespace);

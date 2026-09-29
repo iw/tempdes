@@ -32,7 +32,7 @@ pub struct ProgState {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Snapshot {
     pub completed_in_step: u32,
-    /// activities of the step that failed for good
+    /// activities of the step that failed for good and fail the workflow
     pub failed_in_step: u32,
     pub timer_fired: bool,
     pub children_done: u32,
@@ -64,6 +64,8 @@ pub struct ActTaskInfo {
     pub seq: u32,
     pub attempt: u32,
     pub step: usize,
+    /// its member of a parallel step (0 otherwise)
+    pub member: u8,
     pub scheduled_at: Time,
     /// when the activity was first scheduled (the poll response's `ScheduledTime`)
     pub first_scheduled_at: Time,
@@ -71,13 +73,23 @@ pub struct ActTaskInfo {
     pub plan: super::params::AttemptPlan,
 }
 
+/// `count` activities of step `step` (its member `member` when the step is parallel) to
+/// schedule on task queue `tq`.
+#[derive(Clone, Copy, Debug)]
+pub struct ScheduleActivities {
+    pub step: usize,
+    pub member: u8,
+    pub tq: usize,
+    pub count: u32,
+}
+
 /// Commands produced by a workflow task.
 #[derive(Clone, Debug, Default)]
 pub struct Commands {
-    /// (step, activity task queue, count)
-    pub schedule_activities: Vec<(usize, usize, u32)>,
+    pub schedule_activities: Vec<ScheduleActivities>,
     pub start_timer: Option<Time>,
-    pub start_children: Option<(usize, u32)>,
+    /// (child workflow type, count)
+    pub start_children: Vec<(usize, u32)>,
     pub complete: bool,
     /// close the workflow as failed (with `complete`): an activity failed for good
     pub fail: bool,
@@ -86,8 +98,10 @@ pub struct Commands {
     pub sticky_worker: Option<usize>,
     /// scheduler workflows: actions performed in this task
     pub actions_done: u32,
-    /// how many of the scheduled activities the worker takes eagerly
+    /// how many of the scheduled activities the worker takes eagerly, of those on its task
+    /// queue `eager_tq` (the SDK requests eager execution only for those)
     pub eager_activities: u32,
+    pub eager_tq: usize,
 }
 
 pub struct RespondResult {
@@ -490,9 +504,13 @@ async fn respond_wft_inner(
     deadline: Time,
 ) -> Res<RespondResult> {
     let caller = Caller::Api(2, ctx.wf_ns(info.wf, info.wgen));
-    let n_cmds = cmds.schedule_activities.iter().map(|x| x.2).sum::<u32>()
+    let n_cmds = cmds
+        .schedule_activities
+        .iter()
+        .map(|x| x.count)
+        .sum::<u32>()
         + u32::from(cmds.start_timer.is_some())
-        + cmds.start_children.map(|c| c.1).unwrap_or(0)
+        + cmds.start_children.iter().map(|c| c.1).sum::<u32>()
         + u32::from(cmds.complete)
         + cmds.markers;
     cpu(
@@ -567,15 +585,21 @@ async fn respond_wft_inner(
         }
         // activities
         let mut eager_left = eager_n;
-        for &(step, tq, count) in &cmds.schedule_activities {
+        for &ScheduleActivities {
+            step,
+            member,
+            tq,
+            count,
+        } in &cmds.schedule_activities
+        {
             for _ in 0..count {
                 w.next_act_seq += 1;
                 let seq = w.next_act_seq;
-                let eager = eager_left > 0;
+                let eager = eager_left > 0 && tq == cmds.eager_tq;
                 if eager {
                     eager_left -= 1;
                 }
-                let plan = match ctx.p.wf_types[wf_type].steps.get(step) {
+                let plan = match ctx.p.wf_types[wf_type].activity(step, member) {
                     Some(super::params::StepP::Activity {
                         attempts: Some(a), ..
                     }) => a.sample(ctx.rand()),
@@ -590,6 +614,7 @@ async fn respond_wft_inner(
                         ActState::Scheduled
                     },
                     step,
+                    member,
                     tq,
                     scheduled_at: t,
                     first_scheduled_at: t,
@@ -607,6 +632,7 @@ async fn respond_wft_inner(
                         seq,
                         attempt: 1,
                         step,
+                        member,
                         scheduled_at: t,
                         first_scheduled_at: t,
                         plan,
@@ -627,7 +653,7 @@ async fn respond_wft_inner(
                 0,
             ));
         }
-        if let Some((child_type, count)) = cmds.start_children {
+        for &(child_type, count) in &cmds.start_children {
             w.children_pending += count;
             for i in 0..count {
                 tasks.push(TaskSpec::now(
@@ -762,7 +788,7 @@ pub async fn record_activity_started(
         shard_ready(ctx, pod, shard, deadline).await?;
         let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
-        let (step, scheduled_at, first_scheduled_at, plan, wf_type) = {
+        let (step, member, scheduled_at, first_scheduled_at, plan, wf_type) = {
             let wfs = ctx.wfs.borrow();
             let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
             if w.status != WfStatus::Running {
@@ -775,6 +801,7 @@ pub async fn record_activity_started(
                 .ok_or(Err::NotFound)?;
             (
                 a.step,
+                a.member,
                 a.scheduled_at,
                 a.first_scheduled_at,
                 a.plan,
@@ -841,6 +868,7 @@ pub async fn record_activity_started(
             seq,
             attempt,
             step,
+            member,
             scheduled_at,
             first_scheduled_at,
             plan,
@@ -936,7 +964,7 @@ pub async fn respond_activity(
                 w.activities.retain(|a| a.seq != info.seq);
                 w.history_events += 2;
                 w.history_bytes += ctx.p.wf_types[w.wf_type].payload_bytes;
-                if gave_up {
+                if gave_up && ctx.p.wf_types[w.wf_type].fails_workflow(info.step, info.member) {
                     w.failed_in_step += 1;
                 } else {
                     w.completed_in_step += 1;

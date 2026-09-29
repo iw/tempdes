@@ -515,6 +515,9 @@ pub enum Step {
     Timer(DurDist),
     ChildWorkflow(ChildStep),
     WaitSignal(WaitSignalStep),
+    /// Activity and child workflow steps started by one workflow task, with their own settings;
+    /// the step ends when they all have.
+    Parallel(Vec<Step>),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -897,6 +900,33 @@ impl Scenario {
                 w.task_queue
             );
             for s in &w.steps {
+                if let Step::Parallel(members) = s {
+                    anyhow::ensure!(
+                        !members.is_empty() && members.len() <= usize::from(u8::MAX),
+                        "workflow {}: a parallel step needs 1 to 255 members",
+                        w.type_name
+                    );
+                    for m in members {
+                        match m {
+                            Step::Activity(a) => anyhow::ensure!(
+                                a.parallel,
+                                "workflow {}: the activities of a parallel step start together; `parallel: false` isn't allowed there",
+                                w.type_name
+                            ),
+                            Step::ChildWorkflow(_) => {}
+                            _ => anyhow::bail!(
+                                "workflow {}: a parallel step holds activity and child_workflow steps only",
+                                w.type_name
+                            ),
+                        }
+                    }
+                }
+            }
+            let members = w.steps.iter().flat_map(|s| match s {
+                Step::Parallel(m) => m.iter().collect::<Vec<_>>(),
+                s => vec![s],
+            });
+            for s in members {
                 match s {
                     Step::ChildWorkflow(c) => anyhow::ensure!(
                         wf_types.contains(&c.workflow_type.as_str()),

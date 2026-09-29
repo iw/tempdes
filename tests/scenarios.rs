@@ -1178,6 +1178,177 @@ fn failed_attempts_run_for_their_own_duration() {
     assert!(w.completed_per_s > 0.9 * w.started_per_s, "{w:#?}");
 }
 
+/// An order that charges, then does `STEPS`; its shipment is a child with one 2s activity.
+const FAN_OUT: &str = r#"
+name: fan-out
+warmup: 20s
+duration: 30s
+cluster:
+  num_history_shards: 64
+  replicas: { frontend: 1, history: 1, matching: 1, worker: 1 }
+  persistence: { store: postgresql }
+namespaces:
+  - name: default
+workers:
+  - { name: main, namespace: default, task_queue: q, processes: 2, workflow_pollers: 8, activity_pollers: 8, workflow_slots: 200, activity_slots: 400 }
+  - { name: slow, namespace: default, task_queue: slow, processes: 1, activity_pollers: 4, activity_slots: 200 }
+workflows:
+  - type: OrderWorkflow
+    namespace: default
+    task_queue: q
+    start_rate: 10/s
+    steps:
+      - activity: { duration: 100ms }
+STEPS
+  - type: ShipmentWorkflow
+    namespace: default
+    task_queue: q
+    steps:
+      - activity: { duration: 2s }
+"#;
+
+#[test]
+fn parallel_steps_run_their_members_together() {
+    let with = |steps: &str| Scenario::parse_str(&FAN_OUT.replace("STEPS", steps));
+    let order = |r: &RunResult| {
+        r.workflows
+            .iter()
+            .find(|w| w.workflow_type == "OrderWorkflow")
+            .cloned()
+            .unwrap()
+    };
+    // two 1s lookups, a 3s activity on its own task queue and the 2s shipment, together: the
+    // step takes as long as the slowest, about 3s, where one after another they take 6s
+    let together = "      - parallel:
+          - activity: { count: 2, duration: 1s }
+          - activity: { duration: 3s, task_queue: slow, MEMBER }
+          - child_workflow: { workflow_type: ShipmentWorkflow }";
+    let apart = "      - activity: { count: 2, duration: 1s }
+      - activity: { duration: 3s, task_queue: slow }
+      - child_workflow: { workflow_type: ShipmentWorkflow }";
+    let r = simulate_scenario(
+        &with(&together.replace(", MEMBER", "")).expect("scenario parses"),
+        Overrides::default(),
+    );
+    let w = order(&r);
+    assert!(
+        w.e2e.p50_ms > 3_000.0 && w.e2e.p50_ms < 3_800.0,
+        "{}ms",
+        w.e2e.p50_ms
+    );
+    assert!(w.completed_per_s > 0.95 * w.started_per_s, "{w:#?}");
+    // the charge, two lookups and the slow activity
+    assert!(
+        (w.activities_per_s / w.started_per_s - 4.0).abs() < 0.3,
+        "{w:#?}"
+    );
+    let shipments = r
+        .workflows
+        .iter()
+        .find(|w| w.workflow_type == "ShipmentWorkflow")
+        .unwrap();
+    assert!(
+        (shipments.started_per_s - w.started_per_s).abs() < 1.5,
+        "{shipments:#?}"
+    );
+    // the throughput rule samples the step as its slowest member
+    assert!(
+        !r.hotspots.iter().any(|h| h.category == "throughput"),
+        "{:?}",
+        r.hotspots.iter().map(|h| &h.title).collect::<Vec<_>>()
+    );
+    let sequential = order(&simulate_scenario(
+        &with(apart).expect("scenario parses"),
+        Overrides::default(),
+    ));
+    assert!(
+        sequential.e2e.p50_ms > 5_800.0,
+        "{}ms",
+        sequential.e2e.p50_ms
+    );
+
+    // each member has its own settings: the slow activity always fails for good, which fails
+    // the workflow unless that member goes on
+    let failing = |on_failure: &str| {
+        order(&simulate_scenario(
+            &with(&together.replace(
+                "MEMBER",
+                &format!("non_retryable: {{ 1: 1.0 }}, on_failure: {on_failure}"),
+            ))
+            .expect("scenario parses"),
+            Overrides::default(),
+        ))
+    };
+    let w = failing("fail");
+    assert!(w.failed_per_s > 0.9 * w.started_per_s, "{w:#?}");
+    let w = failing("continue");
+    assert_eq!(w.failed_per_s, 0.0, "{w:#?}");
+    assert!(w.completed_per_s > 0.95 * w.started_per_s, "{w:#?}");
+
+    // members are activities and children that start together
+    for bad in [
+        "      - parallel: []",
+        "      - parallel:\n          - timer: 1s",
+        "      - parallel:\n          - activity: { count: 2, parallel: false, duration: 1s }",
+        "      - parallel:\n          - parallel:\n              - activity: { duration: 1s }",
+    ] {
+        assert!(with(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn eager_activities_are_only_those_on_the_workers_task_queue() {
+    // the main fleet takes activities eagerly, and the parallel step's first member runs on the
+    // slow task queue, which it doesn't poll
+    let sc = Scenario::parse_str(
+        &FAN_OUT
+            .replace(
+                "activity_slots: 400 }",
+                "activity_slots: 400, eager_activities: true }",
+            )
+            .replace(
+                "namespaces:\n",
+                "dynamic_config:\n  system.enableActivityEagerExecution: [ { value: true } ]\nnamespaces:\n",
+            )
+            .replace(
+                "STEPS",
+                "      - parallel:
+          - activity: { duration: 3s, task_queue: slow }
+          - activity: { count: 2, duration: 1s }",
+            ),
+    )
+    .expect("scenario parses");
+    let r = simulate_scenario(&sc, Overrides::default());
+    let adds = |tq: &str| {
+        r.matching
+            .partitions
+            .iter()
+            .filter(|p| p.task_queue == tq && p.kind == "Activity")
+            .map(|p| p.adds_per_s)
+            .sum::<f64>()
+    };
+    let w = r
+        .workflows
+        .iter()
+        .find(|w| w.workflow_type == "OrderWorkflow")
+        .unwrap();
+    assert!(w.completed_per_s > 0.95 * w.started_per_s, "{w:#?}");
+    // every slow activity goes through matching to the slow fleet
+    assert!(
+        adds("default/slow") > 0.9 * w.started_per_s,
+        "{} adds/s for {} orders/s",
+        adds("default/slow"),
+        w.started_per_s
+    );
+    // while the main fleet takes most of its own three per order eagerly
+    assert!(
+        adds("default/q") < 1.5 * w.started_per_s,
+        "{} adds/s for {} orders/s",
+        adds("default/q"),
+        w.started_per_s
+    );
+}
+
 /// Two tenants on one cluster; `LIMIT` is replaced by dynamic config.
 const TENANTS: &str = r#"
 name: two-tenants

@@ -78,8 +78,13 @@ pub struct ActTimer {
     pub created: bool,
 }
 
-fn step_params(ctx: &Ctx, wf_type: usize, step: usize) -> Option<(ActTimeouts, RetryPolicyP)> {
-    match ctx.p.wf_types[wf_type].steps.get(step) {
+fn step_params(
+    ctx: &Ctx,
+    wf_type: usize,
+    step: usize,
+    member: u8,
+) -> Option<(ActTimeouts, RetryPolicyP)> {
+    match ctx.p.wf_types[wf_type].activity(step, member) {
         Some(StepP::Activity {
             timeouts, retry, ..
         }) => Some((*timeouts, *retry)),
@@ -91,7 +96,7 @@ fn step_params(ctx: &Ctx, wf_type: usize, step: usize) -> Option<(ActTimeouts, R
 pub fn activity_timers(ctx: &Ctx, wf_type: usize, acts: &[ActInfo]) -> Vec<ActTimer> {
     let mut out = Vec::new();
     for a in acts {
-        let Some((t, _)) = step_params(ctx, wf_type, a.step) else {
+        let Some((t, _)) = step_params(ctx, wf_type, a.step, a.member) else {
             continue;
         };
         let started = a.state == ActState::Started;
@@ -170,7 +175,7 @@ pub fn retry_decision(
     timeout: Option<TimeoutKind>,
     now: Time,
 ) -> Next {
-    let Some((t, r)) = step_params(ctx, wf_type, a.step) else {
+    let Some((t, r)) = step_params(ctx, wf_type, a.step, a.member) else {
         return Next::Fail;
     };
     if timeout.is_some_and(|k| !k.retryable()) {
@@ -207,8 +212,8 @@ pub struct TimeoutPlan {
     pub activities: Vec<ActInfo>,
     /// retry timer tasks of retried attempts
     pub tasks: Vec<TaskSpec>,
-    /// steps of the activities that failed for good
-    pub failed_steps: Vec<usize>,
+    /// steps (and members) of the activities that failed for good
+    pub failed_steps: Vec<(usize, u8)>,
     /// timeouts that fired, by kind
     pub fired: [u64; 4],
 }
@@ -256,7 +261,7 @@ pub fn plan_timeouts(
         match retry_decision(ctx, w.wf_type, &acts[i], Some(tm.kind), now) {
             Next::Retry(d) => plan.tasks.push(schedule_retry(&mut acts[i], now, d)),
             Next::Fail => {
-                plan.failed_steps.push(acts[i].step);
+                plan.failed_steps.push((acts[i].step, acts[i].member));
                 acts.remove(i);
             }
         }

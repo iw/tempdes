@@ -371,12 +371,16 @@ fn executions_are_pooled_by_path() {
         ..Default::default()
     };
     let p = program::build(&traces, &opts);
-    // 18 parallel activities, 2 of them with four attempts
-    assert!(
-        p.yaml.contains("attempts: { 1: 0.889, 4: 0.111 }"),
-        "{}",
-        p.yaml
-    );
+    // the three activities started together are members of a parallel step, each with its own
+    // settings: the check takes 200ms, the publish 100ms, and 2 of 6 lookups took four attempts
+    for want in [
+        "      - parallel:\n          # Check: 6 activities in 6 executions\n          - activity:\n              count: 1\n              duration: 200ms\n",
+        "          # Publish: 6 activities in 6 executions\n          - activity:\n              count: 1\n              duration: 100ms\n",
+        "          # Lookup: 6 activities in 6 executions, 33% retried\n",
+        "              attempts: { 1: 0.667, 4: 0.333 }\n",
+    ] {
+        assert!(p.yaml.contains(want), "{want}\n{}", p.yaml);
+    }
     // their earlier attempts ran 100ms: the time before the last attempt less 1s + 2s + 4s of
     // retry intervals and 20ms in the queue per attempt
     assert!(p.yaml.contains("failed_duration: 100ms"), "{}", p.yaml);
@@ -567,6 +571,76 @@ fn timeouts_are_told_apart() {
         p.summary
     );
     simulate("payments", &p.yaml);
+}
+
+#[test]
+fn activities_and_children_started_together_become_a_parallel_step() {
+    // a booking reserves two seats and starts its payment and notification children in the
+    // same workflow task, then completes when all four are done
+    let histories: Vec<String> = (0..4)
+        .map(|i| {
+            let mut h = History::new("BookingWorkflow", f64::from(i) * 5_000.0, i % 2 == 0);
+            let w = h.wft(0.0, 5.0);
+            let seats = [h.schedule(w, "Reserve", 6.0), h.schedule(w, "Reserve", 6.0)];
+            let mut children = Vec::new();
+            for child in ["PaymentWorkflow", "NotifyWorkflow"] {
+                children.push(h.event(
+                    "StartChildWorkflowExecutionInitiated",
+                    6.0,
+                    json!({"workflowType": {"name": child}, "taskQueue": {"name": "orders"}, "workflowTaskCompletedEventId": w.to_string()}),
+                ));
+            }
+            for s in seats {
+                h.run(s, 1, 26.0, 326.0);
+            }
+            for (c, at) in children.iter().zip([500.0, 800.0]) {
+                h.event(
+                    "ChildWorkflowExecutionCompleted",
+                    at,
+                    json!({"initiatedEventId": c.to_string()}),
+                );
+            }
+            h.wft(800.0, 2.0);
+            h.event("WorkflowExecutionCompleted", 803.0, json!({}));
+            h.json()
+        })
+        .collect();
+    let t = trace(&parse_history(&histories[0]).unwrap()).unwrap();
+    let sig: Vec<String> = t.steps.iter().map(Step::signature).collect();
+    assert_eq!(
+        sig,
+        ["activity Reserve + Reserve with child NotifyWorkflow + PaymentWorkflow"]
+    );
+    let p = import(&histories);
+    let want = "      - parallel:
+          # Reserve: 8 activities in 4 executions
+          - activity:
+              count: 2
+              parallel: true
+              duration: 300ms
+";
+    assert!(p.yaml.contains(want), "{want}\n{}", p.yaml);
+    for want in [
+        "          - child_workflow: { workflow_type: \"NotifyWorkflow\", count: 1 }\n",
+        "          - child_workflow: { workflow_type: \"PaymentWorkflow\", count: 1 }\n",
+        // the children's histories weren't given: stubs keep the scenario valid
+        "  - type: \"PaymentWorkflow\"",
+    ] {
+        assert!(p.yaml.contains(want), "{want}\n{}", p.yaml);
+    }
+    // the booking waits for the slowest of the four, the 300ms reservations
+    let r = simulate("payments", &p.yaml);
+    let w = r
+        .workflows
+        .iter()
+        .find(|w| w.workflow_type == "BookingWorkflow")
+        .unwrap();
+    assert!(w.completed_per_s > 0.9 * w.started_per_s, "{w:#?}");
+    assert!(
+        w.e2e.p50_ms > 300.0 && w.e2e.p50_ms < 600.0,
+        "{}ms",
+        w.e2e.p50_ms
+    );
 }
 
 #[test]
