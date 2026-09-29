@@ -349,7 +349,8 @@ Workers follow the Go SDK.
     in one workflow task, and the program moves on once every member's activities and children
     are done. Each activity carries its member, whose settings (duration, attempts, retry
     policy, timeouts, task queue, `on_failure`) apply to it.
-  * Eager activities are requested on `RespondWorkflowTaskCompleted`.
+  * Eager activities are requested on `RespondWorkflowTaskCompleted`, only for activities on
+    the worker's own task queue (`applyToRequest` in the SDK's `internal_eager_activity.go`).
 * **Retries** follow the SDK's gRPC retry interceptor (`internal/common/retry/interceptor.go`).
   * Each call gets one context deadline and every retry happens inside it. The deadline is
     `rpc_timeout` (10 s by default, `defaultRPCTimeout`), set per worker fleet, workflow starter
