@@ -575,3 +575,106 @@ fn activity_retries_go_straight_to_matching() {
         "{transfers} transfer and {retries} retry tasks/s for {attempts} attempts/s"
     );
 }
+
+#[test]
+fn history_persistence_limit_follows_shard_ownership() {
+    // History splits a cluster-wide persistence limit by shard ownership: each pod enforces
+    // global × owned shards ÷ numHistoryShards, not global ÷ pods.
+    let mut ov = short();
+    ov.dc.push((
+        "history.persistenceGlobalMaxQPS".into(),
+        DcValue::Int(9000),
+        Constraints::default(),
+    ));
+    let r = simulate("baseline.yaml", ov);
+    let history = r.services.iter().find(|s| s.service == "history").unwrap();
+    let shards = f64::from(r.history.num_shards);
+    let mut limits = Vec::new();
+    for p in history.pods.iter().filter(|p| p.alive) {
+        let expected = 9000.0 * p.owned as f64 / shards;
+        assert!(
+            (p.persistence_qps_limit - expected).abs() < 1e-6,
+            "{}: {} vs {expected}",
+            p.name,
+            p.persistence_qps_limit
+        );
+        limits.push(p.persistence_qps_limit);
+    }
+    // uneven ownership gives uneven limits, which still add up to the cluster-wide number
+    assert!(
+        (limits.iter().sum::<f64>() - 9000.0).abs() < 1e-6,
+        "{limits:?}"
+    );
+    let max = limits.iter().copied().fold(0.0, f64::max);
+    let min = limits.iter().copied().fold(f64::INFINITY, f64::min);
+    assert!(max > min, "{limits:?}");
+}
+
+/// The history task scheduler's rate limiter at 900 tasks/s for the cluster, well below the
+/// baseline's history task rate.
+fn scheduler_limiter(shadow: bool) -> Overrides {
+    let mut ov = short();
+    for (key, value) in [
+        (
+            "history.taskSchedulerEnableRateLimiter",
+            DcValue::Bool(true),
+        ),
+        (
+            "history.taskSchedulerEnableRateLimiterShadowMode",
+            DcValue::Bool(shadow),
+        ),
+        ("history.taskSchedulerGlobalMaxQPS", DcValue::Int(900)),
+    ] {
+        ov.dc.push((key.into(), value, Constraints::default()));
+    }
+    ov
+}
+
+#[test]
+fn task_scheduler_limiter_in_shadow_mode_only_counts() {
+    let off = simulate("baseline.yaml", short());
+    let shadow = simulate("baseline.yaml", scheduler_limiter(true));
+    let ts = &shadow.history.task_scheduler;
+    assert_eq!(ts.mode, "shadow");
+    assert!(
+        ts.throttled_per_s > 100.0,
+        "{} refusals/s",
+        ts.throttled_per_s
+    );
+    assert!(
+        shadow
+            .hotspots
+            .iter()
+            .any(|h| h.title.contains("shadow mode")),
+        "{:#?}",
+        categories(&shadow)
+    );
+    assert_eq!(off.history.task_scheduler.throttled_per_s, 0.0);
+    // nothing is held back: the run is the same as with the limiter off
+    let (a, b) = (&off.workflows[0], &shadow.workflows[0]);
+    assert_eq!(a.completed_per_s, b.completed_per_s);
+    assert_eq!(a.e2e.p99_ms, b.e2e.p99_ms);
+}
+
+#[test]
+fn task_scheduler_limiter_holds_tasks_back_outside_shadow_mode() {
+    let r = simulate("baseline.yaml", scheduler_limiter(false));
+    let ts = &r.history.task_scheduler;
+    assert_eq!(ts.mode, "on");
+    assert!(ts.throttled_per_s > 0.0);
+    let wait = r
+        .history
+        .tasks
+        .iter()
+        .map(|t| t.schedule.p99_ms)
+        .fold(0.0, f64::max);
+    assert!(wait > 1000.0, "scheduling wait p99 {wait} ms");
+    // a limiter inside the cluster ranks above the delays it causes
+    let top = &r.hotspots[0];
+    assert_eq!(
+        (top.category.as_str(), top.resource.as_str()),
+        ("rate-limit", "history.taskSchedulerGlobalMaxQPS"),
+        "{:#?}",
+        categories(&r)
+    );
+}

@@ -600,6 +600,9 @@ pub fn reset_stats(c: &Ctx) {
             for s in &h.schedulers {
                 s.reset_stats();
             }
+            h.sched_throttled = 0;
+            h.sched_limiter.refused_ns = 0;
+            h.sched_limiter.refused_host = 0;
         }
         if let Some(fe) = p.fe.as_mut() {
             fe.concurrent_max.clear();

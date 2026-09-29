@@ -65,6 +65,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **EKS guide.** [docs/EKS.md](docs/EKS.md) covers each option: a headless Service with SDK
   settings, an ALB for external clients, and frontend connection-age and shutdown settings.
 
+- **History task scheduler rate limiter.** `history.taskSchedulerEnableRateLimiter` and its
+  settings are simulated: namespace and pod buckets per task priority, the cluster-wide rates
+  split by shard ownership, and the fallback to the persistence rate. In shadow mode it counts
+  `task_scheduler_throttled` and holds nothing back, and the report says what it would hold back.
+  Otherwise refused tasks wait in the rescheduler, and a long wait is reported as a rate-limit
+  hotspot.
+
 ### Fixed
 
 - **Schedule-to-start is measured as the SDK measures it.** Workflow task and activity
@@ -78,5 +85,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   matching, as Temporal does. It used to write mutable state and create a transfer task as well,
   which overstated persistence load, history task load and retry latency for workloads with many
   retries.
+- **History persistence limits follow shard ownership.** `history.persistenceGlobalMaxQPS` is
+  split by the shards each pod owns, as in Temporal, instead of evenly across pods. Pods that
+  own more shards get more of the budget, so an even split overstated persistence throttling
+  when ownership was uneven. The JSON report lists each pod's `persistence_qps_limit`.
 
 [Unreleased]: https://github.com/iw/tempdes/commits/main

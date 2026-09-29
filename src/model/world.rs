@@ -15,7 +15,7 @@ use crate::util::lru::Lru;
 
 use super::metrics::Metrics;
 use super::params::Params;
-use super::ratelimit::{PriorityLimiter, TokenBucket};
+use super::ratelimit::{PriorityLimiter, SchedulerLimiter, TokenBucket};
 use super::ring::HashRing;
 use super::servers::FcfsServers;
 use super::types::*;
@@ -66,6 +66,12 @@ pub struct HistoryHostState {
     pub pending_in_scheduler: [TimeGauge; 3],
     pub owned_shards: u32,
     pub shard_acquire: Semaphore,
+    /// the task scheduler's rate limiter (`history.taskSchedulerEnableRateLimiter`)
+    pub sched_limiter: SchedulerLimiter,
+    /// when the pod started (the limiter waits `history.taskSchedulerRateLimiterStartupDelay`)
+    pub started_at: Time,
+    /// tasks the limiter refused (`task_scheduler_throttled`), in shadow mode too
+    pub sched_throttled: u64,
 }
 
 // --- history shards -----------------------------------------------------------------------------

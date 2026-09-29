@@ -252,6 +252,9 @@ pub fn render(ctx: &Ctx) -> String {
         if o.busy_errors > 0 {
             w.counter("task_errors_workflow_busy", &l, o.busy_errors as f64);
         }
+        if o.sched_throttled > 0 {
+            w.counter("task_scheduler_throttled", &l, o.sched_throttled as f64);
+        }
         if o.throttled_errors > 0 {
             w.counter("task_errors_throttled", &l, o.throttled_errors as f64);
         }

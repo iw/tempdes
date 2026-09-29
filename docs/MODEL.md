@@ -141,8 +141,11 @@ These workflow behaviours are simulated:
 **Persistence calls** (`infra::persist`) go through three stages in order:
 
 1. **The pod's persistence priority limiter** (`common/persistence/client/quotas.go`).
-   * The limit is `<service>.persistenceMaxQPS`, or `persistenceGlobalMaxQPS` divided by the
-     number of pods, with burst `system.persistenceQPSBurstRatio`.
+   * The limit is `<service>.persistenceMaxQPS`, or the pod's share of
+     `persistenceGlobalMaxQPS`, with burst `system.persistenceQPSBurstRatio`. History splits
+     the cluster-wide number by shard ownership, `global × owned shards ÷ numHistoryShards`
+     (`service/history/shard/ownership_based_quota_calculator.go`), and re-derives it whenever
+     ownership changes. Frontend and matching divide it by their pod count.
    * Callers have priorities: API calls 1–2, shard management 1, queue loads 3, background
      4–5, preemptable 6.
    * A rejected call fails immediately with `ResourceExhausted` (`PERSISTENCE_LIMIT`), as in
@@ -168,6 +171,19 @@ Transfer, timer and visibility queues follow `service/history/queues/`:
     earliest pending timer (`lookAheadTask`).
 * **Scheduling** (`scheduler.go`): each queue type has `history.*ProcessorSchedulerWorkerCount`
   workers per host (512). High-priority tasks run before low.
+* **The scheduler's rate limiter** (`scheduler_quotas.go`, `common/tasks/rate_limited_scheduler.go`)
+  is off unless `history.taskSchedulerEnableRateLimiter` is set, and then starts
+  `history.taskSchedulerRateLimiterStartupDelay` after the pod.
+  * Each task priority has a namespace bucket and a pod bucket, bursting to twice their rate. A
+    task is admitted only when both have a token, and it also reserves a token at each lower
+    priority.
+  * The pod rate is `history.taskSchedulerGlobalMaxQPS` split by shard ownership, else
+    `history.taskSchedulerMaxQPS`, else the pod's persistence rate. The namespace rate works the
+    same way from the `Namespace` settings, else it is the pod rate.
+  * A refused task counts as `task_scheduler_throttled`. In shadow mode
+    (`history.taskSchedulerEnableRateLimiterShadowMode`, on by default) it runs anyway.
+    Otherwise it goes to the rescheduler (`reader.go`, `rescheduler.go`): it waits the task
+    backoff (1 s × 1.1ⁿ, up to 20% less), then retries every 2 s ± 50% until admitted.
 * **Execution** (`executable.go`):
   * The task takes the workflow lock as a non-API caller, loads mutable state and does its work.
     Examples: `AddWorkflowTask`/`AddActivityTask` to matching, starting a child, firing a
@@ -317,6 +333,9 @@ knobs.
 * DNS caching, TLS handshake cost and cross-AZ effects of the client load-balancing modes.
 * GC pauses and memory pressure.
 * Database-internal contention (row locks, vacuum, compaction).
+* Per-namespace persistence limits (`*.persistenceNamespaceMaxQPS` and their global forms).
+* The minute a new pod runs on its per-pod persistence setting before its limiter first
+  re-reads the cluster-wide share.
 * Kubernetes scheduling and pod restarts other than scaling events.
 
 Dynamic config keys that aren't simulated are still validated, and they appear in reports as
