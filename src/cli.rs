@@ -97,6 +97,9 @@ struct RunArgs {
     /// Write a self-contained HTML report.
     #[arg(long)]
     html: Option<PathBuf>,
+    /// Write the report as Markdown, with GitHub-flavoured tables (`--verbose` applies).
+    #[arg(long)]
+    md: Option<PathBuf>,
     /// Print extra detail (per pod, per shard, per partition).
     #[arg(long, short = 'v')]
     verbose: bool,
@@ -126,6 +129,9 @@ struct SweepArgs {
     /// Write an HTML heatmap report.
     #[arg(long)]
     html: Option<PathBuf>,
+    /// Write sweep results as Markdown tables.
+    #[arg(long)]
+    md: Option<PathBuf>,
 }
 
 #[cfg(feature = "ui")]
@@ -288,6 +294,7 @@ pub fn main() -> anyhow::Result<ExitCode> {
                 a.json.as_deref(),
                 a.csv.as_deref(),
                 a.html.as_deref(),
+                a.md.as_deref(),
             )
         }
         Cmd::Profile { cmd } => cmd_profile(cmd),
@@ -374,6 +381,10 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<ExitCode> {
     }
     if let Some(p) = &a.html {
         std::fs::write(p, crate::report::html::render_run(&result))?;
+        eprintln!("wrote {}", p.display());
+    }
+    if let Some(p) = &a.md {
+        std::fs::write(p, crate::report::markdown::render_run(&result, a.verbose))?;
         eprintln!("wrote {}", p.display());
     }
     let critical = result

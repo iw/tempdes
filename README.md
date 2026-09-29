@@ -123,8 +123,9 @@ tempdes metrics show examples/metrics/observed.yaml
 ```
 
 `run` also writes `--json` (the full result), `--prom` (simulated metrics in Prometheus text
-format with Temporal metric names) and `--html` (a self-contained report with time-series charts
-and a shard map). `-v` prints per-pod, per-shard and per-partition tables. `ui` takes the same
+format with Temporal metric names), `--html` (a self-contained report with time-series charts
+and a shard map) and `--md` (the report as Markdown, with GitHub-flavoured tables for pull
+requests, issues and docs). `-v` prints per-pod, per-shard and per-partition tables. `ui` takes the same
 scenario and overrides and shows the run live in the browser.
 
 ## Dimension 1: replica counts
@@ -269,7 +270,7 @@ Each cell is a full simulation with the same seed. The output includes these gri
 * the top hotspot per cell.
 
 `--csv` and `--json` write every cell. `--html` writes a heatmap you can switch between metrics,
-with per-cell detail.
+with per-cell detail. `--md` writes the same tables as Markdown.
 
 ## Watching a run live
 

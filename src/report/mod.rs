@@ -3,6 +3,7 @@
 //! the dynamic config / replica knobs that influence it.
 
 pub mod html;
+pub mod markdown;
 pub mod prom;
 pub mod rules;
 pub mod text;

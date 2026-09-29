@@ -277,6 +277,7 @@ pub fn cmd_sweep(
     json: Option<&Path>,
     csv: Option<&Path>,
     html: Option<&Path>,
+    md: Option<&Path>,
 ) -> anyhow::Result<ExitCode> {
     let obs = run::load_observations(&sc, observed)?;
     let cal = match obs.clone() {
@@ -411,6 +412,10 @@ pub fn cmd_sweep(
         std::fs::write(p, report::html::render_sweep(&result))?;
         eprintln!("wrote {}", p.display());
     }
+    if let Some(p) = md {
+        std::fs::write(p, report::markdown::render_sweep(&result))?;
+        eprintln!("wrote {}", p.display());
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -439,6 +444,80 @@ fn grid(r: &SweepResult, title: &str, f: &dyn Fn(&Cell) -> String) -> String {
     )
 }
 
+/// The sweep's per-cell views, shared by the text and Markdown renderers: the text heading,
+/// the Markdown heading, and how to show one cell.
+pub(crate) type View = (&'static str, &'static str, fn(&Cell) -> String);
+
+pub(crate) fn views() -> [View; 7] {
+    [
+        (
+            "STATUS (critical/warning hotspot count · top hotspot category)",
+            "Status (critical/warning hotspots · top hotspot category)",
+            |c| {
+                if c.critical + c.warning == 0 {
+                    "OK".into()
+                } else {
+                    format!(
+                        "{} {}c/{}w {}",
+                        c.status(),
+                        c.critical,
+                        c.warning,
+                        c.top_category
+                    )
+                }
+            },
+        ),
+        (
+            "COMPLETED WORKFLOWS / OFFERED STARTS",
+            "Completed workflows / offered starts",
+            |c| {
+                format!(
+                    "{} / {}",
+                    fmt_rate(c.completed_per_s),
+                    fmt_rate(c.offered_per_s)
+                )
+            },
+        ),
+        ("WORKFLOW END-TO-END p99", "Workflow end-to-end p99", |c| {
+            fmt_us(c.e2e_p99_ms * 1e3)
+        }),
+        (
+            "StartWorkflowExecution p99 (client)",
+            "StartWorkflowExecution p99 (client)",
+            |c| fmt_us(c.start_p99_ms * 1e3),
+        ),
+        (
+            "MAX POD CPU  frontend / history / matching",
+            "Max pod CPU: frontend / history / matching",
+            |c| {
+                format!(
+                    "{} / {} / {}",
+                    fmt_pct(*c.cpu_max.get("frontend").unwrap_or(&0.0)),
+                    fmt_pct(*c.cpu_max.get("history").unwrap_or(&0.0)),
+                    fmt_pct(*c.cpu_max.get("matching").unwrap_or(&0.0))
+                )
+            },
+        ),
+        (
+            "DATABASE BUSY · HOTTEST SHARD IO BUSY",
+            "Database busy · hottest shard IO busy",
+            |c| format!("{} · {}", fmt_pct(c.db_util), fmt_pct(c.shard_io_max)),
+        ),
+        ("RATE-LIMIT REJECTIONS /s", "Rate-limit rejections/s", |c| {
+            fmt_rate(c.rejections_per_s)
+        }),
+    ]
+}
+
+/// A cell's status and top hotspot, or its error.
+pub(crate) fn top_hotspot(c: &Cell) -> String {
+    match &c.error {
+        Some(e) => format!("error: {e}"),
+        None if c.top_hotspot.is_empty() => "no hotspots".into(),
+        None => format!("{} {}", c.status(), c.top_hotspot),
+    }
+}
+
 pub fn render_text(r: &SweepResult) -> String {
     let mut o = String::new();
     o.push_str(&format!(
@@ -453,62 +532,17 @@ pub fn render_text(r: &SweepResult) -> String {
             format!(" · base overrides: {}", r.base)
         }
     ));
-    o.push_str(&grid(
-        r,
-        "STATUS (critical/warning hotspot count · top hotspot category)",
-        &|c| {
-            if c.critical + c.warning == 0 {
-                "OK".into()
-            } else {
-                format!(
-                    "{} {}c/{}w {}",
-                    c.status(),
-                    c.critical,
-                    c.warning,
-                    c.top_category
-                )
-            }
-        },
-    ));
-    o.push_str(&grid(r, "COMPLETED WORKFLOWS / OFFERED STARTS", &|c| {
-        format!(
-            "{} / {}",
-            fmt_rate(c.completed_per_s),
-            fmt_rate(c.offered_per_s)
-        )
-    }));
-    o.push_str(&grid(r, "WORKFLOW END-TO-END p99", &|c| {
-        fmt_us(c.e2e_p99_ms * 1e3)
-    }));
-    o.push_str(&grid(r, "StartWorkflowExecution p99 (client)", &|c| {
-        fmt_us(c.start_p99_ms * 1e3)
-    }));
-    o.push_str(&grid(
-        r,
-        "MAX POD CPU  frontend / history / matching",
-        &|c| {
-            format!(
-                "{} / {} / {}",
-                fmt_pct(*c.cpu_max.get("frontend").unwrap_or(&0.0)),
-                fmt_pct(*c.cpu_max.get("history").unwrap_or(&0.0)),
-                fmt_pct(*c.cpu_max.get("matching").unwrap_or(&0.0))
-            )
-        },
-    ));
-    o.push_str(&grid(r, "DATABASE BUSY · HOTTEST SHARD IO BUSY", &|c| {
-        format!("{} · {}", fmt_pct(c.db_util), fmt_pct(c.shard_io_max))
-    }));
-    o.push_str(&grid(r, "RATE-LIMIT REJECTIONS /s", &|c| {
-        fmt_rate(c.rejections_per_s)
-    }));
+    for (title, _, f) in views() {
+        o.push_str(&grid(r, title, &f));
+    }
     o.push_str("\nTOP HOTSPOT PER CELL\n");
     for c in &r.cells {
-        let s = match &c.error {
-            Some(e) => format!("error: {e}"),
-            None if c.top_hotspot.is_empty() => "no hotspots".into(),
-            None => format!("{} {}", c.status(), c.top_hotspot),
-        };
-        o.push_str(&format!("  [{} | {}] {}\n", c.row_label, c.col_label, s));
+        o.push_str(&format!(
+            "  [{} | {}] {}\n",
+            c.row_label,
+            c.col_label,
+            top_hotspot(c)
+        ));
     }
     o.push('\n');
     o

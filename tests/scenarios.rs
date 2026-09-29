@@ -678,3 +678,41 @@ fn task_scheduler_limiter_holds_tasks_back_outside_shadow_mode() {
         categories(&r)
     );
 }
+
+#[test]
+fn markdown_report_covers_the_run() {
+    let r = simulate("db-bound.yaml", short());
+    let md = tempdes::report::markdown::render_run(&r, false);
+    assert!(md.starts_with("# tempdes: "), "{md}");
+    for section in [
+        "## Hotspots",
+        "## Workflows",
+        "## API latency",
+        "## Pods",
+        "## Database",
+        "## History",
+        "## Matching",
+    ] {
+        assert!(md.contains(&format!("\n{section}")), "missing {section}");
+    }
+    let top = &r.hotspots[0];
+    assert!(md.contains(&format!(
+        "### 1. Critical · {} · {}",
+        top.category, top.title
+    )));
+    assert!(md.contains("| OrderWorkflow |"));
+    assert!(!md.contains('\x1b'), "no terminal colour codes");
+    // every table row has as many cells as its header
+    let mut header = None;
+    for line in md.lines() {
+        if !line.starts_with('|') {
+            header = None;
+            continue;
+        }
+        let cells = line.replace("\\|", "").matches('|').count();
+        match header {
+            None => header = Some(cells),
+            Some(n) => assert_eq!(cells, n, "ragged row: {line}"),
+        }
+    }
+}
