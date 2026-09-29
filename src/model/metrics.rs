@@ -75,8 +75,11 @@ pub struct WfStats {
     /// activity timeouts that fired, by kind (start-to-close, schedule-to-start,
     /// schedule-to-close, heartbeat), whether retried or not
     pub activity_timeouts: [u64; 4],
-    /// activities that failed for good: a timeout that is not retried, or retries used up
+    /// activities that failed for good: a timeout that is not retried, retries used up, or a
+    /// non-retryable error
     pub activities_failed: u64,
+    /// of those, activities that failed with a non-retryable error
+    pub activities_non_retryable: u64,
     pub sticky_hits: u64,
     pub sticky_misses: u64,
     /// workflow tasks delivered through the normal queue (first task, after sticky timeouts)

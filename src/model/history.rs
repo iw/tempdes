@@ -67,8 +67,8 @@ pub struct ActTaskInfo {
     pub scheduled_at: Time,
     /// when the activity was first scheduled (the poll response's `ScheduledTime`)
     pub first_scheduled_at: Time,
-    /// attempts the activity makes, the last succeeding (0: fail at the step's failure rate)
-    pub planned_attempts: u32,
+    /// how the activity's attempts go (none: they fail at the step's failure rate)
+    pub plan: super::params::AttemptPlan,
 }
 
 /// Commands produced by a workflow task.
@@ -575,11 +575,11 @@ async fn respond_wft_inner(
                 if eager {
                     eager_left -= 1;
                 }
-                let planned_attempts = match ctx.p.wf_types[wf_type].steps.get(step) {
+                let plan = match ctx.p.wf_types[wf_type].steps.get(step) {
                     Some(super::params::StepP::Activity {
                         attempts: Some(a), ..
                     }) => a.sample(ctx.rand()),
-                    _ => 0,
+                    _ => Default::default(),
                 };
                 w.activities.push(ActInfo {
                     seq,
@@ -597,7 +597,7 @@ async fn respond_wft_inner(
                     last_heartbeat: 0,
                     timers: 0,
                     hb_timer_at: 0,
-                    planned_attempts,
+                    plan,
                 });
                 if eager {
                     eager_out.push(ActTaskInfo {
@@ -609,7 +609,7 @@ async fn respond_wft_inner(
                         step,
                         scheduled_at: t,
                         first_scheduled_at: t,
-                        planned_attempts,
+                        plan,
                     });
                 } else {
                     tasks.push(TaskSpec::now(TaskType::TransferActivityTask, seq, 1));
@@ -762,7 +762,7 @@ pub async fn record_activity_started(
         shard_ready(ctx, pod, shard, deadline).await?;
         let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
-        let (step, scheduled_at, first_scheduled_at, planned_attempts, wf_type) = {
+        let (step, scheduled_at, first_scheduled_at, plan, wf_type) = {
             let wfs = ctx.wfs.borrow();
             let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
             if w.status != WfStatus::Running {
@@ -777,7 +777,7 @@ pub async fn record_activity_started(
                 a.step,
                 a.scheduled_at,
                 a.first_scheduled_at,
-                a.planned_attempts,
+                a.plan,
                 w.wf_type,
             )
         };
@@ -843,7 +843,7 @@ pub async fn record_activity_started(
             step,
             scheduled_at,
             first_scheduled_at,
-            planned_attempts,
+            plan,
         })
     }
     .await;
@@ -854,12 +854,14 @@ pub async fn record_activity_started(
     r
 }
 
-/// RespondActivityTaskCompleted / RespondActivityTaskFailed.
+/// RespondActivityTaskCompleted / RespondActivityTaskFailed; a `non_retryable` failure is not
+/// retried.
 pub async fn respond_activity(
     ctx: &Ctx,
     pod: PodId,
     info: ActTaskInfo,
     failed: bool,
+    non_retryable: bool,
     deadline: Time,
 ) -> Res<()> {
     let caller = Caller::Api(2, ctx.wf_ns(info.wf, info.wgen));
@@ -892,10 +894,17 @@ pub async fn respond_activity(
                 })
                 .ok_or(Err::NotFound)?;
             // RespondActivityTaskFailed: the retry policy decides between a new attempt and
-            // failing the activity
-            match failed.then(|| activity::retry_decision(ctx, w.wf_type, a, None, t0w)) {
-                Some(activity::Next::Retry(d)) => Some(d),
-                _ => None,
+            // failing the activity, unless the failure is non-retryable (`RetryActivity` returns
+            // RETRY_STATE_NON_RETRYABLE_FAILURE, `service/history/workflow/
+            // mutable_state_impl.go`)
+            if !failed || non_retryable {
+                None
+            } else if let activity::Next::Retry(d) =
+                activity::retry_decision(ctx, w.wf_type, a, None, t0w)
+            {
+                Some(d)
+            } else {
+                None
             }
         };
         let gave_up = failed && retry.is_none();
@@ -944,6 +953,9 @@ pub async fn respond_activity(
             ws.activity_failures += 1;
             if gave_up {
                 ws.activities_failed += 1;
+                if non_retryable {
+                    ws.activities_non_retryable += 1;
+                }
             }
         } else {
             ws.activities_completed += 1;

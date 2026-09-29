@@ -14,7 +14,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::parse::{Event, Kind, duration_us, float, get, int, name};
+use serde_json::Value;
+
+use super::parse::{Event, Kind, duration_us, enum_value, float, get, int, name, path};
 
 /// Timeouts at or above a year are how servers fill in "no timeout" (a 10-year default run
 /// timeout, for example); they count as unset.
@@ -41,6 +43,73 @@ pub enum ActOutcome {
     TimedOut,
     Canceled,
     Open,
+}
+
+/// Why an activity's retries stopped, as the server records it on the failure or timeout event
+/// (`RetryState`, from `RetryActivity` in `service/history/workflow/mutable_state_impl.go`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryState {
+    /// a non-retryable error
+    NonRetryable,
+    /// the policy's attempts ran out
+    MaximumAttempts,
+    /// the next attempt would start after schedule-to-close, or a schedule timeout fired
+    Timeout,
+    /// no retry policy: the first failure ends the activity
+    NoPolicy,
+    /// the workflow asked to cancel it
+    CancelRequested,
+    Other,
+}
+
+impl RetryState {
+    fn parse(v: &Value) -> Option<RetryState> {
+        Some(match enum_value(v, "RETRY_STATE_")?.as_str() {
+            "nonretryablefailure" => RetryState::NonRetryable,
+            "maximumattemptsreached" => RetryState::MaximumAttempts,
+            "timeout" => RetryState::Timeout,
+            "retrypolicynotset" => RetryState::NoPolicy,
+            "cancelrequested" => RetryState::CancelRequested,
+            _ => RetryState::Other,
+        })
+    }
+}
+
+/// An activity timeout (`TimeoutType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutType {
+    StartToClose,
+    ScheduleToStart,
+    ScheduleToClose,
+    Heartbeat,
+}
+
+impl TimeoutType {
+    /// The timeout a failure reports (`timeoutFailureInfo.timeoutType`).
+    fn of_failure(failure: &Value) -> Option<TimeoutType> {
+        let t = path(failure, &["timeoutFailureInfo", "timeoutType"])?;
+        match enum_value(t, "TIMEOUT_TYPE_")?.as_str() {
+            "starttoclose" => Some(TimeoutType::StartToClose),
+            "scheduletostart" => Some(TimeoutType::ScheduleToStart),
+            "scheduletoclose" => Some(TimeoutType::ScheduleToClose),
+            "heartbeat" => Some(TimeoutType::Heartbeat),
+            _ => None,
+        }
+    }
+}
+
+/// How an activity's attempts ended, for its attempt plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// the last attempt didn't fail: it completed, was cancelled, or is still running
+    Completed,
+    /// the last attempt failed with a non-retryable error
+    NonRetryable,
+    /// the attempts kept failing until the policy's attempts or schedule-to-close ran out
+    RanOut,
+    /// a task waited in its queue past schedule-to-start: the recorded cluster's queueing, not
+    /// the activity's
+    QueueTimeout,
 }
 
 /// An activity's retry policy as recorded when it was scheduled.
@@ -74,8 +143,51 @@ pub struct Activity {
     pub outcome: ActOutcome,
     pub timeouts: Timeouts,
     pub retry: Option<Retry>,
+    /// why its retries stopped, when it failed for good
+    pub retry_state: Option<RetryState>,
+    /// the timeout that ended it, when it timed out
+    pub timeout_type: Option<TimeoutType>,
+    /// its failure is marked non-retryable (`applicationFailureInfo.nonRetryable`)
+    pub non_retryable_error: bool,
+    /// the timeout that ended the attempt before the last (the started event's `lastFailure`)
+    pub last_failure_timeout: Option<TimeoutType>,
     scheduled_us: i64,
     started_us: Option<i64>,
+}
+
+impl Activity {
+    /// From the first schedule to the final attempt's start: the attempts before it, the retry
+    /// intervals between them, and each attempt's wait in the task queue.
+    pub fn start_gap_us(&self) -> Option<u64> {
+        self.started_us
+            .map(|s| s.saturating_sub(self.scheduled_us).max(0) as u64)
+    }
+
+    /// How its attempts ended: by the recorded retry state, or without one, by its failure and
+    /// retry policy.
+    pub fn ending(&self) -> Ending {
+        if !matches!(self.outcome, ActOutcome::Failed | ActOutcome::TimedOut) {
+            return Ending::Completed;
+        }
+        if self.timeout_type == Some(TimeoutType::ScheduleToStart) {
+            return Ending::QueueTimeout;
+        }
+        match self.retry_state {
+            Some(RetryState::NonRetryable | RetryState::NoPolicy) => Ending::NonRetryable,
+            Some(RetryState::MaximumAttempts | RetryState::Timeout) => Ending::RanOut,
+            Some(RetryState::CancelRequested) => Ending::Completed,
+            _ if self.non_retryable_error => Ending::NonRetryable,
+            _ if self.timeout_type == Some(TimeoutType::ScheduleToClose)
+                || self
+                    .retry
+                    .is_some_and(|r| r.max_attempts > 0 && self.attempts >= r.max_attempts) =>
+            {
+                Ending::RanOut
+            }
+            // it failed with retries left: the failure ended it
+            _ => Ending::NonRetryable,
+        }
+    }
 }
 
 /// A step of a workflow's program.
@@ -255,6 +367,10 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
                             heartbeat: timeout("heartbeatTimeout"),
                         },
                         retry,
+                        retry_state: None,
+                        timeout_type: None,
+                        non_retryable_error: false,
+                        last_failure_timeout: None,
                         scheduled_us: e.time_us,
                         started_us: None,
                     },
@@ -269,6 +385,8 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
                 if let Some(a) = id_of(e, "scheduledEventId").and_then(|s| activities.get_mut(&s)) {
                     a.attempts = get(&e.attrs, "attempt").and_then(int).unwrap_or(1).max(1) as u32;
                     a.started_us = Some(e.time_us);
+                    a.last_failure_timeout =
+                        get(&e.attrs, "lastFailure").and_then(TimeoutType::of_failure);
                     if a.attempts == 1 {
                         t.activity_queue_wait_us
                             .push(e.time_us.saturating_sub(a.scheduled_us).max(0) as u64);
@@ -292,6 +410,13 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
                     a.run_us = a
                         .started_us
                         .map(|s| e.time_us.saturating_sub(s).max(0) as u64);
+                    let failure = get(&e.attrs, "failure");
+                    a.retry_state = get(&e.attrs, "retryState").and_then(RetryState::parse);
+                    a.timeout_type = failure.and_then(TimeoutType::of_failure);
+                    a.non_retryable_error = failure
+                        .and_then(|f| path(f, &["applicationFailureInfo", "nonRetryable"]))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                 }
             }
             Kind::TimerStarted => {

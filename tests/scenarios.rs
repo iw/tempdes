@@ -1081,6 +1081,103 @@ fn attempts_plan_the_retries_of_each_activity() {
     assert!(with("attempts: 0").is_err());
 }
 
+#[test]
+fn non_retryable_errors_end_activities_without_retries() {
+    let with = |plan: &str| {
+        Scenario::parse_str(&RETRY_TAIL.replace(
+            "failure_rate: 0.8, duration: 100ms",
+            &format!("{plan}, duration: 100ms"),
+        ))
+    };
+    let per_s = |r: &RunResult, api: &str| {
+        r.apis
+            .iter()
+            .find(|a| a.api == api)
+            .map_or(0.0, |a| a.per_s)
+    };
+    // 30% are rejected on their first attempt, and fail their workflow; the rest succeed at once
+    let r = simulate_scenario(
+        &with("non_retryable: { 1: 0.3 }").expect("scenario parses"),
+        Overrides::default(),
+    );
+    let w = &r.workflows[0];
+    assert!(
+        (w.failed_per_s / w.started_per_s - 0.3).abs() < 0.05,
+        "{w:#?}"
+    );
+    // every failure is final: no retries
+    assert_eq!(w.activity_failures, w.activities_failed, "{w:#?}");
+    // failures the scenario plans are its outcome, not a hotspot
+    assert_eq!(w.activities_non_retryable, w.activities_failed, "{w:#?}");
+    assert!(
+        !r.hotspots.iter().any(|h| h.category == "activity-timeouts"),
+        "{:?}",
+        r.hotspots.iter().map(|h| &h.title).collect::<Vec<_>>()
+    );
+    // with retried attempts before them: half succeed at once, 20% on their third attempt, and
+    // 30% fail for good on their second, so a failed attempt per activity on average, and 0.7
+    // successes
+    let r = simulate_scenario(
+        &with("attempts: { 1: 0.5, 3: 0.2 }, non_retryable: { 2: 0.3 }, on_failure: continue")
+            .expect("scenario parses"),
+        Overrides::default(),
+    );
+    let ratio = per_s(&r, "RespondActivityTaskFailed") / per_s(&r, "RespondActivityTaskCompleted");
+    assert!((ratio - 1.0 / 0.7).abs() < 0.15, "{ratio}");
+    let w = &r.workflows[0];
+    assert_eq!(w.failed_per_s, 0.0, "on_failure: continue");
+    assert!(w.completed_per_s > 0.95 * w.started_per_s, "{w:#?}");
+    // the plan replaces failure_rate, and with attempt shares it covers every activity
+    assert!(with("failure_rate: 0.5, non_retryable: { 1: 0.1 }").is_err());
+    assert!(with("attempts: { 1: 0.5 }, non_retryable: { 1: 0.1 }").is_err());
+    assert!(with("non_retryable: { 0: 0.1 }").is_err());
+    assert!(with("attempts: 3, non_retryable: { 1: 0.1 }").is_ok());
+}
+
+#[test]
+fn failed_attempts_run_for_their_own_duration() {
+    // three attempts of a 100ms activity, 1s and 2s apart: 3.3s when failures are as quick
+    // as successes, 5.1s when a failed attempt takes 1s
+    let with = |extra: &str| {
+        Scenario::parse_str(&RETRY_TAIL.replace(
+            "failure_rate: 0.8, duration: 100ms",
+            &format!("attempts: 3, duration: 100ms{extra}"),
+        ))
+        .expect("scenario parses")
+    };
+    let p50 = |sc: &Scenario| {
+        simulate_scenario(sc, Overrides::default()).workflows[0]
+            .e2e
+            .p50_ms
+    };
+    let (quick, slow) = (p50(&with("")), p50(&with(", failed_duration: 1s")));
+    assert!(
+        (slow - quick - 1_800.0).abs() < 300.0,
+        "{quick}ms, then {slow}ms"
+    );
+    // failed attempts that hang time out at start-to-close instead of failing
+    let r = simulate_scenario(
+        &with(", failed_duration: 30s, start_to_close_timeout: 2s"),
+        Overrides::default(),
+    );
+    let w = &r.workflows[0];
+    assert!(
+        w.activity_timeouts
+            .get("StartToClose")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "{w:#?}"
+    );
+    assert!(
+        !r.apis
+            .iter()
+            .any(|a| a.api == "RespondActivityTaskFailed" && a.per_s > 0.0),
+        "the worker doesn't respond to an attempt that timed out"
+    );
+    assert!(w.completed_per_s > 0.9 * w.started_per_s, "{w:#?}");
+}
+
 /// Two tenants on one cluster; `LIMIT` is replaced by dynamic config.
 const TENANTS: &str = r#"
 name: two-tenants

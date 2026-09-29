@@ -510,7 +510,7 @@ pub struct RampSpec {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Step {
-    Activity(ActivityStep),
+    Activity(Box<ActivityStep>),
     LocalActivity(LocalActivityStep),
     Timer(DurDist),
     ChildWorkflow(ChildStep),
@@ -537,6 +537,16 @@ pub struct ActivityStep {
     /// the drawn count fail and the last one succeeds, unless the retry policy gives up first.
     #[serde(default)]
     pub attempts: Option<AttemptsSpec>,
+    /// Attempts that end the activity with a non-retryable error, by share: `{ 1: 0.02 }` fails
+    /// 2% of activities on their first attempt. The attempts before the drawn one fail and are
+    /// retried, as with `attempts`. The other activities follow `attempts`: with shares, both
+    /// add up to 1; with a count or none, the count (1 by default) applies to the rest.
+    #[serde(default)]
+    pub non_retryable: Option<BTreeMap<u32, f64>>,
+    /// How long a failed attempt runs before it fails (default `duration`). One that runs past
+    /// `start_to_close_timeout` times out instead.
+    #[serde(default)]
+    pub failed_duration: Option<DurDist>,
     /// Retry policy: initial interval. Unset fields of the policy come from the namespace's
     /// `history.defaultActivityRetryPolicy` (1s initial, coefficient 2, maximum interval 100 ×
     /// initial, unlimited attempts).
@@ -927,6 +937,35 @@ impl Scenario {
                             "workflow {}: set either attempts or failure_rate, not both",
                             w.type_name
                         );
+                        if let Some(m) = &a.non_retryable {
+                            anyhow::ensure!(
+                                !m.is_empty()
+                                    && m.iter().all(|(n, s)| *n >= 1 && s.is_finite() && *s > 0.0),
+                                "workflow {}: non_retryable shares need attempts of at least 1 with positive shares",
+                                w.type_name
+                            );
+                            anyhow::ensure!(
+                                a.failure_rate == 0.0,
+                                "workflow {}: non_retryable plans each activity's attempts, so it can't be combined with failure_rate; give the retried ones under attempts",
+                                w.type_name
+                            );
+                            let failing: f64 = m.values().sum();
+                            match &a.attempts {
+                                Some(AttemptsSpec::Shares(s)) => {
+                                    let total = failing + s.values().sum::<f64>();
+                                    anyhow::ensure!(
+                                        (total - 1.0).abs() <= 0.01,
+                                        "workflow {}: attempts and non_retryable shares add up to {total}, not 1",
+                                        w.type_name
+                                    );
+                                }
+                                _ => anyhow::ensure!(
+                                    failing <= 1.01,
+                                    "workflow {}: non_retryable shares add up to {failing}, more than 1",
+                                    w.type_name
+                                ),
+                            }
+                        }
                         anyhow::ensure!(
                             a.backoff_coefficient.is_none_or(|c| c >= 1.0),
                             "workflow {}: backoff_coefficient cannot be less than 1",

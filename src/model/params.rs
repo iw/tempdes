@@ -417,36 +417,76 @@ impl ActTimeouts {
     }
 }
 
-/// How many attempts each activity of a step makes, drawn when it is scheduled: counts and
-/// their cumulative shares.
+/// How one activity's attempts go, drawn when it is scheduled: the attempts before `attempts`
+/// fail and are retried, and the last succeeds, or fails with a non-retryable error. An attempt
+/// after the last (the last timed out, and was retried) ends the same way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttemptPlan {
+    /// 0: no plan; each attempt fails at the step's failure rate
+    pub attempts: u32,
+    pub non_retryable: bool,
+}
+
+impl AttemptPlan {
+    /// Whether attempt `attempt` fails, and whether its failure is non-retryable; `None` without
+    /// a plan.
+    pub fn outcome(self, attempt: u32) -> Option<(bool, bool)> {
+        (self.attempts > 0).then(|| {
+            let last = attempt >= self.attempts;
+            (!last || self.non_retryable, last && self.non_retryable)
+        })
+    }
+}
+
+/// The attempt plans of a step's activities (`attempts` and `non_retryable`) and their
+/// cumulative shares.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AttemptsP {
-    pub counts: Vec<u32>,
+    pub plans: Vec<AttemptPlan>,
     pub cumulative: Vec<f64>,
 }
 
 impl AttemptsP {
-    pub fn new(spec: &crate::config::scenario::AttemptsSpec) -> AttemptsP {
-        use crate::config::scenario::AttemptsSpec;
-        let pairs: Vec<(u32, f64)> = match spec {
-            AttemptsSpec::Count(n) => vec![((*n).max(1), 1.0)],
-            AttemptsSpec::Shares(m) => m.iter().map(|(n, s)| ((*n).max(1), *s)).collect(),
+    /// `None` when neither field is set.
+    pub fn new(
+        attempts: Option<&AttemptsSpec>,
+        non_retryable: Option<&BTreeMap<u32, f64>>,
+    ) -> Option<AttemptsP> {
+        let plan = |n: u32, non_retryable| AttemptPlan {
+            attempts: n.max(1),
+            non_retryable,
         };
+        let failing: Vec<(AttemptPlan, f64)> = non_retryable
+            .into_iter()
+            .flatten()
+            .map(|(n, s)| (plan(*n, true), *s))
+            .collect();
+        let rest = 1.0 - failing.iter().map(|p| p.1).sum::<f64>();
+        let mut pairs: Vec<(AttemptPlan, f64)> = match (attempts, non_retryable) {
+            (None, None) => return None,
+            (Some(AttemptsSpec::Shares(m)), _) => {
+                m.iter().map(|(n, s)| (plan(*n, false), *s)).collect()
+            }
+            (Some(AttemptsSpec::Count(n)), _) => vec![(plan(*n, false), rest)],
+            (None, Some(_)) => vec![(plan(1, false), rest)],
+        };
+        pairs.extend(failing);
+        pairs.retain(|p| p.1 > 0.0);
         let total: f64 = pairs.iter().map(|p| p.1).sum();
         let mut acc = 0.0;
-        let (mut counts, mut cumulative) = (Vec::new(), Vec::new());
-        for (n, s) in pairs {
+        let (mut plans, mut cumulative) = (Vec::new(), Vec::new());
+        for (p, s) in pairs {
             acc += s / total;
-            counts.push(n);
+            plans.push(p);
             cumulative.push(acc);
         }
-        AttemptsP { counts, cumulative }
+        Some(AttemptsP { plans, cumulative })
     }
 
-    /// The count at uniform draw `u` in [0, 1).
-    pub fn sample(&self, u: f64) -> u32 {
+    /// The plan at uniform draw `u` in [0, 1).
+    pub fn sample(&self, u: f64) -> AttemptPlan {
         let i = self.cumulative.partition_point(|&c| c <= u);
-        self.counts[i.min(self.counts.len() - 1)]
+        self.plans[i.min(self.plans.len() - 1)]
     }
 }
 
@@ -488,8 +528,10 @@ pub enum StepP {
         /// heartbeat interval of the activity code
         heartbeat: Option<Time>,
         failure_rate: f64,
-        /// attempts per activity, drawn when scheduled (instead of `failure_rate`)
+        /// attempt plans, one drawn per activity when scheduled (instead of `failure_rate`)
         attempts: Option<AttemptsP>,
+        /// how long a failed attempt runs (default `duration`)
+        failed_duration: Option<Box<Dist>>,
         retry: RetryPolicyP,
         timeouts: ActTimeouts,
         on_failure: OnFailure,
@@ -1246,6 +1288,18 @@ impl Params {
                             .duration
                             .build()
                             .map_err(|e| anyhow::anyhow!("{}: {e}", w.type_name))?;
+                        let failed_duration = a
+                            .failed_duration
+                            .as_ref()
+                            .map(|d| d.build())
+                            .transpose()
+                            .map_err(|e| {
+                                anyhow::anyhow!("{}: failed_duration: {e}", w.type_name)
+                            })?;
+                        let longest_p99 = failed_duration
+                            .as_ref()
+                            .map_or(0.0, |d| d.quantile(0.99))
+                            .max(duration.quantile(0.99));
                         let heartbeat = a.heartbeat.map(|d| d.us().max(1_000));
                         let timeouts = ActTimeouts::normalize(
                             a.schedule_to_start_timeout.map(|d| d.us()),
@@ -1254,8 +1308,9 @@ impl Params {
                             a.heartbeat_timeout
                                 .map(|d| d.us())
                                 .or(heartbeat.map(|h| h * 2)),
-                            // no timeouts given: 10 × the duration's p99, 10s–1h
-                            (duration.quantile(0.99) * 10.0).clamp(10.0e6, 3_600.0e6) as Time,
+                            // no timeouts given: 10 × the p99 of an attempt (successful or
+                            // failed), 10s–1h
+                            (longest_p99 * 10.0).clamp(10.0e6, 3_600.0e6) as Time,
                         );
                         let initial = a
                             .retry_initial
@@ -1277,7 +1332,8 @@ impl Params {
                             duration,
                             heartbeat,
                             failure_rate: a.failure_rate,
-                            attempts: a.attempts.as_ref().map(AttemptsP::new),
+                            attempts: AttemptsP::new(a.attempts.as_ref(), a.non_retryable.as_ref()),
+                            failed_duration: failed_duration.map(Box::new),
                             retry,
                             timeouts,
                             on_failure: a.on_failure,

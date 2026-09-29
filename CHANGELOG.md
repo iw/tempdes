@@ -126,6 +126,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   step sets how many attempts each activity makes, instead of failing every attempt at
   `failure_rate`. A per-attempt failure rate gives a geometric number of attempts with a long
   tail; a status poll that always takes about five attempts doesn't have one.
+- **Non-retryable failures and failed-attempt durations.**
+  - `non_retryable: { 1: 0.02 }` on an activity step fails that share of activities on the given
+    attempt with a non-retryable error. The server doesn't retry it: `RetryActivity` returns
+    `RETRY_STATE_NON_RETRYABLE_FAILURE`. The report counts these failures apart
+    (`activities_non_retryable`) and doesn't raise them as hotspots, since they are the
+    workload's outcome.
+  - `failed_duration` sets how long a failed attempt runs. Quick rejections, and attempts that
+    hang until their start-to-close timeout, can then differ from successful attempts.
+- **`workload import` reads why retries stopped.**
+  - An activity's recorded retry state decides its plan:
+    - non-retryable failures become `non_retryable`;
+    - activities whose retries ran out get an attempt count they can't reach;
+    - schedule-to-start timeouts, the recorded cluster's queueing, are left out.
+  - The run time of the failed attempts before the last is estimated and written as
+    `failed_duration`: the time before the last attempt, less the retry intervals and queue
+    waits.
+  - Attempt shares are written to three significant digits, so rare counts aren't rounded to 0.
 
 ### Fixed
 

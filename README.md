@@ -405,9 +405,19 @@ inferred. Both export spellings are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` a
   throttled dispatch) are reported in the summary and left out, because a history from a busy
   cluster would otherwise build its queueing into the workload.
 * **Attempts, retry policies and timeouts are as recorded.** A history keeps only an activity's
-  final attempt, with its number, so `attempts` gets the recorded counts, and the failed attempts
-  are assumed to take as long as successful ones. Heartbeats aren't recorded, so an activity
-  with a heartbeat timeout is assumed to heartbeat at the Go SDK's throttle, 0.8 × the timeout.
+  final attempt, with its number and why its retries stopped. So `attempts` gets the recorded
+  counts, `non_retryable` the activities that ended with a non-retryable error, and an activity
+  whose retries ran out (its policy's attempts, or schedule-to-close) gets an attempt count it
+  can't reach. An activity that waited in its queue past its schedule-to-start timeout is the
+  recorded cluster's queueing, and is left out of the plans.
+* **Failed attempts' durations are estimated.** The attempts before the last aren't recorded.
+  Their run time is the time from scheduling to the last attempt's start, less the retry
+  intervals of the policy and a typical queue wait per attempt; when the last attempt's
+  `lastFailure` is a start-to-close timeout, the attempt before it ran to the timeout. With the
+  run times of failed final attempts, they make `failed_duration`. Retry delays an activity
+  sets itself (`NextRetryDelay`) aren't recorded, so the estimate assumes the policy's intervals.
+* **Heartbeats aren't recorded,** so an activity with a heartbeat timeout is assumed to
+  heartbeat at the Go SDK's throttle, 0.8 × the timeout.
 * **Paths.** Executions of a type that took the same steps are pooled. A path taken by at least
   5% of them (`--min-path-share`) becomes a workflow type of its own (`OrderWorkflow~2`) with its
   share of the start rate; rarer paths are folded into the most common.
@@ -419,10 +429,8 @@ inferred. Both export spellings are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` a
 
 Not modelled, and counted in the summary: updates, Nexus operations, search attribute upserts,
 markers other than local activities, and continue-as-new (each run is imported as its own
-execution). Parallel activities of different types are pooled into one distribution; an
-activity that failed without using up its retries (a non-retryable error) is imported as
-succeeding on its last attempt; and a child type whose histories weren't given is written as a
-stub with no steps.
+execution). Parallel activities of different types are pooled into one distribution, and a
+child type whose histories weren't given is written as a stub with no steps.
 
 ## Saved run profiles
 
@@ -568,7 +576,8 @@ workflows:
                     start_to_close_timeout: 2m, schedule_to_start_timeout: 1m,
                     retry_initial: 1s, backoff_coefficient: 2, max_interval: 1m, max_attempts: 5,
                     on_failure: fail }     # fail | continue: when an activity fails for good
-      - activity: { count: 1, duration: 3s, attempts: { 1: 0.8, 5: 0.2 } }   # instead of failure_rate
+      - activity: { count: 1, duration: 3s, attempts: { 1: 0.8, 5: 0.18 },   # instead of failure_rate
+                    non_retryable: { 1: 0.02 }, failed_duration: 200ms }
       - local_activity: { count: 1, duration: 5ms }
       - timer: 2s
       - child_workflow: { workflow_type: ShipmentWorkflow, count: 1 }
@@ -611,8 +620,9 @@ client waiting for a result (`await_result`) long-polls the history for up to 65
 maximum interval of 100 × the initial one, unlimited attempts), as the server fills them in.
 Timeouts are filled in as the server does: a schedule-to-close timeout bounds the others and
 stands in for those not given, and the heartbeat timeout never exceeds start-to-close. An
-activity with neither schedule-to-close nor start-to-close gets a start-to-close of ten times its
-duration's p99, between 10s and 1h (a real SDK would refuse to schedule it), and an activity
+activity with neither schedule-to-close nor start-to-close gets a start-to-close of ten times the
+p99 of its `duration` or `failed_duration`, whichever is longer, between 10s and 1h (a real SDK
+would refuse to schedule it), and an activity
 that heartbeats without a `heartbeat_timeout` gets twice its heartbeat interval. Schedule-to-start
 and schedule-to-close timeouts fail the activity; start-to-close and heartbeat timeouts retry the
 attempt while the policy allows. An activity that fails for good fails its workflow, unless
@@ -621,8 +631,15 @@ the step says `on_failure: continue`.
 `failure_rate` fails each attempt independently, which gives a geometric number of attempts with
 a long tail. `attempts` instead sets how many attempts each activity makes, a count or shares
 by count (`{ 1: 0.8, 5: 0.2 }`): the attempts before the drawn count fail and the last one
-succeeds, unless the retry policy gives up first. It is what `workload import` writes, because a
-history records each activity's attempt count.
+succeeds, unless the retry policy gives up first. `non_retryable` adds activities whose last
+attempt fails with a non-retryable error, by that attempt (`{ 1: 0.02 }`), which the server
+doesn't retry. With shares, `attempts` and `non_retryable` add up to 1; with a count or none,
+the count (1 by default) applies to the other activities. The report counts non-retryable
+failures apart from the others and doesn't raise them as hotspots: they are the scenario's
+outcome, not a symptom. `failed_duration` sets how long a failed attempt runs (by default
+`duration`): quick rejections run shorter, and attempts that hang past
+`start_to_close_timeout` time out instead of failing. These are what `workload import` writes,
+because a history records each activity's attempt count and why its retries stopped.
 
 ## Example scenarios
 

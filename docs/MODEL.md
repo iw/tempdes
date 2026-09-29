@@ -278,6 +278,10 @@ History enforces activity timeouts with timer tasks, as Temporal does
   * The write records the outcome. A failed activity adds history events and a workflow task.
 * **Stale attempts.** A worker's heartbeat, completion or failure for an attempt that has timed
   out is rejected with `NotFound`, as a stale task token is.
+* **Non-retryable failures.** A `RespondActivityTaskFailed` whose failure is non-retryable fails
+  the activity without consulting the retry policy: `RetryActivity` returns
+  `RETRY_STATE_NON_RETRYABLE_FAILURE` (`service/history/workflow/mutable_state_impl.go`) and
+  `respondactivitytaskfailed/api.go` records the failure and schedules a workflow task.
 * **The workflow's reaction.** An activity that fails for good fails its workflow, as a Go
   workflow returning the error does, unless the step says `on_failure: continue`.
 * Timeouts are counted by kind; the server metrics for activities that fail on them are
@@ -352,8 +356,11 @@ Workers follow the Go SDK.
     retry options (`internal_task_pollers.go`), and the poller loop polls again.
   * Client latency includes the retries.
 * **Activities** run for a duration drawn from the step, heartbeating every `heartbeat`. An
-  attempt fails at the step's `failure_rate`, or, with `attempts`, when it comes before the
-  count drawn for the activity when history scheduled it. The
+  attempt fails at the step's `failure_rate`, or by the plan drawn for the activity when history
+  scheduled it (`attempts` and `non_retryable`): the attempts before the drawn one fail and are
+  retried, and the drawn one succeeds, or fails with a non-retryable error. A failed attempt
+  runs for a duration drawn from `failed_duration` when the step sets it; with `failure_rate`,
+  the failure is then drawn before the duration rather than after it. The
   SDK gives the activity a context that ends at the earlier of start-to-close from its start
   and schedule-to-close from its first schedule (`calculateActivityDeadline`). The activity is
   assumed to honour it: it stops there, and the SDK drops the result without responding
@@ -398,9 +405,25 @@ Workers follow the Go SDK.
   `WorkflowTaskCompleted`. Schedule-to-start and retry gaps are cluster waits: the importer
   reports them but the simulation produces its own.
 * **Attempts.** A history records only an activity's final attempt, with its number
-  (`ActivityTaskStarted.attempt`), so the step's `attempts` are those counts. An activity that
-  failed for good after using up `maximumAttempts` is counted as needing one more, so the
-  simulated retry policy gives up on it too.
+  (`ActivityTaskStarted.attempt`, written when the activity closes, with the attempt's own start
+  time: `addStartedEventForTransientActivity` in `mutable_state_impl.go`). The failure or
+  timeout event records why the retries stopped (`retryState`, from `RetryActivity`):
+  * completed at attempt n: `attempts` n;
+  * `NON_RETRYABLE_FAILURE` (or `RETRY_POLICY_NOT_SET`): `non_retryable` at n;
+  * `MAXIMUM_ATTEMPTS_REACHED`, or `TIMEOUT` from schedule-to-close: an attempt count it can't
+    reach, one past `maximumAttempts` or the first that the retry intervals alone would start
+    after schedule-to-close, so the simulated policy or timeout stops it too;
+  * `TIMEOUT` from schedule-to-start: the recorded cluster's queueing, left out of the plans.
+
+  Without a recorded retry state, a non-retryable application failure, a schedule-to-close
+  timeout or `attempt` ≥ `maximumAttempts` decides, and otherwise the failure ended it.
+* **Failed attempts' durations.** The attempts before the last aren't recorded. Their total run
+  time is the time from `ActivityTaskScheduled` to the last `ActivityTaskStarted`, less the
+  policy's retry intervals (`nextBackoffInterval`) and the median first-attempt queue wait of
+  the step (or of the workflow type) per attempt, shared equally. When the last attempt's
+  `lastFailure` is a start-to-close timeout, the attempt before it ran for the timeout. With the
+  run times of failed final attempts, they make the step's `failed_duration`. Retry delays set
+  by the activity (`NextRetryDelay`) aren't recorded and are assumed to be the policy's.
 * **Retry policy and timeouts** come from `ActivityTaskScheduled`, with timeouts of a year or
   more (how servers fill in "none") treated as unset.
 * **Pooling.** Executions of a type that took the same steps are pooled per step. Paths taken by
@@ -450,8 +473,9 @@ knobs.
   * *not keeping up*: workflows close (complete or fail) more slowly than a healthy cluster
     would close them. The expected rate comes from the workflow's own run time, sampled 2,000
     times from its steps, and from the warm-up.
-    * Each sample includes activity durations, failed attempts and the retry policy's
-      intervals, timers, children, signal timeouts and a workflow task per step.
+    * Each sample includes activity durations, failed attempts (with `failed_duration` when
+      set, and ending the activity when non-retryable) and the retry policy's intervals,
+      timers, children, signal timeouts and a workflow task per step.
     * With starts at a steady rate from time zero, a healthy cluster closes, at each moment of
       the window, the workflows started at least their run time earlier.
     * So a long retry tail counts: with intervals that double up to 100 s, a few runs take
@@ -462,7 +486,10 @@ knobs.
     Workflows with no known run time (waiting for signals without a timeout) get only the start
     test.
 * **Activity timeouts.** Timeouts that fired, by kind, are an `activity-timeouts` hotspot:
-  critical when activities failed for good or more than 1% of attempts timed out.
+  critical when activities failed for good or more than 1% of attempts timed out. Workflows
+  failing as activities run out of retries are critical too. Activities that fail with a
+  non-retryable error, as the scenario plans, are counted apart and raise neither: they are the
+  workload's outcome, not a symptom.
 * **Causal ranking.** After detection, a causal pass re-ranks results:
   * when polls are rejected, the frontend or matching limiter that rejects them outranks the
     worker schedule-to-start latency and the matching backlog they cause;
