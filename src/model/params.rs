@@ -271,6 +271,10 @@ pub struct NsParams {
     pub fe_vis_burst_ratio: f64,
     pub enable_eager_start: bool,
     pub enable_eager_activity: bool,
+    /// `history.taskSchedulerNamespaceMaxQPS` (per pod) and
+    /// `history.taskSchedulerGlobalNamespaceMaxQPS` (cluster-wide); 0 = fall back
+    pub task_sched_ns_max_qps: f64,
+    pub task_sched_global_ns_max_qps: f64,
     pub default_wft_timeout: Time,
     pub history_long_poll: Time,
     pub per_ns_worker_count: u32,
@@ -299,6 +303,13 @@ pub struct Knobs {
     pub cache_non_user_lock_timeout: Time,
     pub events_cache_max_bytes: f64,
     pub scheduler_workers: [u32; 3],
+    /// history task scheduler rate limiter: `history.taskSchedulerEnableRateLimiter`, shadow
+    /// mode, startup delay, and the per-pod and cluster-wide rates (0 = fall back)
+    pub task_sched_enabled: bool,
+    pub task_sched_shadow: bool,
+    pub task_sched_startup_delay: Time,
+    pub task_sched_max_qps: f64,
+    pub task_sched_global_max_qps: f64,
     pub task_batch: [u32; 3],
     pub max_poll_rps: [f64; 3],
     pub max_poll_host_rps: [f64; 3],
@@ -510,6 +521,13 @@ pub const MODELED_KEYS: &[&str] = &[
     "history.transferProcessorSchedulerWorkerCount",
     "history.timerProcessorSchedulerWorkerCount",
     "history.visibilityProcessorSchedulerWorkerCount",
+    "history.taskSchedulerEnableRateLimiter",
+    "history.taskSchedulerEnableRateLimiterShadowMode",
+    "history.taskSchedulerRateLimiterStartupDelay",
+    "history.taskSchedulerMaxQPS",
+    "history.taskSchedulerGlobalMaxQPS",
+    "history.taskSchedulerNamespaceMaxQPS",
+    "history.taskSchedulerGlobalNamespaceMaxQPS",
     "history.transferTaskBatchSize",
     "history.timerTaskBatchSize",
     "history.visibilityTaskBatchSize",
@@ -620,6 +638,12 @@ impl Params {
                     .max(1.0),
                 enable_eager_start: dc.boolean("system.enableEagerWorkflowStart", &p, true),
                 enable_eager_activity: dc.boolean("system.enableActivityEagerExecution", &p, false),
+                task_sched_ns_max_qps: dc.int("history.taskSchedulerNamespaceMaxQPS", &p, 0) as f64,
+                task_sched_global_ns_max_qps: dc.int(
+                    "history.taskSchedulerGlobalNamespaceMaxQPS",
+                    &p,
+                    0,
+                ) as f64,
                 default_wft_timeout: dur_t(dc.duration_us(
                     "history.defaultWorkflowTaskTimeout",
                     &p,
@@ -695,6 +719,19 @@ impl Params {
                 dc.int("history.visibilityProcessorSchedulerWorkerCount", &g, 512)
                     .max(1) as u32,
             ],
+            task_sched_enabled: dc.boolean("history.taskSchedulerEnableRateLimiter", &g, false),
+            task_sched_shadow: dc.boolean(
+                "history.taskSchedulerEnableRateLimiterShadowMode",
+                &g,
+                true,
+            ),
+            task_sched_startup_delay: dur_t(dc.duration_us(
+                "history.taskSchedulerRateLimiterStartupDelay",
+                &g,
+                5.0 * SEC,
+            )),
+            task_sched_max_qps: dc.int("history.taskSchedulerMaxQPS", &g, 0) as f64,
+            task_sched_global_max_qps: dc.int("history.taskSchedulerGlobalMaxQPS", &g, 0) as f64,
             task_batch: [
                 dc.int("history.transferTaskBatchSize", &g, 100).max(1) as u32,
                 dc.int("history.timerTaskBatchSize", &g, 100).max(1) as u32,

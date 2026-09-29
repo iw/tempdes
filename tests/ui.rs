@@ -247,10 +247,16 @@ fn engine_applies_live_changes() {
     assert!(engine.send(Command::Resume));
     wait_for(&engine, "resume", |f| !f.paused && f.t > t_pause);
 
-    // restart with another seed starts a new run from t = 0
+    // Restart with another seed starts a new run from t = 0. The engine runs as fast as it can,
+    // so by the first frame we see, run 2 can be seconds in: compare with where run 1 was.
+    let t_run1 = engine.latest().t;
     assert!(engine.send(Command::Restart(Some(11))));
     let f = wait_for(&engine, "run 2", |f| f.run == 2);
-    assert!(f.t < 5.0, "run 2 started over (t={})", f.t);
+    assert!(
+        f.t < t_run1,
+        "run 2 started over (t={} after run 1 reached {t_run1})",
+        f.t
+    );
     assert_eq!(f.load_scale, 2.0, "the load multiplier carries over");
     assert_eq!(
         f.services[1].replicas, 3,

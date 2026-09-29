@@ -162,6 +162,7 @@ pub fn detect(ctx: &Ctx, r: &RunResult) -> Vec<Hotspot> {
     shards(&c, &mut out);
     locks(&c, &mut out);
     queues(&c, &mut out);
+    task_scheduler(&c, &mut out);
     matching(&c, &mut out);
     limits(&c, &mut out);
     headroom(&c, &mut out);
@@ -816,6 +817,128 @@ fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     }
 }
 
+/// The history task scheduler's rate limiter. In shadow mode it only counts, so report what it
+/// would hold back, which is how the limits are sized. Enforced, a refused task waits in the
+/// rescheduler, which is the point of the limiter; the wait is what can become a problem.
+fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
+    let h = &c.r.history;
+    let ts = &h.task_scheduler;
+    if ts.mode == "off" || ts.throttled_per_s <= 0.0 {
+        return;
+    }
+    let (k, namespaces) = (&c.ctx.p.k, &c.ctx.p.namespaces);
+    // Without a namespace limit the namespace bucket runs at the pod rate and, being checked
+    // first, does the refusing: name a namespace setting only when one is set.
+    let ns_limit = namespaces
+        .iter()
+        .any(|n| n.task_sched_global_ns_max_qps > 0.0 || n.task_sched_ns_max_qps > 0.0);
+    let resource = if ns_limit && ts.refused_by_namespace > ts.refused_by_pod {
+        if namespaces
+            .iter()
+            .any(|n| n.task_sched_global_ns_max_qps > 0.0)
+        {
+            "history.taskSchedulerGlobalNamespaceMaxQPS"
+        } else {
+            "history.taskSchedulerNamespaceMaxQPS"
+        }
+    } else if k.task_sched_global_max_qps > 0.0 {
+        "history.taskSchedulerGlobalMaxQPS"
+    } else {
+        "history.taskSchedulerMaxQPS"
+    };
+    let mut by_type: Vec<&TaskResult> = h
+        .tasks
+        .iter()
+        .filter(|t| t.sched_throttled_per_s > 0.0)
+        .collect();
+    by_type.sort_by(|a, b| b.sched_throttled_per_s.total_cmp(&a.sched_throttled_per_s));
+    let mut evidence = vec![format!(
+        "pod limit {:.0}–{:.0} tasks/s{}",
+        ts.pod_qps_min,
+        ts.pod_qps_max,
+        if k.task_sched_global_max_qps > 0.0 {
+            " (the cluster-wide setting, split by shard ownership)"
+        } else if k.task_sched_max_qps > 0.0 {
+            ""
+        } else {
+            " (no scheduler rate set: the pod's persistence rate)"
+        }
+    )];
+    if let Some((pod, rate)) = &ts.busiest_pod {
+        evidence.push(format!("{pod}: {rate:.0}/s refused"));
+    }
+    if ns_limit {
+        evidence.push(format!(
+            "refused by the namespace limit {} times, by the pod limit {} times",
+            ts.refused_by_namespace, ts.refused_by_pod
+        ));
+    }
+    for t in by_type.iter().take(3) {
+        evidence.push(format!(
+            "{}: {:.0}/s refused of {:.0}/s run",
+            t.task_type, t.sched_throttled_per_s, t.per_s
+        ));
+    }
+    let knobs = vec![
+        c.knob(
+            "history.taskSchedulerGlobalMaxQPS",
+            "task starts/s for the cluster, split by shard ownership",
+        ),
+        c.knob(
+            "history.taskSchedulerGlobalNamespaceMaxQPS",
+            "the same, per namespace",
+        ),
+        c.knob(
+            "history.taskSchedulerEnableRateLimiterShadowMode",
+            "true counts refusals without holding tasks back",
+        ),
+    ];
+    if ts.mode == "shadow" {
+        out.push(hs(
+            Severity::Info,
+            "history-queue",
+            resource.into(),
+            format!(
+                "task scheduler limiter (shadow mode) would hold back {:.0} task runs/s ({:.2} per task run)",
+                ts.throttled_per_s, ts.throttled_per_task
+            ),
+            "Shadow mode counts task_scheduler_throttled but holds nothing back. Out of shadow mode, each refused task would wait in the rescheduler (about 1s, then every 2s) until the limiter admits it. Size the limits from this count before turning shadow mode off.".into(),
+            evidence,
+            &["task_scheduler_throttled", "task_requests"],
+            knobs,
+            20.0 + 20.0 * ts.throttled_per_task.min(1.0),
+        ));
+        return;
+    }
+    let wait_p99 = h
+        .tasks
+        .iter()
+        .map(|t| t.schedule.p99_ms)
+        .fold(0.0, f64::max);
+    evidence.insert(0, format!("task scheduling wait p99 {}", ms(wait_p99)));
+    let sev = if wait_p99 > 5000.0 {
+        Severity::Critical
+    } else if wait_p99 > 1000.0 {
+        Severity::Warning
+    } else {
+        Severity::Info
+    };
+    out.push(hs(
+        sev,
+        "rate-limit",
+        resource.into(),
+        format!(
+            "{resource}: tasks held back ({:.0} refusals/s, {:.2} per task run)",
+            ts.throttled_per_s, ts.throttled_per_task
+        ),
+        "The task scheduler's rate limiter: a refused task waits in the rescheduler (about 1s, then every 2s) until the limiter admits it. Some waiting is the point; a long wait delays dispatch, timers and retries.".into(),
+        evidence,
+        &["task_scheduler_throttled", "task_latency_schedule"],
+        knobs,
+        40.0 + wait_p99 / 200.0,
+    ));
+}
+
 fn matching(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     let m = &c.r.matching;
     // backlogged partitions
@@ -965,7 +1088,17 @@ fn limits(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             l if l.ends_with(".persistenceMaxQPS") => (
                 "Persistence priority rate limiter on the pod: calls fail immediately with PERSISTENCE_LIMIT (no waiting). Queue tasks back off for seconds; API calls surface ResourceExhausted.".into(),
                 vec!["persistence_errors_resource_exhausted", "task_errors_throttled"],
-                vec![c.knob(l, "per-host persistence QPS"), c.knob(&l.replace("persistenceMaxQPS", "persistenceGlobalMaxQPS"), "cluster-wide / #hosts")],
+                vec![
+                    c.knob(l, "per-host persistence QPS"),
+                    c.knob(
+                        &l.replace("persistenceMaxQPS", "persistenceGlobalMaxQPS"),
+                        if l.starts_with("history.") {
+                            "cluster-wide, split by shard ownership"
+                        } else {
+                            "cluster-wide / #hosts"
+                        },
+                    ),
+                ],
             ),
             "matching.outstandingTaskAppendsThreshold" => (
                 "Matching task writer buffer overflow.".into(),
@@ -1477,11 +1610,13 @@ fn rank_poll_limiters(out: &mut [Hotspot], poll_rejects: u64) {
     }
 }
 
-/// Limiters inside the cluster: history and matching host RPS, and persistence QPS.
+/// Limiters inside the cluster: history and matching host RPS, persistence QPS, and the history
+/// task scheduler's rate limiter (whose hotspot is a rate limit only when it is enforced).
 fn is_internal_limiter(resource: &str) -> bool {
     resource == "history.rps"
         || resource == "matching.rps"
         || resource.ends_with(".persistenceMaxQPS")
+        || resource.starts_with("history.taskScheduler")
 }
 
 /// When `history.rps`, `matching.rps` or a persistence limit rejects calls, the retries and

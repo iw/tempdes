@@ -134,6 +134,9 @@ pub struct PodResult {
     pub rejections: u64,
     /// offered requests / effective rate limit, per limiter on this pod
     pub limit_util: Vec<(String, f64)>,
+    /// the pod's effective persistence limit in calls/s (history: its share of a cluster-wide
+    /// limit, by shard ownership); 0 when unlimited
+    pub persistence_qps_limit: f64,
 }
 
 impl PodResult {
@@ -211,6 +214,27 @@ pub struct TaskResult {
     pub throttled_retries: u64,
     pub throttled_by: BTreeMap<String, u64>,
     pub other_retries: u64,
+    /// the task scheduler limiter's refusals (`task_scheduler_throttled`) per second
+    pub sched_throttled_per_s: f64,
+}
+
+/// The history task scheduler's rate limiter (`history.taskSchedulerEnableRateLimiter`).
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskSchedulerResult {
+    /// `off`, `shadow` (counts refusals, holds nothing back) or `on`
+    pub mode: String,
+    /// refusals per second (`task_scheduler_throttled`): would-be refusals in shadow mode
+    pub throttled_per_s: f64,
+    /// refusals per task run; above 1 when refused tasks are retried and refused again
+    pub throttled_per_task: f64,
+    /// the pod limit in tasks/s, across history pods
+    pub pod_qps_min: f64,
+    pub pod_qps_max: f64,
+    /// refusals by a namespace bucket and by the pod bucket
+    pub refused_by_namespace: u64,
+    pub refused_by_pod: u64,
+    /// the history pod with the most refusals, and its refusals per second
+    pub busiest_pod: Option<(String, f64)>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -229,6 +253,7 @@ pub struct HistoryResult {
     pub cache_hit_ratio: f64,
     pub events_cache_hit_ratio: f64,
     pub tasks: Vec<TaskResult>,
+    pub task_scheduler: TaskSchedulerResult,
     pub shards_per_pod: Vec<(String, u64)>,
     pub shard_moves: u64,
     pub shard_unavailable: Lat,
@@ -533,6 +558,7 @@ pub fn analyze_window(
             }
             prs.push(PodResult {
                 limit_util,
+                persistence_qps_limit: pq.max(0.0),
                 service: svc.as_str().into(),
                 name: pod_name(svc, pod.ordinal),
                 addr: pod.addr.clone(),
@@ -720,8 +746,42 @@ pub fn analyze_window(
                 })
                 .collect(),
             other_retries: o.other_errors,
+            sched_throttled_per_s: o.sched_throttled as f64 / dur,
         });
     }
+    let task_scheduler = {
+        let hist: Vec<_> = pods
+            .iter()
+            .filter(|p| p.alive)
+            .filter_map(|p| p.hist.as_ref().map(|h| (p, h)))
+            .collect();
+        let throttled: u64 = m.tasks.iter().map(|t| t.sched_throttled).sum();
+        let runs: u64 = m.tasks.iter().map(|t| t.count).sum();
+        let qps = hist.iter().map(|(_, h)| h.sched_limiter.host_rate());
+        TaskSchedulerResult {
+            mode: match (p.k.task_sched_enabled, p.k.task_sched_shadow) {
+                (false, _) => "off",
+                (true, true) => "shadow",
+                (true, false) => "on",
+            }
+            .into(),
+            throttled_per_s: throttled as f64 / dur,
+            throttled_per_task: if runs > 0 {
+                throttled as f64 / runs as f64
+            } else {
+                0.0
+            },
+            pod_qps_min: qps.clone().fold(f64::INFINITY, f64::min),
+            pod_qps_max: qps.fold(0.0, f64::max),
+            refused_by_namespace: hist.iter().map(|(_, h)| h.sched_limiter.refused_ns).sum(),
+            refused_by_pod: hist.iter().map(|(_, h)| h.sched_limiter.refused_host).sum(),
+            busiest_pod: hist
+                .iter()
+                .max_by_key(|(_, h)| h.sched_throttled)
+                .filter(|(_, h)| h.sched_throttled > 0)
+                .map(|(p, h)| (p.addr.clone(), h.sched_throttled as f64 / dur)),
+        }
+    };
     let shards_per_pod: Vec<(String, u64)> = pods
         .iter()
         .enumerate()
@@ -748,6 +808,7 @@ pub fn analyze_window(
         shard_io_wait: Lat::of(&m.shard_io_wait),
         lock_wait: Lat::of(&m.lock_wait),
         lock_timeouts: m.lock_timeouts,
+        task_scheduler,
         hot_workflows: locks,
         cache_hit_ratio: if hits + misses > 0 {
             hits as f64 / (hits + misses) as f64

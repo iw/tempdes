@@ -51,6 +51,8 @@ pub struct TaskStats {
     /// throttled retries by cause (RPS limit of the called service vs persistence limit ...)
     pub throttled_by: BTreeMap<ReCause, u64>,
     pub other_errors: u64,
+    /// refusals by the task scheduler's rate limiter (`task_scheduler_throttled`)
+    pub sched_throttled: u64,
 }
 
 #[derive(Clone, Debug, Default)]

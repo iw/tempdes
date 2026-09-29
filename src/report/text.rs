@@ -356,6 +356,27 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
         h.lock_timeouts,
         fmt_pct(h.cache_hit_ratio)
     );
+    let ts = &h.task_scheduler;
+    if ts.mode != "off" {
+        let _ = writeln!(
+            o,
+            "  task scheduler limiter {} · pod limit {:.0}–{:.0} tasks/s · {:.0}/s {} ({:.2} per task run)",
+            if ts.mode == "shadow" {
+                "in shadow mode (counts only)"
+            } else {
+                "on"
+            },
+            ts.pod_qps_min,
+            ts.pod_qps_max,
+            ts.throttled_per_s,
+            if ts.mode == "shadow" {
+                "would be held back"
+            } else {
+                "held back"
+            },
+            ts.throttled_per_task
+        );
+    }
     let mut t = Table::new(&[
         "hot shard",
         "owner",

@@ -321,6 +321,9 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
         } else {
             Prio::High
         };
+        if ctx.p.k.task_sched_enabled {
+            wait_for_scheduler_limiter(&ctx, owner, &task, prio, attempt).await;
+        }
         let permit = sched.acquire_prio(prio).await;
         let start = now();
         if attempt == 1 {
@@ -412,6 +415,61 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
     };
     if checkpoint {
         checkpoint_shard(&ctx, shard, c).await;
+    }
+}
+
+/// The task scheduler's rate limiter, which the queue reader meets in `TrySubmit`
+/// (`common/tasks/rate_limited_scheduler.go`). A refused task counts as
+/// `task_scheduler_throttled`. In shadow mode it runs anyway. Otherwise it goes to the
+/// rescheduler: first for the task backoff (1s × 1.1ⁿ, up to 20% less), then every 2s ± 50%
+/// (`taskChanFullBackoff`) until the limiter admits it.
+async fn wait_for_scheduler_limiter(
+    ctx: &Ctx,
+    pod: PodId,
+    task: &HistTask,
+    prio: Prio,
+    attempt: u32,
+) {
+    let k = &ctx.p.k;
+    let level = match prio {
+        Prio::High => 0,
+        Prio::Low => 1,
+    };
+    let ns = ctx
+        .wfs
+        .borrow()
+        .get(task.wf, task.wf_gen)
+        .map_or(0, |w| w.ns);
+    let mut refusals = 0u32;
+    loop {
+        let admitted = {
+            let mut pods = ctx.pods.borrow_mut();
+            let Some(h) = pods[pod].hist.as_mut() else {
+                return;
+            };
+            if now() < h.started_at + k.task_sched_startup_delay {
+                return;
+            }
+            let ok = h.sched_limiter.allow(level, ns);
+            if !ok {
+                h.sched_throttled += 1;
+            }
+            ok
+        };
+        if admitted {
+            return;
+        }
+        ctx.m.borrow_mut().tasks[task.kind.idx()].sched_throttled += 1;
+        if k.task_sched_shadow {
+            return;
+        }
+        let delay = if refusals == 0 {
+            1e6 * 1.1f64.powi(attempt as i32 - 1) * (0.8 + 0.2 * ctx.rand())
+        } else {
+            2e6 * (0.5 + ctx.rand())
+        };
+        refusals += 1;
+        sleep(delay as Time).await;
     }
 }
 

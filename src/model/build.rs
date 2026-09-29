@@ -16,7 +16,7 @@ use super::infra::*;
 use super::matching;
 use super::metrics::Metrics;
 use super::params::Params;
-use super::ratelimit::{PriorityLimiter, TokenBucket};
+use super::ratelimit::{PriorityLimiter, SchedulerLimiter, TokenBucket};
 use super::ring::HashRing;
 use super::sdk;
 use super::servers::FcfsServers;
@@ -48,6 +48,68 @@ fn persistence_qps(p: &Params, svc: Service, n: usize) -> f64 {
             n,
         ),
         Service::Worker => k.worker_persistence_max_qps,
+    }
+}
+
+/// A history pod's share of a cluster-wide limit: `global × owned shards ÷ numHistoryShards`
+/// (`getOwnershipScaledQuota` in `service/history/shard/ownership_based_quota_calculator.go`).
+/// `None` when no cluster-wide limit is set or before the pod owns shards.
+fn ownership_share(global: f64, owned: u32, total: u32) -> Option<f64> {
+    (global > 0.0 && owned > 0 && total > 0).then(|| global * f64::from(owned) / f64::from(total))
+}
+
+/// History splits `history.persistenceGlobalMaxQPS` by shard ownership. Until a pod owns shards
+/// it uses `history.persistenceMaxQPS`, as a starting pod does. Frontend and matching divide a
+/// global limit by their pod count.
+pub fn history_persistence_qps(p: &Params, owned: u32) -> f64 {
+    let k = &p.k;
+    ownership_share(k.history_persistence_global_max_qps, owned, p.num_shards)
+        .unwrap_or(k.history_persistence_max_qps)
+}
+
+/// The task scheduler limiter's rates for a history pod owning `owned` shards
+/// (`QueueSchedulerRateLimiterProvider`): the cluster-wide setting split by shard ownership,
+/// else the per-pod setting, else the pod's persistence rate. A namespace rate of 0 falls back
+/// to the pod rate (per-namespace persistence limits are not modelled).
+pub fn task_scheduler_qps(p: &Params, owned: u32) -> (f64, Vec<f64>) {
+    let k = &p.k;
+    let host = ownership_share(k.task_sched_global_max_qps, owned, p.num_shards)
+        .or((k.task_sched_max_qps > 0.0).then_some(k.task_sched_max_qps))
+        .unwrap_or_else(|| history_persistence_qps(p, owned));
+    let ns = p
+        .namespaces
+        .iter()
+        .map(|n| {
+            ownership_share(n.task_sched_global_ns_max_qps, owned, p.num_shards)
+                .unwrap_or(n.task_sched_ns_max_qps)
+        })
+        .collect();
+    (host, ns)
+}
+
+/// Set a history pod's persistence and task scheduler rates from the shards it owns.
+fn apply_history_limits(p: &Params, pod: &mut Pod) {
+    let Some(owned) = pod.hist.as_ref().map(|h| h.owned_shards) else {
+        return;
+    };
+    let q = history_persistence_qps(p, owned);
+    if q > 0.0 {
+        pod.persist_limiter.set_rate(
+            q,
+            q * p.k.persistence_burst_ratio,
+            Some(p.k.operator_rps_ratio),
+        );
+    }
+    let (host, ns) = task_scheduler_qps(p, owned);
+    if let Some(h) = pod.hist.as_mut() {
+        h.sched_limiter.set_rates(host, &ns);
+    }
+}
+
+/// Re-derive every live history pod's limits after shard ownership changes.
+pub fn refresh_history_limits(ctx: &Ctx) {
+    for pod in ctx.live_pods(Service::History) {
+        apply_history_limits(&ctx.p, &mut ctx.pods.borrow_mut()[pod]);
     }
 }
 
@@ -111,6 +173,13 @@ pub fn make_pod(
         pending_in_scheduler: [TimeGauge::new(), TimeGauge::new(), TimeGauge::new()],
         owned_shards: 0,
         shard_acquire: Semaphore::new(k.acquire_shard_concurrency),
+        // rates follow shard ownership: set by refresh_history_limits once shards are assigned
+        sched_limiter: {
+            let (host, ns) = task_scheduler_qps(p, 0);
+            SchedulerLimiter::new(host, &ns)
+        },
+        started_at: now(),
+        sched_throttled: 0,
     });
     Pod {
         svc,
@@ -195,6 +264,9 @@ pub fn build(p: Params) -> (Ctx, Executor) {
             api_requests: 0,
             persistence_ops: 0,
         });
+    }
+    for pod in pods.iter_mut() {
+        apply_history_limits(&p, pod);
     }
 
     // matching partitions
@@ -596,6 +668,18 @@ pub fn apply_dc(ctx: &Ctx, key: &str, v: &crate::config::dynamic::DcValue) -> bo
                 "matching" => Service::Matching,
                 _ => Service::Frontend,
             };
+            let global = match svc {
+                Service::History => ctx.p.k.history_persistence_global_max_qps,
+                Service::Matching => ctx.p.k.matching_persistence_global_max_qps,
+                _ => 0.0,
+            };
+            if global > 0.0 {
+                // a cluster-wide limit is in force and replaces the per-pod one
+                ctx.m.borrow_mut().notes.push(format!(
+                    "  dynamic config {key} -> {v}: ignored while {svc}.persistenceGlobalMaxQPS is set"
+                ));
+                return false;
+            }
             for pod in ctx.live_pods(svc) {
                 ctx.pods.borrow_mut()[pod].persist_limiter.set_rate(
                     num,
@@ -680,7 +764,11 @@ pub async fn scale(ctx: &Ctx, svc: Service, target: usize) {
         Service::Matching => rebalance_matching(ctx),
         Service::Worker => rebalance_worker(ctx),
     }
-    // persistence global limits depend on member counts
+    // global limits follow the new membership: shard ownership for history, pod count otherwise
+    if svc == Service::History {
+        refresh_history_limits(ctx);
+        return;
+    }
     let n = ctx.n_live(svc);
     let q = persistence_qps(&ctx.p, svc, n);
     for pod in ctx.live_pods(svc) {
@@ -837,4 +925,25 @@ fn rebalance_worker(ctx: &Ctx) {
     let mut r = ctx.rings.borrow_mut();
     r.worker = ring;
     r.worker_pods = ids;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ownership_share;
+
+    #[test]
+    fn global_limits_split_by_shard_ownership() {
+        // 36000 × 1156 / 2048, the per-pod rate a real history pod enforces
+        assert_eq!(ownership_share(36000.0, 1156, 2048), Some(20320.3125));
+        // two pods owning 1049 and 999 of 2048 shards share a 60/s limit as 30.7 + 29.3
+        let a = ownership_share(60.0, 1049, 2048).unwrap();
+        let b = ownership_share(60.0, 999, 2048).unwrap();
+        assert!(
+            (a - 30.73).abs() < 0.01 && (a + b - 60.0).abs() < 1e-9,
+            "{a} {b}"
+        );
+        // no cluster-wide limit, or no shards yet: the per-pod setting applies
+        assert_eq!(ownership_share(0.0, 1156, 2048), None);
+        assert_eq!(ownership_share(36000.0, 0, 2048), None);
+    }
 }

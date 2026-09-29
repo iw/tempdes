@@ -212,14 +212,14 @@ useful fix for a hotspot, the report marks it *(not simulated)*.
 
 ### Simulated settings (highlights)
 
-Run `tempdes dc modeled` for the full list of 75 keys with their defaults and descriptions.
+Run `tempdes dc modeled` for the full list of 82 keys with their defaults and descriptions.
 
 | Area | Keys |
 |---|---|
 | Frontend limits | `frontend.rps`, `frontend.globalRPS`, `frontend.namespaceRPS`, `frontend.globalNamespaceRPS`, `frontend.namespaceBurstRatio`, `frontend.namespaceCount` / `globalNamespaceCount`, `frontend.namespaceRPS.visibility` (+ global/burst), `frontend.pollWaitForNamespaceRateLimitToken`, `frontend.keepAliveMaxConnectionAge`, `system.operatorRPSRatio` |
 | Persistence | `{frontend,history,matching,worker}.persistenceMaxQPS`, `{history,matching}.persistenceGlobalMaxQPS`, `system.persistenceQPSBurstRatio` |
 | History | `history.rps`, `history.shardIOConcurrency`, `history.hostLevelCacheMaxSize`, `history.cacheNonUserContextLockTimeout`, `history.eventsCacheMaxSizeBytes`, `history.acquireShardConcurrency`, `history.defaultWorkflowTaskTimeout`, `history.longPollExpirationInterval` |
-| History task queues | `*ProcessorSchedulerWorkerCount`, `*TaskBatchSize`, `*ProcessorMaxPollRPS`, `*ProcessorMaxPollHostRPS`, `*ProcessorUpdateAckInterval`, `history.queuePendingTasksMaxCount`, `history.timerProcessorMaxTimeShift`, `history.shardUpdateMin{Interval,TasksCompleted}` |
+| History task queues | `*ProcessorSchedulerWorkerCount`, `*TaskBatchSize`, `*ProcessorMaxPollRPS`, `*ProcessorMaxPollHostRPS`, `*ProcessorUpdateAckInterval`, `history.queuePendingTasksMaxCount`, `history.timerProcessorMaxTimeShift`, `history.shardUpdateMin{Interval,TasksCompleted}`, the task scheduler's rate limiter: `history.taskSchedulerEnableRateLimiter{,ShadowMode}`, `history.taskSchedulerRateLimiterStartupDelay`, `history.taskScheduler{,Global}{,Namespace}MaxQPS` |
 | Matching | `matching.rps`, `matching.numTaskqueue{Read,Write}Partitions`, `matching.forwarderMax{OutstandingPolls,OutstandingTasks,RatePerSecond,ChildrenPerNode}`, `matching.outstandingTaskAppendsThreshold`, `matching.maxTaskBatchSize`, `matching.getTasksBatchSize`, `matching.getTasksReloadAt`, `matching.maxWaitForPollerBeforeFwd`, `matching.backlogNegligibleAge`, `matching.longPollExpirationInterval`, `admin.matching*DispatchRate` |
 | Worker service | `worker.perNamespaceWorkerCount`, `worker.schedulerNamespaceStartWorkflowRPS`, `worker.schedulerLocalActivitySleepLimit`, `worker.ESProcessor{BulkActions,FlushInterval,NumOfWorkers}` |
 | Membership / features | `system.ringpopReplicaPoints`, `system.ringpopApproximateMaxPropagationTime`, `system.enableEagerWorkflowStart`, `system.enableActivityEagerExecution` |
