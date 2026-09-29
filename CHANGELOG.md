@@ -91,10 +91,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Per-call SDK deadlines.** `rpc_timeout` (10 s by default) sets the deadline of each SDK
   call, retries included. It can be set for worker fleets, workflow starters, and signal,
   query, describe and visibility load.
-- **"Not keeping up" throughput rule.** Workflows that close more slowly than they start,
-  once their own run time (estimated from their steps) and the warm-up are allowed for, are
-  reported with the rate at which running workflows pile up. Workflows with no known run time,
-  such as entities waiting for signals, keep only the start-shortfall test.
+- **"Not keeping up" throughput rule.** Workflows that close more slowly than they start are
+  reported with the rate at which running workflows pile up. The expected closing rate allows
+  for the warm-up and for the workflow's own run time, sampled from its steps with their
+  failed attempts and retry intervals. A long retry tail (intervals doubling up to 100 s) is
+  therefore not mistaken for a cluster falling behind. Workflows with no known run time, such
+  as entities waiting for signals, keep only the start-shortfall test.
 - **Multi-tenant scheduling and limits.**
   - The history task scheduler interleaves (namespace, priority) channels by weight, as
     Temporal's interleaved weighted round robin does
@@ -148,6 +150,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pilot runs fit each operation's service time so that the simulated mean latency, queueing
   included, matches the observed mean. Uncalibrated writes run the append inside the write, with
   one rate-limiter charge and one latency, as Temporal's SQL and Cassandra stores do.
+- **Rejecting limiters keep their order.** When several internal limiters reject calls, the
+  report ranks each above the symptoms it causes. It used to give them all the same score, so
+  the order came from their names, and a limiter rejecting a few calls a second could head the
+  report over one rejecting a thousand times as many. They now keep their order by rejection
+  rate.
+- **Throttled activity retries point at `matching.rps`.** An activity retry timer pushes the
+  next attempt to matching, so its `RPS_LIMIT` throttling comes from `matching.rps`. The
+  history-queue hotspot suggested `history.rps`. Each throttled task type now names the limit
+  of the service it calls.
 - **Documentation.** The README and model docs described activity timeouts before they were
   simulated. They also described only one of the throughput tests, and gave stale counts of
   simulated keys. All three are corrected.

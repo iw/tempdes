@@ -182,57 +182,173 @@ pub fn detect(ctx: &Ctx, r: &RunResult) -> Vec<Hotspot> {
     out
 }
 
-/// A workflow type's expected run time in seconds from its steps alone, with no waiting in the
-/// cluster: sequential activities add up, parallel ones take about as long as the slowest,
-/// retries add their share, and each step costs a workflow task round trip. `None` when the
-/// workflow waits for signals without a timeout or runs forever (entity workflows), so its
-/// duration can't be known.
-pub fn expected_duration_s(p: &crate::model::params::Params, t: usize, depth: u32) -> Option<f64> {
+/// How many executions of a workflow type are sampled to estimate its own run time.
+const RUN_TIME_SAMPLES: usize = 2_000;
+
+/// Sampled run times, in seconds and sorted, of workflow type `t` on its own: how long an
+/// execution takes with no waiting in the cluster. Activities run for a drawn duration, and a
+/// failed attempt (at the step's failure rate, or one that runs past start-to-close) retries
+/// after its retry policy's interval until the policy gives up, so a high failure rate with
+/// growing intervals gives a long tail. Parallel activities and children take as long as the
+/// slowest, timers and local activities add their time, and each step costs a workflow task
+/// round trip. An activity that fails for good ends the run when its step fails the workflow.
+/// `None` when the workflow waits for signals without a timeout or runs forever (entity
+/// workflows), so its run time can't be known.
+pub fn own_run_times(p: &crate::model::params::Params, t: usize) -> Option<Vec<f64>> {
+    run_times_at(p, t, 0)
+}
+
+/// [`own_run_times`] for a workflow `depth` levels down a tree of child workflows.
+fn run_times_at(p: &crate::model::params::Params, t: usize, depth: u32) -> Option<Vec<f64>> {
     use crate::model::params::StepP;
-    const STEP_OVERHEAD_S: f64 = 0.05;
-    let tp = &p.wf_types[t];
-    if tp.system_scheduler || depth > 8 {
+    // deeper than this is a cycle of child workflows, which never finishes
+    if p.wf_types[t].system_scheduler || depth > 8 {
         return None;
     }
+    // the run times of the child workflow types it starts, sampled first
+    let mut children = std::collections::BTreeMap::new();
+    for step in &p.wf_types[t].steps {
+        if let StepP::Child { wf_type, .. } = step
+            && !children.contains_key(wf_type)
+        {
+            children.insert(*wf_type, run_times_at(p, *wf_type, depth + 1)?);
+        }
+    }
+    let mut rng = crate::sim::rng::Rng::new(p.seed)
+        .fork(0x0072_756e_7469_6d65 ^ t as u64 ^ (u64::from(depth) << 32));
+    let mut out = (0..RUN_TIME_SAMPLES)
+        .map(|_| sample_run_time(p, t, &children, &mut rng))
+        .collect::<Option<Vec<f64>>>()?;
+    out.sort_by(f64::total_cmp);
+    Some(out)
+}
+
+/// One sampled run time of workflow type `t` in seconds (see [`own_run_times`]), given the
+/// sorted run times of the child workflow types it starts.
+fn sample_run_time(
+    p: &crate::model::params::Params,
+    t: usize,
+    children: &std::collections::BTreeMap<usize, Vec<f64>>,
+    rng: &mut crate::sim::rng::Rng,
+) -> Option<f64> {
+    use crate::config::scenario::OnFailure;
+    use crate::model::params::StepP;
+    const STEP_OVERHEAD_S: f64 = 0.05;
     let mut total = STEP_OVERHEAD_S;
-    for step in &tp.steps {
+    for step in &p.wf_types[t].steps {
         total += STEP_OVERHEAD_S;
-        total += match step {
+        match step {
             StepP::Activity {
                 count,
                 parallel,
                 duration,
                 failure_rate,
                 retry,
+                timeouts,
+                on_failure,
                 ..
             } => {
-                // a failed attempt runs again after its backoff
-                let retries = failure_rate / (1.0 - failure_rate);
-                let attempt = duration.mean() / 1e6;
-                let one = attempt + retries * (attempt + retry.initial as f64 / 1e6);
-                if *parallel && *count > 1 {
-                    let n = f64::from(*count);
-                    duration.quantile(n / (n + 1.0)) / 1e6
-                        + retries * (attempt + retry.initial as f64 / 1e6)
-                } else {
-                    one * f64::from(*count)
+                let parallel = *parallel && *count > 1;
+                let (mut longest, mut sum) = (0.0f64, 0.0);
+                // when the first activity to fail for good fails the workflow
+                let mut failed_at = f64::INFINITY;
+                for i in 0..*count {
+                    if !parallel && i > 0 {
+                        sum += STEP_OVERHEAD_S;
+                    }
+                    let (d, ok) = sample_activity(duration, *failure_rate, retry, timeouts, rng);
+                    if !ok && *on_failure == OnFailure::Fail {
+                        failed_at = failed_at.min(if parallel { d } else { sum + d });
+                        if !parallel {
+                            break;
+                        }
+                    }
+                    longest = longest.max(d);
+                    sum += d;
+                }
+                if failed_at.is_finite() {
+                    return Some(total + failed_at);
+                }
+                total += if parallel { longest } else { sum };
+            }
+            StepP::LocalActivity { count, duration } => {
+                for _ in 0..*count {
+                    total += duration.sample(rng) / 1e6;
                 }
             }
-            StepP::LocalActivity { count, duration } => f64::from(*count) * duration.mean() / 1e6,
-            StepP::Timer(d) => d.mean() / 1e6,
-            StepP::Child { wf_type, .. } => expected_duration_s(p, *wf_type, depth + 1)?,
-            StepP::WaitSignal { timeout, .. } => *timeout.as_ref()? as f64 / 1e6,
-        };
+            StepP::Timer(d) => total += d.sample(rng) / 1e6,
+            StepP::Child { wf_type, count } => {
+                // the slowest of `count` children: the child's run time at quantile u^(1/count)
+                let q = rng.f64().powf(1.0 / f64::from(*count));
+                total += sample_quantile(&children[wf_type], q);
+            }
+            // signals may arrive sooner; the timeout bounds the wait
+            StepP::WaitSignal { timeout, .. } => total += *timeout.as_ref()? as f64 / 1e6,
+        }
     }
     Some(total)
 }
 
-/// Completions a healthy cluster would show over the measurement window: workflows started
-/// at least their duration before each moment close then, so a workflow that runs longer than
-/// the warm-up closes during only part of the window, or not at all.
-fn expected_closing_rate(start_rate: f64, duration_s: f64, warmup_s: f64, window_s: f64) -> f64 {
-    let late = (duration_s - warmup_s).max(0.0);
-    start_rate * ((window_s - late) / window_s).clamp(0.0, 1.0)
+/// One activity's time from its first schedule to its outcome, in seconds, and whether it
+/// succeeded. An attempt fails at `failure_rate`, or when it runs past start-to-close or
+/// schedule-to-close (the worker stops at its deadline); a failed attempt retries after the
+/// policy's next interval (`nextBackoffInterval`) until the attempts are used up or the retry
+/// would start after the schedule-to-close deadline.
+fn sample_activity(
+    duration: &crate::sim::dist::Dist,
+    failure_rate: f64,
+    retry: &crate::model::params::RetryPolicyP,
+    timeouts: &crate::model::params::ActTimeouts,
+    rng: &mut crate::sim::rng::Rng,
+) -> (f64, bool) {
+    // retries beyond this count run past any measurement window
+    const MAX_ATTEMPTS: u32 = 1_000;
+    let expiration = (timeouts.schedule_to_close > 0).then_some(timeouts.schedule_to_close);
+    let mut now: u64 = 0;
+    let mut attempt = 1;
+    loop {
+        let mut deadline = u64::MAX;
+        if timeouts.start_to_close > 0 {
+            deadline = now + timeouts.start_to_close;
+        }
+        if let Some(e) = expiration {
+            deadline = deadline.min(e.max(now));
+        }
+        let end = now.saturating_add(duration.sample_us(rng));
+        let failed = rng.f64() < failure_rate;
+        if end < deadline && !failed {
+            return (end as f64 / 1e6, true);
+        }
+        now = end.min(deadline);
+        match retry.next_delay(attempt, now, expiration) {
+            Some(d) if attempt < MAX_ATTEMPTS => {
+                now += d;
+                attempt += 1;
+            }
+            _ => return (now as f64 / 1e6, false),
+        }
+    }
+}
+
+/// The share of starts a healthy cluster closes during the measured window: with starts at a
+/// steady rate from time zero, one taking `d` seconds on its own and started at `s` closes at
+/// `s + d`, so the closing rate at time `t` is the start rate times the share of run times up
+/// to `t`, here averaged over the window from `warmup_s` to `warmup_s + window_s`.
+fn closing_fraction(run_times: &[f64], warmup_s: f64, window_s: f64) -> f64 {
+    if run_times.is_empty() || window_s <= 0.0 {
+        return 1.0;
+    }
+    let end = warmup_s + window_s;
+    run_times
+        .iter()
+        .map(|d| ((end - d) / window_s).clamp(0.0, 1.0))
+        .sum::<f64>()
+        / run_times.len() as f64
+}
+
+/// The value at quantile `q` of sorted samples.
+fn sample_quantile(sorted: &[f64], q: f64) -> f64 {
+    sorted[((sorted.len() - 1) as f64 * q).round() as usize]
 }
 
 fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
@@ -240,27 +356,29 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
         // not keeping up: workflows close (complete or fail) more slowly than a healthy cluster
         // would close them, given how long they run by themselves
         if w.started_per_s > 0.0
-            && let Some(d) = expected_duration_s(&c.ctx.p, i, 0)
+            && let Some(runs) = own_run_times(&c.ctx.p, i)
         {
             let window = c.r.duration_s;
-            let expected = expected_closing_rate(w.started_per_s, d, c.r.warmup_s, window);
+            let expected = w.started_per_s * closing_fraction(&runs, c.r.warmup_s, window);
             let closed = w.completed_per_s + w.failed_per_s;
             let short = expected - closed;
             let noise = 3.0 * (expected * window).sqrt() / window;
             if expected > 0.0 && short > noise.max(0.1 * expected) {
                 let frac = short / expected;
                 let growth = running_growth(c.r);
+                let (p50, p99) = (sample_quantile(&runs, 0.5), sample_quantile(&runs, 0.99));
                 let mut evidence = vec![format!(
-                    "expected {} closing for a {} run time and {} starts",
+                    "a healthy cluster would close {} of the {} starts in the window; on its own a run takes {} (p50) and {} (p99), retries included",
                     fmt_rate(expected),
-                    ms(d * 1e3),
-                    fmt_rate(w.started_per_s)
+                    fmt_rate(w.started_per_s),
+                    ms(p50 * 1e3),
+                    ms(p99 * 1e3)
                 )];
                 if w.e2e.p50_ms > 0.0 {
                     evidence.push(format!(
                         "completed workflows took {} (p50) against {} on their own",
                         ms(w.e2e.p50_ms),
-                        ms(d * 1e3)
+                        ms(p50 * 1e3)
                     ));
                 }
                 if let Some(g) = growth {
@@ -284,10 +402,7 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                         fmt_rate(expected),
                         fmt_rate(short)
                     ),
-                    format!(
-                        "Workflows start faster than they finish, so the number running grows for as long as the load lasts. The expected rate allows for the workflow's own run time ({}, from its steps), so the shortfall is time spent waiting in the cluster: see the rate-limit and saturation hotspots for where.",
-                        ms(d * 1e3)
-                    ),
+                    "Workflows start faster than they finish, so the number running grows for as long as the load lasts. The expected rate allows for the workflow's own run time, sampled from its steps with their retries and the warm-up, so the shortfall is time spent waiting in the cluster: see the rate-limit and saturation hotspots for where.".to_string(),
                     evidence,
                     &[
                         "workflow_success, workflow_failed (per workflow type)",
@@ -1011,14 +1126,8 @@ fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 .collect();
             let mut knobs = Vec::new();
             if t.throttled_by.contains_key("RPS_LIMIT") {
-                if t.task_type.contains("WorkflowTask") || t.task_type.contains("ActivityTask") {
-                    knobs.push(c.knob(
-                        "matching.rps",
-                        "AddTask calls rejected by the matching host limit",
-                    ));
-                } else {
-                    knobs.push(c.knob("history.rps", "history host limit"));
-                }
+                let (key, hint) = rps_limit_knob(&t.task_type);
+                knobs.push(c.knob(key, hint));
             }
             if t.throttled_by.contains_key("PERSISTENCE_LIMIT") {
                 knobs.push(c.knob("history.persistenceMaxQPS", "per-host persistence QPS"));
@@ -1877,7 +1986,7 @@ fn rank_poll_limiters(out: &mut [Hotspot], poll_rejects: u64) {
     let mut limiters = Vec::new();
     for h in out.iter_mut().filter(|h| h.category == "rate-limit") {
         if h.resource.starts_with("frontend.") || h.resource == "matching.rps" {
-            h.score = h.score.max(symptom_max + 1.0);
+            lift_above(h, symptom_max);
             h.severity = Severity::Critical;
             h.evidence.insert(
                 0,
@@ -1913,6 +2022,30 @@ fn rank_poll_limiters(out: &mut [Hotspot], poll_rejects: u64) {
             h.detail
         );
     }
+}
+
+/// The host limit behind a history task's `RPS_LIMIT` throttling: that of the service the task
+/// calls, matching for dispatching workflow and activity tasks (retries included).
+fn rps_limit_knob(task_type: &str) -> (&'static str, &'static str) {
+    use crate::model::types::{Service, TaskType};
+    let remote = TaskType::ALL
+        .into_iter()
+        .find(|k| k.as_str() == task_type)
+        .and_then(TaskType::remote_service);
+    match remote {
+        Some(Service::Matching) => (
+            "matching.rps",
+            "AddTask calls rejected by the matching host limit",
+        ),
+        _ => ("history.rps", "history host limit"),
+    }
+}
+
+/// Rank a limiter's hotspot above symptoms scoring up to `symptom_max`. Its own score (for a
+/// limiter, how often it rejects) stays a small part of the new one, so limiters lifted together
+/// keep their order instead of tying.
+fn lift_above(h: &mut Hotspot, symptom_max: f64) {
+    h.score = h.score.max(symptom_max + 1.0 + h.score / 1_000.0);
 }
 
 /// Limiters inside the cluster: history and matching host RPS, persistence QPS, and the history
@@ -1956,7 +2089,7 @@ fn rank_internal_limiters(out: &mut [Hotspot]) {
         .iter_mut()
         .filter(|h| h.category == "rate-limit" && is_internal_limiter(&h.resource))
     {
-        h.score = h.score.max(symptom_max + 1.0);
+        lift_above(h, symptom_max);
     }
     for h in out.iter_mut().filter(|h| {
         matches!(
@@ -1991,6 +2124,106 @@ mod tests {
     }
 
     #[test]
+    fn activity_retries_follow_the_policy_and_timeouts() {
+        use crate::model::params::{ActTimeouts, RetryPolicyP};
+        use crate::sim::dist::Dist;
+        let mut rng = crate::sim::rng::Rng::new(1);
+        let retry = RetryPolicyP {
+            initial: 1_000_000,
+            coefficient: 2.0,
+            max_interval: 100_000_000,
+            max_attempts: 3,
+        };
+        let timeouts = ActTimeouts {
+            start_to_close: 2_000_000,
+            ..Default::default()
+        };
+        // a 10s attempt times out at 2s: attempts at 0-2s, 3-5s and 7-9s, then the policy stops
+        let long = Dist::Const(10_000_000.0);
+        assert_eq!(
+            sample_activity(&long, 0.0, &retry, &timeouts, &mut rng),
+            (9.0, false)
+        );
+        // a fast attempt that never fails succeeds at once
+        let fast = Dist::Const(500_000.0);
+        assert_eq!(
+            sample_activity(&fast, 0.0, &retry, &timeouts, &mut rng),
+            (0.5, true)
+        );
+        // schedule-to-close ends the retries: attempts at 0-2s and 3-5s, a third would start
+        // after the 6s deadline
+        let bounded = ActTimeouts {
+            start_to_close: 2_000_000,
+            schedule_to_close: 6_000_000,
+            ..Default::default()
+        };
+        let unlimited = RetryPolicyP {
+            max_attempts: 0,
+            ..retry
+        };
+        assert_eq!(
+            sample_activity(&long, 0.0, &unlimited, &bounded, &mut rng),
+            (5.0, false)
+        );
+    }
+
+    #[test]
+    fn throttled_tasks_point_at_the_limit_of_the_service_they_call() {
+        // activity retry timers push the next attempt to matching, as transfer tasks do
+        for task in [
+            "TransferActiveTaskWorkflowTask",
+            "TransferActiveTaskActivityTask",
+            "TimerActiveTaskActivityRetryTimer",
+        ] {
+            assert_eq!(rps_limit_knob(task).0, "matching.rps", "{task}");
+        }
+        // starting a child and reporting its completion call history
+        for task in [
+            "TransferActiveTaskStartChildExecution",
+            "TransferActiveTaskCloseExecution",
+        ] {
+            assert_eq!(rps_limit_knob(task).0, "history.rps", "{task}");
+        }
+    }
+
+    fn params(workflows: &str) -> crate::model::params::Params {
+        let yaml = format!(
+            "name: t\nduration: 10s\ncluster: {{ num_history_shards: 4, replicas: {{ frontend: 1, history: 1, matching: 1, worker: 1 }}, persistence: {{ store: postgresql }} }}\nnamespaces: [ {{ name: default }} ]\nworkers: [ {{ name: w, namespace: default, task_queue: q }} ]\nworkflows:\n{workflows}"
+        );
+        let sc = crate::config::scenario::Scenario::parse_str(&yaml).expect("scenario parses");
+        crate::run::prepare(&sc, &Default::default(), None).expect("parameters resolve")
+    }
+
+    #[test]
+    fn run_times_cover_children_and_stop_at_cycles() {
+        // a parent waiting for 50 children that each run a 10s timer takes about as long as one
+        let p = params(
+            "  - { type: Parent, namespace: default, task_queue: q, start_rate: 1/s, steps: [ { child_workflow: { workflow_type: Child, count: 50 } } ] }\n  - { type: Child, namespace: default, task_queue: q, steps: [ { timer: 10s } ] }\n",
+        );
+        let runs = own_run_times(&p, 0).expect("known run time");
+        assert!(
+            (10.0..10.5).contains(&sample_quantile(&runs, 0.5)),
+            "{runs:?}"
+        );
+        // a workflow that starts itself as a child never finishes: no run time, and no hang
+        let p = params(
+            "  - { type: Loop, namespace: default, task_queue: q, start_rate: 1/s, steps: [ { child_workflow: { workflow_type: Loop, count: 10 } } ] }\n",
+        );
+        assert!(own_run_times(&p, 0).is_none());
+    }
+
+    #[test]
+    fn closing_share_allows_for_run_time_and_warm_up() {
+        // runs shorter than the warm-up all close within the window
+        assert_eq!(closing_fraction(&[5.0, 10.0], 30.0, 30.0), 1.0);
+        // a 45s run closes during the second half of a 30-60s window only
+        assert!((closing_fraction(&[45.0], 30.0, 30.0) - 0.5).abs() < 1e-12);
+        // runs longer than warm-up and window together never close in it
+        assert_eq!(closing_fraction(&[90.0], 30.0, 30.0), 0.0);
+        assert!((closing_fraction(&[10.0, 45.0, 90.0], 30.0, 30.0) - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
     fn internal_limiter_rejections_rank_above_their_symptoms() {
         let mut out = vec![
             hotspot(Severity::Critical, "workers", "OrderWorkflow", 80.0),
@@ -2010,6 +2243,27 @@ mod tests {
                 .detail
                 .starts_with("Likely caused by rejected calls (history.rps)")
         );
+
+        // limiters lifted together keep their order: the one rejecting more calls first
+        let mut out = vec![
+            hotspot(
+                Severity::Warning,
+                "history-queue",
+                "TransferActiveTaskActivityTask",
+                270.0,
+            ),
+            hotspot(
+                Severity::Critical,
+                "rate-limit",
+                "history.persistenceMaxQPS",
+                50.5,
+            ),
+            hotspot(Severity::Critical, "rate-limit", "matching.rps", 150.0),
+        ];
+        rank_internal_limiters(&mut out);
+        let score = |r: &str| out.iter().find(|h| h.resource == r).unwrap().score;
+        assert!(score("matching.rps") > score("history.persistenceMaxQPS"));
+        assert!(score("history.persistenceMaxQPS") > score("TransferActiveTaskActivityTask"));
 
         // frontend limiters are handled with poll rejections, not here
         let mut out = vec![

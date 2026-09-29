@@ -564,6 +564,21 @@ impl TaskType {
         }
     }
 
+    /// The service the task calls, whose host rate limit can throttle it (`RPS_LIMIT`):
+    /// matching for the tasks that add workflow and activity tasks (activity retries
+    /// included), history for starting a child and recording its completion on the parent.
+    pub fn remote_service(self) -> Option<Service> {
+        match self {
+            TaskType::TransferWorkflowTask
+            | TaskType::TransferActivityTask
+            | TaskType::TimerActivityRetryTimer => Some(Service::Matching),
+            TaskType::TransferCloseExecution | TaskType::TransferStartChildExecution => {
+                Some(Service::History)
+            }
+            _ => None,
+        }
+    }
+
     /// Timeout tasks run at Low priority in the host scheduler (and BackgroundLow persistence).
     pub fn low_priority(self) -> bool {
         matches!(
