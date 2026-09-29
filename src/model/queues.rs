@@ -5,18 +5,21 @@
 //!   `history.*TaskBatchSize`, rate limited per shard by `history.*ProcessorMaxPollRPS` and per
 //!   host by `history.*ProcessorMaxPollHostRPS`), paused when a shard has
 //!   `history.queuePendingTasksMaxCount` tasks loaded.
-//! * Loaded tasks go to the host-level scheduler (`history.*ProcessorSchedulerWorkerCount`
-//!   workers, High before Low priority).
+//! * Loaded tasks go to the host-level scheduler: interleaved weighted round robin over
+//!   (namespace, priority) channels (`history.*ProcessorSchedulerActiveRoundRobinWeights`, high 10
+//!   / low 9 by default) in front of `history.*ProcessorSchedulerWorkerCount` workers, plus the
+//!   optional execution queue scheduler for busy workflows.
 //! * Execution takes the workflow lock as a non-API caller (≤ `cacheNonUserContextLockTimeout`),
-//!   loads mutable state and performs the task; busy-workflow failures are resubmitted
-//!   immediately up to 10 attempts then backed off 1s·1.1^n, throttling errors back off
-//!   max(1s·1.1^n, 3s·1.5^(n-1)).
+//!   loads mutable state and performs the task. Failures follow `executable.go`: immediate
+//!   resubmits while the attempt is at most 10 (throttling gets one), then backoff 1s·1.1ⁿ⁻¹, or
+//!   for throttling max(1s·1.1ⁿ⁻¹, 3s·1.5ᵐ⁻¹) with m the throttles in a row.
 //! * Every `history.*ProcessorUpdateAckInterval` a shard checkpoints: RangeCompleteHistoryTasks,
 //!   plus UpdateShard at most every `history.shardUpdateMinInterval` / 1000 tasks.
 
 use crate::sim::executor::{Time, now, sleep, sleep_until, spawn};
-use crate::sim::sync::Prio;
+use crate::sim::sync::{Permit, Prio, Semaphore, WeightedPermit};
 
+use super::activity;
 use super::history::{self, StartOrigin, record_child_completed, start_workflow};
 use super::infra::*;
 use super::matching;
@@ -165,7 +168,7 @@ async fn immediate_reader(ctx: Ctx, shard: ShardId, c: Category) {
         let visible = ctx.shards.borrow()[(shard - 1) as usize].queues[c.idx()]
             .unloaded
             .len();
-        if persist(&ctx, owner, c.load_op(), Caller::QueueLoad)
+        if persist(&ctx, owner, c.load_op(), Caller::QueueLoad, None)
             .await
             .is_err()
         {
@@ -248,9 +251,15 @@ async fn timer_reader(ctx: Ctx, shard: ShardId, my_seq: u64, wake_at: Time) {
             continue;
         }
         wait_load_tokens(&ctx, owner, shard, Category::Timer).await;
-        if persist(&ctx, owner, PersistOp::GetTimerTasks, Caller::QueueLoad)
-            .await
-            .is_err()
+        if persist(
+            &ctx,
+            owner,
+            PersistOp::GetTimerTasks,
+            Caller::QueueLoad,
+            None,
+        )
+        .await
+        .is_err()
         {
             sleep(3_000_000).await;
             continue;
@@ -295,36 +304,78 @@ enum Outcome {
     Drop,
 }
 
-/// Schedule and execute one history task with Temporal's retry policy.
+/// How a task's next run gets a worker.
+enum RunPermit {
+    /// a worker of the host scheduler's pool
+    Pool(WeightedPermit),
+    /// a worker of its workflow's execution queue on `pod`
+    Exec(Permit, PodId),
+}
+
+/// Schedule and execute one history task with Temporal's retry policy (`executable.go`).
+///
+/// * Every run goes through the host scheduler: its (namespace, priority) channel waits its
+///   interleaved weighted round robin turn for a pool worker. A task of a workflow that has an
+///   execution queue runs there instead of on a pool worker (`ExecutionAwareScheduler`).
+/// * A failure increments the attempt (`HandleErr`), and a throttling error also the throttle
+///   count, which busy-workflow errors leave alone and any other error resets.
+/// * `Nack`: with the execution queue scheduler on, a busy-workflow failure moves the task to
+///   its workflow's queue. Otherwise the task is resubmitted immediately while its attempt is at
+///   most 10, except that throttling allows one immediate resubmit (`shouldResubmitOnNack`).
+///   Then it backs off 1s·1.1ⁿ⁻¹ for attempt n, or for throttling the larger of that and
+///   3s·1.5ᵐ⁻¹ for the m-th throttle in a row (`backoffDuration`).
 async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
     let c = task.kind.category();
     let mut attempt: u32 = 1;
+    let mut throttles: u32 = 0;
     {
         let mut m = ctx.m.borrow_mut();
         m.tasks[task.kind.idx()]
             .load_latency
             .record(loaded_at.saturating_sub(task.fire_at));
     }
+    let ns = ctx
+        .wfs
+        .borrow()
+        .get(task.wf, task.wf_gen)
+        .map_or(0, |w| w.ns);
+    let (prio, level) = if task.kind.low_priority() {
+        (Prio::Low, 1)
+    } else {
+        (Prio::High, 0)
+    };
+    let channel = (ns as u64) << 2 | level as u64;
+    let weight = ctx.p.namespaces[ns].sched_weights[c.idx()][level];
+    let exec_key = (task.wf, task.wf_gen);
+    // set when a busy-workflow failure moved the task to its workflow's execution queue
+    let mut routed: Option<(PodId, Semaphore)> = None;
     loop {
         let owner = ctx.shard_owner(shard);
-        let sched = {
-            let pods = ctx.pods.borrow();
-            pods[owner]
-                .hist
-                .as_ref()
-                .map(|h| h.schedulers[c.idx()].clone())
-        };
-        let Some(sched) = sched else { break };
         let enq = now();
-        let prio = if task.kind.low_priority() {
-            Prio::Low
-        } else {
-            Prio::High
+        let permit = match routed.take() {
+            Some((pod, workers)) => RunPermit::Exec(workers.acquire().await, pod),
+            None => {
+                let sched = {
+                    let pods = ctx.pods.borrow();
+                    pods[owner]
+                        .hist
+                        .as_ref()
+                        .map(|h| h.schedulers[c.idx()].clone())
+                };
+                let Some(sched) = sched else { break };
+                if ctx.p.k.task_sched_enabled {
+                    wait_for_scheduler_limiter(&ctx, owner, &task, prio, attempt).await;
+                }
+                let p = sched.acquire(channel, weight).await;
+                match exec_queue(&ctx, owner, c, exec_key, false) {
+                    Some(workers) => {
+                        drop(p);
+                        RunPermit::Exec(workers.acquire().await, owner)
+                    }
+                    None => RunPermit::Pool(p),
+                }
+            }
         };
-        if ctx.p.k.task_sched_enabled {
-            wait_for_scheduler_limiter(&ctx, owner, &task, prio, attempt).await;
-        }
-        let permit = sched.acquire_prio(prio).await;
         let start = now();
         if attempt == 1 {
             ctx.m.borrow_mut().tasks[task.kind.idx()]
@@ -332,7 +383,16 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
                 .record(start - enq);
         }
         let outcome = execute(&ctx, owner, shard, &task).await;
-        drop(permit);
+        match permit {
+            RunPermit::Pool(p) => drop(p),
+            RunPermit::Exec(p, pod) => {
+                drop(p);
+                if let Some(h) = ctx.pods.borrow_mut()[pod].hist.as_mut() {
+                    h.exec_queues[c.idx()].done(exec_key, now());
+                }
+                ctx.m.borrow_mut().tasks[task.kind.idx()].exec_queue_runs += 1;
+            }
+        }
         let proc_time = now() - start;
         {
             let mut m = ctx.m.borrow_mut();
@@ -340,7 +400,7 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
             ts.processing.record(proc_time);
             m.task_pod(owner);
         }
-        match outcome {
+        let e = match outcome {
             Outcome::Done | Outcome::Noop | Outcome::Drop => {
                 let mut m = ctx.m.borrow_mut();
                 let ts = &mut m.tasks[task.kind.idx()];
@@ -352,49 +412,48 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
                 ts.attempts.record(u64::from(attempt));
                 break;
             }
-            Outcome::Retry(e) => {
-                let delay = {
-                    let mut m = ctx.m.borrow_mut();
-                    let ts = &mut m.tasks[task.kind.idx()];
-                    match e {
-                        Err::ResourceExhausted(ReCause::BusyWorkflow, _) => {
-                            ts.busy_errors += 1;
-                            if attempt <= 10 {
-                                0
-                            } else {
-                                backoff(&ctx, 1_000_000, 1.1, 180_000_000, attempt - 10)
-                            }
-                        }
-                        Err::ResourceExhausted(cause, _) => {
-                            ts.throttled_errors += 1;
-                            *ts.throttled_by.entry(cause).or_default() += 1;
-                            backoff(&ctx, 1_000_000, 1.1, 180_000_000, attempt).max(backoff(
-                                &ctx,
-                                3_000_000,
-                                1.5,
-                                300_000_000,
-                                attempt,
-                            ))
-                        }
-                        _ => {
-                            ts.other_errors += 1;
-                            if attempt <= 1 {
-                                0
-                            } else {
-                                backoff(&ctx, 1_000_000, 1.1, 180_000_000, attempt)
-                            }
-                        }
-                    }
-                };
-                attempt += 1;
-                if delay > 0 {
-                    sleep(delay).await;
+            Outcome::Retry(e) => e,
+        };
+        // HandleErr
+        attempt += 1;
+        let busy = matches!(e, Err::ResourceExhausted(ReCause::BusyWorkflow, _));
+        let throttled = e.is_resource_exhausted() && !busy;
+        {
+            let mut m = ctx.m.borrow_mut();
+            let ts = &mut m.tasks[task.kind.idx()];
+            match e {
+                _ if busy => ts.busy_errors += 1,
+                Err::ResourceExhausted(cause, _) => {
+                    ts.throttled_errors += 1;
+                    *ts.throttled_by.entry(cause).or_default() += 1;
                 }
-                if attempt > 200 {
-                    break;
-                }
+                _ => ts.other_errors += 1,
             }
         }
+        if throttled {
+            throttles += 1;
+        } else if !busy {
+            throttles = 0;
+        }
+        if attempt > 200 {
+            break;
+        }
+        // Nack
+        if busy
+            && ctx.p.k.eqs_enabled
+            && let Some(workers) = exec_queue(&ctx, owner, c, exec_key, true)
+        {
+            routed = Some((owner, workers));
+            continue;
+        }
+        if resubmits(attempt, throttles, e) {
+            continue;
+        }
+        let mut delay = backoff(&ctx, 1_000_000, 1.1, 180_000_000, attempt);
+        if throttled {
+            delay = delay.max(backoff(&ctx, 3_000_000, 1.5, 300_000_000, throttles));
+        }
+        sleep(delay).await;
     }
     // completion bookkeeping & checkpointing
     let checkpoint = {
@@ -416,6 +475,42 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
     if checkpoint {
         checkpoint_shard(&ctx, shard, c).await;
     }
+}
+
+/// `shouldResubmitOnNack`: whether a task that failed with `e`, now at `attempt` (incremented by
+/// the failure) and `throttles` throttling errors in a row, is resubmitted at once rather than
+/// backed off. Up to attempt 10 it is, except that throttling allows one immediate resubmit and
+/// a lost shard none.
+fn resubmits(attempt: u32, throttles: u32, e: Err) -> bool {
+    let throttled =
+        e.is_resource_exhausted() && !matches!(e, Err::ResourceExhausted(ReCause::BusyWorkflow, _));
+    attempt <= 10 && !(throttled && throttles > 1) && e != Err::ShardOwnershipLost
+}
+
+/// The execution queue of workflow `key` on `pod`'s `c` scheduler, when the execution queue
+/// scheduler is on: an existing queue takes every task of its workflow; `create` (a
+/// busy-workflow failure) also opens one, unless `MaxQueues` queues exist.
+fn exec_queue(
+    ctx: &Ctx,
+    pod: PodId,
+    c: Category,
+    key: (WfId, u32),
+    create: bool,
+) -> Option<Semaphore> {
+    let k = &ctx.p.k;
+    if !k.eqs_enabled {
+        return None;
+    }
+    let mut pods = ctx.pods.borrow_mut();
+    let h = pods[pod].hist.as_mut()?;
+    h.exec_queues[c.idx()].submit(
+        key,
+        create,
+        now(),
+        k.eqs_queue_ttl,
+        k.eqs_max_queues,
+        k.eqs_queue_concurrency,
+    )
 }
 
 /// The task scheduler's rate limiter, which the queue reader meets in `TrySubmit`
@@ -475,7 +570,7 @@ async fn wait_for_scheduler_limiter(
 
 async fn checkpoint_shard(ctx: &Ctx, shard: ShardId, c: Category) {
     let owner = ctx.shard_owner(shard);
-    let _ = persist(ctx, owner, c.range_complete_op(), Caller::ShardMgmt).await;
+    let _ = persist(ctx, owner, c.range_complete_op(), Caller::ShardMgmt, None).await;
     let update = {
         let mut shards = ctx.shards.borrow_mut();
         let s = &mut shards[(shard - 1) as usize];
@@ -506,17 +601,20 @@ async fn checkpoint_shard(ctx: &Ctx, shard: ShardId, c: Category) {
     }
 }
 
-fn caller_for(task: &HistTask) -> Caller {
+/// Task executors call persistence as their namespace, at the task's priority
+/// (`executable.go`: `NewBackgroundHighCallerInfo(ns)` / `NewBackgroundLowCallerInfo(ns)`).
+fn caller_for(ctx: &Ctx, task: &HistTask) -> Caller {
+    let ns = ctx.wf_ns(task.wf, task.wf_gen);
     if task.kind.low_priority() {
-        Caller::BackgroundLow
+        Caller::BackgroundLow(ns)
     } else {
-        Caller::BackgroundHigh
+        Caller::BackgroundHigh(ns)
     }
 }
 
 /// Execute a task once. Returns how it ended.
 async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outcome {
-    let caller = caller_for(task);
+    let caller = caller_for(ctx, task);
     let (wf, wgen) = (task.wf, task.wf_gen);
     // workflow gone (closed & released) -> nothing to do
     if ctx.wfs.borrow().get(wf, wgen).is_none() {
@@ -825,6 +923,7 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             Outcome::Done
         }
         TaskType::TimerActivityTimeout => {
+            // executeActivityTimeoutTask: process every expired activity timeout
             let lock = match lock_wf(ctx, wf, wgen, caller, deadline).await {
                 Ok(l) => l,
                 Err(e) => return Outcome::Retry(e),
@@ -832,9 +931,69 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             if let Err(e) = load_ms(ctx, pod, shard, wf, wgen, caller).await {
                 return Outcome::Retry(e);
             }
+            let plan = {
+                let wfs = ctx.wfs.borrow();
+                let Some(w) = wfs.get(wf, wgen) else {
+                    return Outcome::Drop;
+                };
+                if w.status != WfStatus::Running {
+                    None
+                } else {
+                    activity::plan_timeouts(ctx, w, task.r, task.r2, task.fire_at, now())
+                }
+            };
+            let Some(plan) = plan else {
+                // errNoTimerFired: stale, or a heartbeat that already moved on
+                drop(lock);
+                cpu(ctx, pod, ctx.p.costs.task_noop).await;
+                return Outcome::Noop;
+            };
+            cpu(ctx, pod, base_cost).await;
+            // a failed activity adds ActivityTaskTimedOut (and a workflow task) to history
+            let events = !plan.failed_steps.is_empty();
+            if let Err(e) = shard_write(
+                ctx,
+                pod,
+                shard,
+                PersistOp::UpdateWorkflowExecution,
+                events,
+                caller,
+                deadline,
+            )
+            .await
+            {
+                evict_ms(ctx, pod, shard, wf, wgen);
+                return Outcome::Retry(e);
+            }
+            let t = now();
+            let mut tasks = plan.tasks;
+            let wf_type = {
+                let mut wfs = ctx.wfs.borrow_mut();
+                let Some(w) = wfs.get_mut(wf, wgen) else {
+                    return Outcome::Drop;
+                };
+                w.activities = plan.activities;
+                for &step in &plan.failed_steps {
+                    if step == w.step {
+                        w.failed_in_step += 1;
+                    }
+                    w.history_events += 1;
+                }
+                if events {
+                    history::deliver_event(ctx, w, t, &mut tasks);
+                }
+                activity::create_next_timer(ctx, w, &mut tasks);
+                w.wf_type
+            };
+            commit_tasks(ctx, shard, wf, wgen, &tasks);
             drop(lock);
-            cpu(ctx, pod, ctx.p.costs.task_noop).await;
-            Outcome::Noop
+            let mut m = ctx.m.borrow_mut();
+            let ws = &mut m.wf[wf_type];
+            for (n, fired) in ws.activity_timeouts.iter_mut().zip(plan.fired) {
+                *n += fired;
+            }
+            ws.activities_failed += plan.failed_steps.len() as u64;
+            Outcome::Done
         }
         TaskType::TimerUserTimer => {
             let lock = match lock_wf(ctx, wf, wgen, caller, deadline).await {
@@ -962,12 +1121,13 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
     }
 }
 
-/// Free a closed workflow's slot once its outstanding timers can no longer matter (after the
-/// longest timer horizon we generate).
+/// Free a closed workflow's slot a while after it closed. A timer of the closed workflow that
+/// fires before then finds it closed and does nothing; one that fires later fails the
+/// generation check and is dropped, so both are harmless.
 fn release_later(ctx: &Ctx, wf: WfId, wgen: u32) {
     let c = ctx.clone();
     spawn(async move {
-        sleep(3_700_000_000).await; // > max activity timeout (1h) + margin
+        sleep(3_700_000_000).await; // past the default activity start-to-close ceiling (1h)
         let ok = c
             .wfs
             .borrow()
@@ -1035,5 +1195,27 @@ where
             }
             other => return other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resubmit_follows_executable_go() {
+        let busy = Err::ResourceExhausted(ReCause::BusyWorkflow, Scope::Namespace);
+        let throttle = Err::ResourceExhausted(ReCause::PersistenceLimit, Scope::System);
+        // busy workflow: resubmitted until the tenth attempt (the first run is attempt 1, and
+        // each failure increments it before the decision)
+        assert!(resubmits(2, 0, busy));
+        assert!(resubmits(10, 0, busy));
+        assert!(!resubmits(11, 0, busy));
+        // throttling: one immediate resubmit, then backoff
+        assert!(resubmits(2, 1, throttle));
+        assert!(!resubmits(3, 2, throttle));
+        // other errors: like busy workflow; a lost shard never
+        assert!(resubmits(5, 0, Err::Unavailable));
+        assert!(!resubmits(2, 0, Err::ShardOwnershipLost));
     }
 }

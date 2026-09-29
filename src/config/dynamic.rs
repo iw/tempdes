@@ -753,6 +753,14 @@ impl DynamicConfig {
         }
     }
 
+    /// A map-valued setting (round-robin weights, retry policies), when one is configured.
+    pub fn map(&self, key: &str, prec: &[Constraints]) -> Option<BTreeMap<String, DcValue>> {
+        match self.lookup(key, prec) {
+            Some(DcValue::Map(m)) => Some(m),
+            _ => None,
+        }
+    }
+
     pub fn string(&self, key: &str, prec: &[Constraints], fallback: &str) -> String {
         match self.lookup(key, prec) {
             Some(DcValue::Str(s)) => s,

@@ -7,6 +7,7 @@ use std::rc::Rc;
 use crate::sim::executor::{Time, now, sleep, sleep_until, spawn, timeout};
 use crate::sim::sync::{Permit, Prio};
 
+use super::ratelimit::PriorityLimiter;
 use super::types::*;
 use super::world::*;
 
@@ -37,14 +38,20 @@ pub async fn client_hop(ctx: &Ctx) {
     }
 }
 
-/// Persistence caller class → priority in the persistence priority limiter
-/// (`common/persistence/client/quotas.go`).
+/// Who makes a persistence call: its priority in the persistence priority limiters
+/// (`common/persistence/client/quotas.go`) and, for calls made on behalf of a namespace, the
+/// namespace, which subjects them to the namespace persistence limiters. API handlers and history
+/// task executors carry the namespace (`NewBackgroundHighCallerInfo(ns)` in `executable.go`), as
+/// do matching's task queue managers; queue loads and shard management run as the system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Caller {
-    /// API caller with explicit priority (1 for Start/Signal, 2 otherwise).
-    Api(usize),
-    BackgroundHigh,
-    BackgroundLow,
+    /// API caller: priority (1 for Start/Signal/GetWorkflowExecutionHistory, 2 otherwise) and
+    /// namespace.
+    Api(usize, usize),
+    /// background work of a namespace: history tasks at high priority, matching's writes
+    BackgroundHigh(usize),
+    /// history timeout tasks of a namespace
+    BackgroundLow(usize),
     Preemptable,
     /// queue loads (GetHistoryTasks) = 3
     QueueLoad,
@@ -55,11 +62,11 @@ pub enum Caller {
 impl Caller {
     pub fn persistence_priority(self) -> usize {
         match self {
-            Caller::Api(p) => p,
+            Caller::Api(p, _) => p,
             Caller::ShardMgmt => 1,
             Caller::QueueLoad => 3,
-            Caller::BackgroundHigh => 4,
-            Caller::BackgroundLow => 5,
+            Caller::BackgroundHigh(_) => 4,
+            Caller::BackgroundLow(_) => 5,
             Caller::Preemptable => 6,
         }
     }
@@ -67,49 +74,107 @@ impl Caller {
     /// history.rps priority (Operator 0, API 1, BackgroundHigh 2, BackgroundLow 3, Preemptable 4).
     pub fn history_rps_priority(self) -> usize {
         match self {
-            Caller::Api(_) => 1,
-            Caller::BackgroundHigh | Caller::QueueLoad | Caller::ShardMgmt => 2,
-            Caller::BackgroundLow => 3,
+            Caller::Api(..) => 1,
+            Caller::BackgroundHigh(_) | Caller::QueueLoad | Caller::ShardMgmt => 2,
+            Caller::BackgroundLow(_) => 3,
             Caller::Preemptable => 4,
         }
     }
 
     pub fn is_api(self) -> bool {
-        matches!(self, Caller::Api(_))
+        matches!(self, Caller::Api(..))
+    }
+
+    /// The namespace the call is made for; `None` for system calls, which the namespace
+    /// limiters skip (`hasCaller`).
+    pub fn namespace(self) -> Option<usize> {
+        match self {
+            Caller::Api(_, ns) | Caller::BackgroundHigh(ns) | Caller::BackgroundLow(ns) => Some(ns),
+            _ => None,
+        }
     }
 }
 
-/// A persistence call from `pod`. Fails immediately with PERSISTENCE_LIMIT when the pod's
-/// priority limiter rejects it (Temporal does not wait for a token).
-pub async fn persist(ctx: &Ctx, pod: PodId, op: PersistOp, caller: Caller) -> Res<()> {
-    if op.rate_limited() {
-        ctx.m.borrow_mut().persist_limited_pod(pod);
-        let ok = {
-            let mut pods = ctx.pods.borrow_mut();
-            pods[pod]
-                .persist_limiter
-                .allow(caller.persistence_priority())
-        };
-        if !ok {
-            let svc = ctx.pods.borrow()[pod].svc;
-            let mut m = ctx.m.borrow_mut();
-            m.persist[op.idx()].record(
-                0,
-                Some(Err::ResourceExhausted(
-                    ReCause::PersistenceLimit,
-                    Scope::System,
-                )),
-            );
-            m.reject(
-                &format!("{}.persistenceMaxQPS", svc.as_str()),
-                ctx.pods.borrow()[pod].addr.clone(),
-            );
-            return Err(Err::ResourceExhausted(
-                ReCause::PersistenceLimit,
-                Scope::System,
-            ));
+/// The persistence rate limiters a call from `pod` meets, in Temporal's order (`allow` in
+/// `persistence_rate_limited_clients.go`): the namespace's per-shard limit (history, when
+/// `history.persistencePerShardNamespaceMaxQPS` is set), the namespace limit, then the pod's
+/// limit. A refusal fails the call at once with `ResourceExhausted` (`PERSISTENCE_LIMIT`), of
+/// namespace scope for the first two and system scope for the last; there is no waiting for a
+/// token.
+fn admit_persistence(
+    ctx: &Ctx,
+    pod: PodId,
+    op: PersistOp,
+    caller: Caller,
+    shard: Option<ShardId>,
+) -> Res<()> {
+    let prio = caller.persistence_priority();
+    let ns = caller.namespace();
+    let refused = {
+        let mut pods = ctx.pods.borrow_mut();
+        let p = &mut pods[pod];
+        let svc = p.svc;
+        let mut refused = None;
+        if let (Some(ns), Some(shard)) = (ns, shard)
+            && svc == Service::History
+            && !p.persist_limiter.is_unlimited()
+        {
+            let rate = ctx.p.namespaces[ns].hist_persist_shard_ns_qps;
+            if rate > 0.0 {
+                let k = &ctx.p.k;
+                let l = p.shard_ns_limiters.entry((ns, shard)).or_insert_with(|| {
+                    PriorityLimiter::new(
+                        7,
+                        rate,
+                        rate * k.persistence_burst_ratio,
+                        Some(k.operator_rps_ratio),
+                    )
+                });
+                if !l.allow(prio) {
+                    refused = Some(("persistencePerShardNamespaceMaxQPS", Scope::Namespace));
+                }
+            }
         }
-    }
+        if refused.is_none()
+            && let Some(ns) = ns
+            && let Some(l) = p.ns_persist_limiters.get_mut(ns)
+        {
+            *ctx.m
+                .borrow_mut()
+                .persist_ns_limited
+                .entry((pod, ns))
+                .or_default() += 1;
+            if !l.allow(prio) {
+                refused = Some(("persistenceNamespaceMaxQPS", Scope::Namespace));
+            }
+        }
+        if refused.is_none() {
+            ctx.m.borrow_mut().persist_limited_pod(pod);
+            if !p.persist_limiter.allow(prio) {
+                refused = Some(("persistenceMaxQPS", Scope::System));
+            }
+        }
+        refused.map(|(limit, scope)| (svc, p.addr.clone(), limit, scope))
+    };
+    let Some((svc, addr, limit, scope)) = refused else {
+        return Ok(());
+    };
+    let e = Err::ResourceExhausted(ReCause::PersistenceLimit, scope);
+    let mut m = ctx.m.borrow_mut();
+    m.persist[op.idx()].record(0, Some(e));
+    let place = match ns {
+        Some(ns) if scope == Scope::Namespace => {
+            format!("{addr} ns={}", ctx.p.namespaces[ns].name)
+        }
+        _ => addr,
+    };
+    m.reject(&format!("{}.{limit}", svc.as_str()), place);
+    Err(e)
+}
+
+/// One database statement from `pod`: the persistence client's CPU, a connection from the pod's
+/// pool, then the database station.
+async fn db_statement(ctx: &Ctx, pod: PodId, op: PersistOp) {
     cpu(ctx, pod, ctx.p.costs.persistence_client).await;
     let start = now();
     let (pool, svc) = {
@@ -125,11 +190,49 @@ pub async fn persist(ctx: &Ctx, pod: PodId, op: PersistOp, caller: Caller) -> Re
     let end = ctx.db.borrow_mut().servers.schedule(service);
     sleep_until(end).await;
     drop(conn);
+    ctx.m.borrow_mut().persist_conn_wait[svc.idx()].record(conn_wait);
+}
+
+/// A persistence call from `pod`: the rate limiters, then the call's database statements.
+/// `shard` is the history shard the call is for, when it has one.
+pub async fn persist(
+    ctx: &Ctx,
+    pod: PodId,
+    op: PersistOp,
+    caller: Caller,
+    shard: Option<ShardId>,
+) -> Res<()> {
+    persist_call(ctx, pod, op, false, caller, shard).await
+}
+
+/// A persistence call, optionally carrying new history events. Create/UpdateWorkflowExecution
+/// persist their events inside the same call: the SQL and Cassandra stores append the history
+/// nodes, then write the mutable state (`UpdateWorkflowExecution` in
+/// `common/persistence/sql/execution.go` and `cassandra/execution_store.go`). The append is not
+/// charged to the rate limiters, and the call's latency, including both statements, is recorded
+/// under the call's own operation, as Temporal's `persistence_latency` does. When calibration has
+/// fitted the operation's latency to production, whose measurements already include the append,
+/// the call is one statement drawn from that distribution.
+async fn persist_call(
+    ctx: &Ctx,
+    pod: PodId,
+    op: PersistOp,
+    append_history: bool,
+    caller: Caller,
+    shard: Option<ShardId>,
+) -> Res<()> {
+    if op.rate_limited() {
+        admit_persistence(ctx, pod, op, caller, shard)?;
+    }
+    let start = now();
+    if append_history && !ctx.p.db_includes_append[op.idx()] {
+        db_statement(ctx, pod, PersistOp::AppendHistoryNodes).await;
+    }
+    db_statement(ctx, pod, op).await;
     let lat = now() - start;
     let mut m = ctx.m.borrow_mut();
     m.persist[op.idx()].record(lat, None);
     m.persist_pod(pod);
-    m.persist_conn_wait[svc.idx()].record(conn_wait);
     Ok(())
 }
 
@@ -288,8 +391,9 @@ pub async fn shard_ready(ctx: &Ctx, pod: PodId, shard: ShardId, deadline: Time) 
     }
 }
 
-/// Persist a workflow write under the shard IO semaphore: optional AppendHistoryNodes then the
-/// execution write, sequentially (as the SQL/Cassandra execution stores do).
+/// Persist a workflow write under the shard IO semaphore (`ContextImpl.UpdateWorkflowExecution`
+/// in `service/history/shard/context_impl.go` takes it before calling the execution manager),
+/// with its new history events appended inside the same call.
 pub async fn shard_write(
     ctx: &Ctx,
     pod: PodId,
@@ -316,16 +420,13 @@ pub async fn shard_write(
     if ctx.shard_owner(shard) != pod {
         return Err(Err::ShardOwnershipLost);
     }
-    if append_history {
-        persist(ctx, pod, PersistOp::AppendHistoryNodes, caller).await?;
-    }
-    let r = persist(ctx, pod, op, caller).await;
+    let r = persist_call(ctx, pod, op, append_history, caller, Some(shard)).await;
     drop(permit);
     {
         let mut shards = ctx.shards.borrow_mut();
         let s = &mut shards[(shard - 1) as usize];
         s.writes += 1;
-        s.persistence_ops += 1 + u64::from(append_history);
+        s.persistence_ops += 1;
     }
     r
 }
@@ -398,7 +499,14 @@ pub async fn load_ms(
         h.cache.access(key).0
     };
     if !hit {
-        persist(ctx, pod, PersistOp::GetWorkflowExecution, caller).await?;
+        persist(
+            ctx,
+            pod,
+            PersistOp::GetWorkflowExecution,
+            caller,
+            Some(shard),
+        )
+        .await?;
         cpu(ctx, pod, ctx.p.costs.history_cache_miss).await;
     }
     Ok(())

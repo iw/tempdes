@@ -157,6 +157,7 @@ pub fn detect(ctx: &Ctx, r: &RunResult) -> Vec<Hotspot> {
     };
     let mut out = Vec::new();
     throughput(&c, &mut out);
+    activity_timeouts(&c, &mut out);
     cpu(&c, &mut out);
     database(&c, &mut out);
     shards(&c, &mut out);
@@ -181,8 +182,122 @@ pub fn detect(ctx: &Ctx, r: &RunResult) -> Vec<Hotspot> {
     out
 }
 
+/// A workflow type's expected run time in seconds from its steps alone, with no waiting in the
+/// cluster: sequential activities add up, parallel ones take about as long as the slowest,
+/// retries add their share, and each step costs a workflow task round trip. `None` when the
+/// workflow waits for signals without a timeout or runs forever (entity workflows), so its
+/// duration can't be known.
+pub fn expected_duration_s(p: &crate::model::params::Params, t: usize, depth: u32) -> Option<f64> {
+    use crate::model::params::StepP;
+    const STEP_OVERHEAD_S: f64 = 0.05;
+    let tp = &p.wf_types[t];
+    if tp.system_scheduler || depth > 8 {
+        return None;
+    }
+    let mut total = STEP_OVERHEAD_S;
+    for step in &tp.steps {
+        total += STEP_OVERHEAD_S;
+        total += match step {
+            StepP::Activity {
+                count,
+                parallel,
+                duration,
+                failure_rate,
+                retry,
+                ..
+            } => {
+                // a failed attempt runs again after its backoff
+                let retries = failure_rate / (1.0 - failure_rate);
+                let attempt = duration.mean() / 1e6;
+                let one = attempt + retries * (attempt + retry.initial as f64 / 1e6);
+                if *parallel && *count > 1 {
+                    let n = f64::from(*count);
+                    duration.quantile(n / (n + 1.0)) / 1e6
+                        + retries * (attempt + retry.initial as f64 / 1e6)
+                } else {
+                    one * f64::from(*count)
+                }
+            }
+            StepP::LocalActivity { count, duration } => f64::from(*count) * duration.mean() / 1e6,
+            StepP::Timer(d) => d.mean() / 1e6,
+            StepP::Child { wf_type, .. } => expected_duration_s(p, *wf_type, depth + 1)?,
+            StepP::WaitSignal { timeout, .. } => *timeout.as_ref()? as f64 / 1e6,
+        };
+    }
+    Some(total)
+}
+
+/// Completions a healthy cluster would show over the measurement window: workflows started
+/// at least their duration before each moment close then, so a workflow that runs longer than
+/// the warm-up closes during only part of the window, or not at all.
+fn expected_closing_rate(start_rate: f64, duration_s: f64, warmup_s: f64, window_s: f64) -> f64 {
+    let late = (duration_s - warmup_s).max(0.0);
+    start_rate * ((window_s - late) / window_s).clamp(0.0, 1.0)
+}
+
 fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
-    for w in &c.r.workflows {
+    for (i, w) in c.r.workflows.iter().enumerate() {
+        // not keeping up: workflows close (complete or fail) more slowly than a healthy cluster
+        // would close them, given how long they run by themselves
+        if w.started_per_s > 0.0
+            && let Some(d) = expected_duration_s(&c.ctx.p, i, 0)
+        {
+            let window = c.r.duration_s;
+            let expected = expected_closing_rate(w.started_per_s, d, c.r.warmup_s, window);
+            let closed = w.completed_per_s + w.failed_per_s;
+            let short = expected - closed;
+            let noise = 3.0 * (expected * window).sqrt() / window;
+            if expected > 0.0 && short > noise.max(0.1 * expected) {
+                let frac = short / expected;
+                let growth = running_growth(c.r);
+                let mut evidence = vec![format!(
+                    "expected {} closing for a {} run time and {} starts",
+                    fmt_rate(expected),
+                    ms(d * 1e3),
+                    fmt_rate(w.started_per_s)
+                )];
+                if w.e2e.p50_ms > 0.0 {
+                    evidence.push(format!(
+                        "completed workflows took {} (p50) against {} on their own",
+                        ms(w.e2e.p50_ms),
+                        ms(d * 1e3)
+                    ));
+                }
+                if let Some(g) = growth {
+                    evidence.push(format!(
+                        "running workflows grew by {} over the window",
+                        fmt_rate(g)
+                    ));
+                }
+                out.push(hs(
+                    if frac > 0.2 {
+                        Severity::Critical
+                    } else {
+                        Severity::Warning
+                    },
+                    "throughput",
+                    w.workflow_type.clone(),
+                    format!(
+                        "{}: not keeping up, {} closing against {} expected (running workflows pile up at {})",
+                        w.workflow_type,
+                        fmt_rate(closed),
+                        fmt_rate(expected),
+                        fmt_rate(short)
+                    ),
+                    format!(
+                        "Workflows start faster than they finish, so the number running grows for as long as the load lasts. The expected rate allows for the workflow's own run time ({}, from its steps), so the shortfall is time spent waiting in the cluster: see the rate-limit and saturation hotspots for where.",
+                        ms(d * 1e3)
+                    ),
+                    evidence,
+                    &[
+                        "workflow_success, workflow_failed (per workflow type)",
+                        "service_requests{operation=\"StartWorkflowExecution\"}",
+                    ],
+                    vec![],
+                    100.0 + frac * 100.0,
+                ));
+            }
+        }
         // Poisson arrivals: ignore shortfalls within 3σ of arrival noise unless starts failed
         let expected = w.offered_start_rate * c.r.duration_s;
         let observed = w.started_per_s * c.r.duration_s;
@@ -202,7 +317,7 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                     fmt_rate(w.offered_start_rate)
                 ),
                 format!(
-                    "{:.0}% of offered starts did not complete successfully within the SDK retry window ({} start failures). See the rate-limit and saturation hotspots below for the cause.",
+                    "{:.0}% of offered starts did not succeed before the SDK call's deadline, retries included ({} start failures). See the rate-limit and saturation hotspots below for the cause.",
                     short * 100.0,
                     w.start_failures
                 ),
@@ -298,6 +413,131 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             ));
         }
     }
+}
+
+/// Activity timeouts that fired, and the workflows that failed because an activity failed for
+/// good.
+fn activity_timeouts(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
+    for w in &c.r.workflows {
+        let fired: u64 = w.activity_timeouts.values().sum();
+        if fired > 0 {
+            let rate = fired as f64 / c.r.duration_s;
+            let attempts =
+                (w.activities_per_s * c.r.duration_s) as u64 + w.activity_failures + fired;
+            let frac = fired as f64 / attempts.max(1) as f64;
+            let kinds: Vec<String> = w
+                .activity_timeouts
+                .iter()
+                .map(|(k, n)| format!("{k}: {n}"))
+                .collect();
+            let mut detail = Vec::new();
+            if w.activity_timeouts.contains_key("ScheduleToStart") {
+                detail.push("Schedule-to-start: tasks waited in the task queue longer than the timeout, because activity workers are short of pollers or slots or dispatch is held back. The activity fails; it is not retried.");
+            }
+            if w.activity_timeouts.contains_key("ScheduleToClose") {
+                detail.push(
+                    "Schedule-to-close: the activity, retries included, ran out of time. It fails.",
+                );
+            }
+            if w.activity_timeouts.contains_key("StartToClose") {
+                detail.push("Start-to-close: an attempt ran longer than the timeout, or its completion reached history too late. The attempt is retried, repeating its work.");
+            }
+            if w.activity_timeouts.contains_key("Heartbeat") {
+                detail.push("Heartbeat: a running attempt's heartbeats stopped reaching history in time, for example throttled or failing RecordActivityTaskHeartbeat calls. The attempt is retried from scratch while the worker's copy is cancelled.");
+            }
+            let mut evidence = vec![format!("{} of activity attempts timed out", fmt_pct(frac))];
+            if w.activities_failed > 0 {
+                evidence.push(format!(
+                    "{} activities failed for good (timeouts not retried, or retries used up)",
+                    w.activities_failed
+                ));
+            }
+            if w.failed_per_s > 0.0 {
+                evidence.push(format!(
+                    "{} of the workflows failed as a result",
+                    fmt_rate(w.failed_per_s)
+                ));
+            }
+            let failing = w.activities_failed > 0 || w.failed_per_s > 0.0;
+            out.push(hs(
+                if failing || frac > 0.01 {
+                    Severity::Critical
+                } else {
+                    Severity::Warning
+                },
+                "activity-timeouts",
+                w.workflow_type.clone(),
+                format!(
+                    "{}: {fired} activity timeouts ({}; {})",
+                    w.workflow_type,
+                    fmt_rate(rate),
+                    kinds.join(", ")
+                ),
+                detail.join(" "),
+                evidence,
+                &[
+                    "schedule_to_start_timeout, start_to_close_timeout, schedule_to_close_timeout, heartbeat_timeout (activities that failed for good)",
+                    "temporal_activity_schedule_to_start_latency (SDK)",
+                    "task_requests{task_type=\"TimerActiveTaskActivityTimeout\"}",
+                ],
+                vec![
+                    c.infra(
+                        "workflows.*.steps[].activity.*_timeout",
+                        "scenario".into(),
+                        "timeouts must allow for queueing at the busiest time, not just the run time",
+                    ),
+                    c.infra(
+                        "workers.*.activity_pollers / activity_slots",
+                        "scenario".into(),
+                        "more activity capacity shortens queueing (schedule-to-start)",
+                    ),
+                    c.knob(
+                        "history.defaultActivityRetryPolicy",
+                        "retry settings for fields an activity leaves unset",
+                    ),
+                ],
+                if failing { 70.0 } else { 30.0 } + frac * 100.0,
+            ));
+        } else if w.failed_per_s > 0.0 {
+            out.push(hs(
+                Severity::Critical,
+                "activity-timeouts",
+                w.workflow_type.clone(),
+                format!(
+                    "{}: workflows failing ({}) as activities run out of retries",
+                    w.workflow_type,
+                    fmt_rate(w.failed_per_s)
+                ),
+                "Activities that fail more often than their retry policy allows fail the workflow."
+                    .into(),
+                vec![format!(
+                    "{} activities failed for good",
+                    w.activities_failed
+                )],
+                &["workflow_failed", "activity_failures"],
+                vec![c.infra(
+                    "workflows.*.steps[].activity.max_attempts",
+                    "scenario".into(),
+                    "attempts in total, the first included (0 = unlimited)",
+                )],
+                70.0,
+            ));
+        }
+    }
+}
+
+/// How fast the number of running workflows grew over the measurement window (per second),
+/// from the periodic samples.
+fn running_growth(r: &RunResult) -> Option<f64> {
+    let t0 = r.warmup_s;
+    let pts: Vec<(f64, f64)> = r
+        .samples
+        .iter()
+        .filter(|s| s.t > t0)
+        .map(|s| (s.t, s.running as f64))
+        .collect();
+    let (first, last) = (pts.first()?, pts.last()?);
+    (last.0 > first.0 + 1.0).then(|| (last.1 - first.1) / (last.0 - first.0))
 }
 
 fn cpu(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
@@ -641,7 +881,8 @@ fn locks(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     let h = &c.r.history;
     let hot = h.hot_workflows.first();
     let hot_util = hot.map(|l| l.util).unwrap_or(0.0);
-    if h.lock_timeouts > 0 || hot_util >= 0.5 {
+    // an odd timeout (a call retried just before its deadline) is not contention
+    if h.lock_timeouts as f64 / c.r.duration_s >= 0.05 || hot_util >= 0.5 {
         let sev = if hot_util >= c.crit || h.lock_timeouts as f64 / c.r.duration_s > 1.0 {
             Severity::Critical
         } else {
@@ -672,8 +913,28 @@ fn locks(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 ms(h.lock_wait.p99_ms),
                 h.lock_timeouts
             ),
-            "Every API call and history task on a workflow serialises on its mutable-state lock for the whole persistence write. Queue tasks give up after history.cacheNonUserContextLockTimeout and retry (immediately up to 10 times, then with backoff); API callers wait until their deadline. A workflow receiving more updates/s than 1/(lock hold time) is a hard hotspot.".into(),
-            list,
+            if c.ctx.p.k.eqs_enabled {
+                "Every API call and history task on a workflow serialises on its mutable-state lock for the whole persistence write. Queue tasks give up after history.cacheNonUserContextLockTimeout; the execution queue scheduler then runs that workflow's tasks in its own queue, a few at a time, instead of resubmitting them. API callers wait until their deadline. A workflow receiving more updates/s than 1/(lock hold time) is a hard hotspot.".to_string()
+            } else {
+                "Every API call and history task on a workflow serialises on its mutable-state lock for the whole persistence write. Queue tasks give up after history.cacheNonUserContextLockTimeout and are resubmitted at once until their tenth attempt, then backed off; API callers wait until their deadline. A workflow receiving more updates/s than 1/(lock hold time) is a hard hotspot.".to_string()
+            },
+            {
+                let mut list = list;
+                if let Some(q) = &h.exec_queues {
+                    list.push(format!(
+                        "execution queue scheduler: tasks enter per-workflow queues at {}, at most {} open on one scheduler (limit {}){}",
+                        fmt_rate(q.submitted_per_s),
+                        q.max_queues,
+                        q.queue_limit,
+                        if q.rejected > 0 {
+                            format!(", {} busy-workflow tasks turned away at the limit", q.rejected)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+                list
+            },
             &[
                 "history_workflow_execution_cache_latency",
                 "acquire_lock_failed",
@@ -779,7 +1040,7 @@ fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 "history-queue",
                 t.task_type.clone(),
                 format!("{}: {} task retries ({} busy workflow, {} throttled)", t.task_type, fmt_rate(retries as f64 / c.r.duration_s), t.busy_workflow_retries, t.throttled_retries),
-                "Retried tasks consume scheduler capacity and delay progress; throttled retries back off for seconds (max(1s·1.1ⁿ, 3s·1.5ⁿ⁻¹)).".into(),
+                "Retried tasks consume scheduler capacity and delay progress. A failed task is resubmitted at once until its tenth attempt, but throttling allows only one immediate resubmit; after that it backs off 1s·1.1ⁿ⁻¹ at attempt n, or when throttled the larger of that and 3s·1.5ᵐ⁻¹ for the m-th throttle in a row.".into(),
                 {
                     let mut e = vec![format!("mean attempts {:.2}", t.mean_attempts)];
                     if !causes.is_empty() {
@@ -1062,7 +1323,7 @@ fn limits(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 vec![c.knob("frontend.rps", "per-instance RPS"), c.knob("frontend.globalRPS", "cluster-wide"), c.replicas("frontend", "more frontends add host capacity")],
             ),
             "frontend.namespaceCount" => (
-                format!("Concurrent long-running requests (polls, queries) per namespace per API exceed the per-frontend quota. SDK pollers across all workers count here. {}", c.frontend_spread()),
+                format!("Concurrent long-running requests (polls, queries, history long polls from clients waiting for results) per namespace per API exceed the per-frontend quota. SDK pollers across all workers count here. {}", c.frontend_spread()),
                 vec!["service_errors_resource_exhausted{resource_exhausted_cause=\"RESOURCE_EXHAUSTED_CAUSE_CONCURRENT_LIMIT\"}", "service_pending_requests"],
                 vec![c.knob("frontend.namespaceCount", "per instance per API"), c.knob("frontend.globalNamespaceCount", "cluster-wide / #frontends")],
             ),
@@ -1084,6 +1345,39 @@ fn limits(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                     c.replicas("matching", "more hosts"),
                     c.knob("matching.numTaskqueueReadPartitions", "spread a hot queue"),
                 ],
+            ),
+            l if l.ends_with(".persistenceNamespaceMaxQPS") => (
+                format!(
+                    "The pod's persistence limiter for one namespace, checked before the pod's own limit: the namespace's calls fail immediately with PERSISTENCE_LIMIT of namespace scope, which internal clients don't retry. Without a namespace setting it runs at the pod's rate ({}), counting only the namespace's calls: queue loads and shard management run as the system and skip it.",
+                    l.replace("persistenceNamespaceMaxQPS", "persistenceMaxQPS")
+                ),
+                vec![
+                    "persistence_errors_resource_exhausted{resource_exhausted_scope=\"RESOURCE_EXHAUSTED_SCOPE_NAMESPACE\"}",
+                    "task_errors_throttled",
+                ],
+                vec![
+                    c.knob(l, "per-host limit for each namespace (0 = the pod's rate)"),
+                    c.knob(
+                        &l.replace("persistenceNamespaceMaxQPS", "persistenceGlobalNamespaceMaxQPS"),
+                        if l.starts_with("history.") {
+                            "cluster-wide per namespace, split by shard ownership"
+                        } else {
+                            "cluster-wide per namespace / #hosts"
+                        },
+                    ),
+                    c.knob(
+                        &l.replace("persistenceNamespaceMaxQPS", "persistenceMaxQPS"),
+                        "the pod's limit, which an unset namespace limit follows",
+                    ),
+                ],
+            ),
+            "history.persistencePerShardNamespaceMaxQPS" => (
+                "Per-shard namespace persistence limit, checked first: a namespace's calls on one shard are capped, so a hot shard is throttled without taking the pod's budget.".into(),
+                vec!["persistence_errors_resource_exhausted{resource_exhausted_scope=\"RESOURCE_EXHAUSTED_SCOPE_NAMESPACE\"}"],
+                vec![c.knob(
+                    "history.persistencePerShardNamespaceMaxQPS",
+                    "per shard, per namespace",
+                )],
             ),
             l if l.ends_with(".persistenceMaxQPS") => (
                 "Persistence priority rate limiter on the pod: calls fail immediately with PERSISTENCE_LIMIT (no waiting). Queue tasks back off for seconds; API calls surface ResourceExhausted.".into(),
@@ -1195,7 +1489,8 @@ fn schedules(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
 fn api_latency(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     let slo = c.ctx.p.report.api_p99_slo.0 / 1e3;
     for a in &c.r.apis {
-        if a.api.starts_with("Poll") || a.api == "GetWorkflowExecutionHistory" {
+        // long polls wait for work by design (PollWorkflowExecutionHistory included)
+        if a.api.starts_with("Poll") {
             continue;
         }
         if a.latency.p99_ms > slo {
@@ -1339,12 +1634,19 @@ pub fn validate(ctx: &Ctx, r: &RunResult, obs: &Observations) -> Vec<ValidationR
     };
     let m = ctx.m.borrow();
     let dur = r.duration_s;
-    for api in Api::ALL {
-        let f = [("service_name", "frontend"), ("operation", api.as_str())];
-        let sim = m.fe_total(api);
+    // Temporal's frontend metrics name calls by gRPC method, so a history long poll counts as
+    // GetWorkflowExecutionHistory
+    let mut frontend_ops: Vec<&str> = Api::ALL.iter().map(|a| a.metric_operation()).collect();
+    frontend_ops.dedup();
+    for op in frontend_ops {
+        let f = [("service_name", "frontend"), ("operation", op)];
+        let mut sim = crate::model::metrics::OpStats::default();
+        for api in Api::ALL.iter().filter(|a| a.metric_operation() == op) {
+            sim.merge(&m.fe_total(*api));
+        }
         if let Some(rate) = obs.rate("service_requests", &f) {
             push(
-                format!("service_requests{{frontend,{}}}", api.as_str()),
+                format!("service_requests{{frontend,{op}}}"),
                 rate,
                 sim.count as f64 / dur,
                 "/s",
@@ -1354,7 +1656,7 @@ pub fn validate(ctx: &Ctx, r: &RunResult, obs: &Observations) -> Vec<ValidationR
             && let Some(q) = l.quantile_us(0.99)
         {
             push(
-                format!("service_latency p99{{frontend,{}}}", api.as_str()),
+                format!("service_latency p99{{frontend,{op}}}"),
                 q / 1e3,
                 sim.latency.quantile(0.99) as f64 / 1e3,
                 "ms",
@@ -1386,8 +1688,11 @@ pub fn validate(ctx: &Ctx, r: &RunResult, obs: &Observations) -> Vec<ValidationR
                 "/s",
             );
         }
+        // an operation the model doesn't make on its own (AppendHistoryNodes rides inside
+        // Create/UpdateWorkflowExecution) has no latency to compare
         if let Some(l) = obs.latency("persistence_latency", &f)
             && let Some(q) = l.quantile_us(0.99)
+            && sim.count > 0
         {
             push(
                 format!("persistence_latency p99{{{}}}", op.as_str()),
@@ -1615,7 +1920,7 @@ fn rank_poll_limiters(out: &mut [Hotspot], poll_rejects: u64) {
 fn is_internal_limiter(resource: &str) -> bool {
     resource == "history.rps"
         || resource == "matching.rps"
-        || resource.ends_with(".persistenceMaxQPS")
+        || resource.contains(".persistence")
         || resource.starts_with("history.taskScheduler")
 }
 
@@ -1624,7 +1929,7 @@ fn is_internal_limiter(resource: &str) -> bool {
 /// timeouts, throttled queue tasks and slow or failing API calls. Rank the limiter above those
 /// symptoms (within its severity) and point the symptoms at it.
 fn rank_internal_limiters(out: &mut [Hotspot]) {
-    const SYMPTOMS: [&str; 7] = [
+    const SYMPTOMS: [&str; 8] = [
         "workers",
         "matching-backlog",
         "workflow-tasks",
@@ -1632,6 +1937,7 @@ fn rank_internal_limiters(out: &mut [Hotspot]) {
         "api-latency",
         "api-errors",
         "throughput",
+        "activity-timeouts",
     ];
     let limiters: Vec<String> = out
         .iter()

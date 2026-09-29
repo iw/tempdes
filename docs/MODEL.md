@@ -84,10 +84,18 @@ Limits 2 and 3 are **priority rate limiters** (`common/quotas/priority_rate_limi
 They keep one token bucket per priority. An admitted request at priority *p* also reserves a
 token from every lower-priority bucket, which can drive those buckets negative.
 
-* Priorities come from `service/frontend/configs/quotas.go`: Start, Signal and Respond calls are
-  P1, polls are P4, and operator traffic gets `system.operatorRPSRatio` of the rate at P0.
-* Under pressure, high-priority calls consume the budget of lower priorities, so **polls starve
-  first**. Workers then look idle while tasks back up in matching.
+* Priorities come from `service/frontend/configs/quotas.go`: Start, Signal, Respond and
+  heartbeat calls are P1, `GetWorkflowExecutionHistory` P2, Describe, Query and
+  `RespondActivityTaskFailed` P3, and polls P4. Operator traffic gets `system.operatorRPSRatio`
+  of the rate at P0.
+* The namespace limiter renames a history long poll (`GetWorkflowExecutionHistory` with
+  `WaitNewEvent`, as a client waiting for a result sends) to `PollWorkflowExecutionHistory`
+  and admits it at P5, the lowest priority (`namespace_rate_limit.go`). The host limiter
+  classifies by gRPC method, so there it stays at P2. The concurrent request limit counts it,
+  but not a plain `GetWorkflowExecutionHistory`.
+* Under pressure, high-priority calls consume the budget of lower priorities, so **history long
+  polls and worker polls starve first**. Workers then look idle while tasks back up in
+  matching.
 
 After admission, the handler spends CPU (per-API cost, plus a per-command cost for
 `RespondWorkflowTaskCompleted`) and calls history or matching over the internal network. Frontend
@@ -112,7 +120,11 @@ Each API follows the real handler sequence (`service/history/api/*`):
    the cache.
 6. **Persistence under the shard IO semaphore** (`service/history/shard/context_impl.go`,
    `history.shardIOConcurrency`; forced to 1 on Cassandra, with a warning):
-   `AppendHistoryNodes`, then `UpdateWorkflowExecution` / `CreateWorkflowExecution`.
+   `UpdateWorkflowExecution` / `CreateWorkflowExecution`. The store appends the new history
+   events first, inside the same call (`UpdateWorkflowExecution` in
+   `common/persistence/sql/execution.go` and `cassandra/execution_store.go`). The append is one
+   more database statement but not a separate persistence call: it passes the rate limiters
+   once with the write, and its time is part of the write's `persistence_latency`.
 7. Task generation (transfer, timer and visibility tasks) is written in the same transaction.
 8. Lock release, then post-lock reads. For example, `RecordWorkflowTaskStarted` reads history
    through the events cache (`service/history/events/cache.go`, `history.eventsCacheMaxSizeBytes`)
@@ -126,7 +138,8 @@ These workflow behaviours are simulated:
 * The workflow task lifecycle: schedule, sticky or normal queue, start, and complete or time out.
   The workflow task timeout is `history.defaultWorkflowTaskTimeout`, and a sticky
   schedule-to-start timeout falls back to the normal queue.
-* Activities: retries with backoff, heartbeats and their timeouts, and start-to-close timeouts.
+* Activities: retries with the activity's retry policy, heartbeats, and the four activity
+  timeouts (see [Activity timeouts](#activity-timeouts)).
 * User timers.
 * Child workflows: start through a transfer task, and completion recorded on the parent.
 * Signals. A signal that arrives while a workflow task is running is buffered and flushed into
@@ -140,15 +153,26 @@ These workflow behaviours are simulated:
 
 **Persistence calls** (`infra::persist`) go through three stages in order:
 
-1. **The pod's persistence priority limiter** (`common/persistence/client/quotas.go`).
-   * The limit is `<service>.persistenceMaxQPS`, or the pod's share of
+1. **The persistence priority limiters** (`common/persistence/client/quotas.go`), in the order
+   of `allow` in `persistence_rate_limited_clients.go`. A call made for a namespace meets the
+   namespace's per-shard limiter, then the namespace limiter, then the pod's limiter; system
+   calls (queue loads, shard management) meet only the pod's.
+   * The pod limit is `<service>.persistenceMaxQPS`, or the pod's share of
      `persistenceGlobalMaxQPS`, with burst `system.persistenceQPSBurstRatio`. History splits
      the cluster-wide number by shard ownership, `global × owned shards ÷ numHistoryShards`
      (`service/history/shard/ownership_based_quota_calculator.go`), and re-derives it whenever
      ownership changes. Frontend and matching divide it by their pod count.
+   * The namespace limit is `<service>.persistenceNamespaceMaxQPS`, or the pod's share of
+     `persistenceGlobalNamespaceMaxQPS` (history by shard ownership, matching by pod count).
+     Unset, it is the pod's own rate (`newPriorityNamespaceRateLimiter`), so one busy namespace
+     can use a whole pod's budget but no more.
+   * `history.persistencePerShardNamespaceMaxQPS`, when set, limits each namespace on each
+     shard.
    * Callers have priorities: API calls 1–2, shard management 1, queue loads 3, background
-     4–5, preemptable 6.
-   * A rejected call fails immediately with `ResourceExhausted` (`PERSISTENCE_LIMIT`), as in
+     4–5, preemptable 6. History task executors and matching's task queue managers call on
+     behalf of the task's namespace.
+   * A rejected call fails immediately with `ResourceExhausted` (`PERSISTENCE_LIMIT`), of
+     namespace scope from the first two limiters and system scope from the pod's, as in
      Temporal. There is no waiting for a token.
 2. **The pod's SQL connection pool** (`maxConns`). Waiting here is reported as
    `connection-pool`.
@@ -170,7 +194,23 @@ Transfer, timer and visibility queues follow `service/history/queues/`:
   * The timer queue looks ahead by `history.timerProcessorMaxTimeShift` and wakes at the
     earliest pending timer (`lookAheadTask`).
 * **Scheduling** (`scheduler.go`): each queue type has `history.*ProcessorSchedulerWorkerCount`
-  workers per host (512). High-priority tasks run before low.
+  workers per host (512), fed by an interleaved weighted round robin
+  (`common/tasks/interleaved_weighted_round_robin.go`).
+  * A task waits in the channel of its namespace and priority. A freed worker goes to the next
+    waiting channel in the flattened round-robin order, where each channel appears as often as
+    its weight: `history.*ProcessorSchedulerActiveRoundRobinWeights`, by default high 10, low
+    9 and preemptable 1. A saturated pool therefore serves ten high-priority tasks for every
+    nine low ones, and busy namespaces take turns instead of one namespace's backlog going
+    first. With nothing waiting, a task takes a free worker at once.
+  * **The execution queue scheduler** (`execution_aware_scheduler.go`,
+    `execution_queue_scheduler.go`) is off unless
+    `history.taskSchedulerEnableExecutionQueueScheduler` is set. When a task fails with
+    `BUSY_WORKFLOW`, it moves to a queue of its own workflow instead of being resubmitted to the
+    shared pool, and while that queue exists every task of the workflow goes there once the
+    round robin dispatches it. Each queue runs
+    `history.taskSchedulerExecutionQueueSchedulerQueueConcurrency` tasks at a time (2) and
+    closes after `...QueueTTL` (5 s) idle. At `...MaxQueues` (500) open queues, busy tasks fall
+    back to the shared pool.
 * **The scheduler's rate limiter** (`scheduler_quotas.go`, `common/tasks/rate_limited_scheduler.go`)
   is off unless `history.taskSchedulerEnableRateLimiter` is set, and then starts
   `history.taskSchedulerRateLimiterStartupDelay` after the pod.
@@ -193,15 +233,56 @@ Transfer, timer and visibility queues follow `service/history/queues/`:
     (`executeActivityRetryTimerTask` in `timer_queue_active_task_executor.go`). The failed
     attempt's write already recorded the retry, so the timer writes no mutable state and creates
     no transfer task.
-* **Retries** (`rescheduler.go`):
-  * A `BUSY_WORKFLOW` failure is resubmitted immediately, up to 10 attempts. After that it backs
-    off 1 s × 1.1ⁿ.
-  * A throttling failure (persistence limit, matching `ResourceExhausted`) backs off
-    max(1 s × 1.1ⁿ, 3 s × 1.5ⁿ⁻¹).
+* **Retries** (`executable.go`, `rescheduler.go`):
+  * Each failure increments the task's attempt. A throttling failure (persistence limit, matching
+    `ResourceExhausted`) also counts a throttle; a `BUSY_WORKFLOW` failure leaves that count
+    alone, and any other error resets it.
+  * A failed task is resubmitted immediately while its attempt is at most 10
+    (`shouldResubmitOnNack`), except that throttling allows only one immediate resubmit.
+  * Otherwise it backs off 1 s × 1.1ⁿ⁻¹ at attempt n, or when throttled the larger of that and
+    3 s × 1.5ᵐ⁻¹ for the m-th throttle in a row, with the rescheduler's jitter (up to 20% less).
   * Each retry records its cause, so hotspots can name the limiter responsible.
 * **Checkpoints**: every `history.*ProcessorUpdateAckInterval`, a shard runs
   `RangeComplete*Tasks`. It runs `UpdateShard` at most every `history.shardUpdateMinInterval`
   or `history.shardUpdateMinTasksCompleted` tasks.
+
+## Activity timeouts (`src/model/activity.rs`)
+
+History enforces activity timeouts with timer tasks, as Temporal does
+(`service/history/workflow/timer_sequence.go`, and `executeActivityTimeoutTask` in
+`timer_queue_active_task_executor.go`).
+
+* **Filling in.** A step's timeouts are normalised as `validateAndNormalizeTimeouts` does.
+  Schedule-to-close bounds schedule-to-start and start-to-close, and stands in for them when
+  they're not set; the heartbeat timeout never exceeds start-to-close. An activity with neither
+  schedule-to-close nor start-to-close gets a start-to-close of ten times its duration's p99,
+  between 10 s and 1 h (an SDK would refuse to schedule it). An activity that heartbeats
+  without a `heartbeat_timeout` gets twice its heartbeat interval. Unset retry-policy fields
+  come from `history.defaultActivityRetryPolicy` for the namespace.
+* **One timer per workflow.** A workflow keeps a single activity timer task, for its earliest
+  pending timeout. Every transaction that changes its activities (scheduling, start,
+  completion, failure, heartbeat) creates the next one if it is missing
+  (`CreateNextActivityTimer`). Schedule-to-close runs from the first schedule,
+  schedule-to-start from the attempt's scheduled time, and start-to-close and heartbeat from
+  the attempt's start (heartbeat from the latest heartbeat).
+* **Firing.** The timer task takes the workflow lock, loads mutable state and processes every
+  expired timeout in order.
+  * A heartbeat timeout that finds a newer heartbeat re-arms itself, which costs a
+    mutable-state write.
+  * Schedule-to-start and schedule-to-close timeouts fail the activity.
+  * Start-to-close and heartbeat timeouts retry the attempt after the policy's next interval
+    (`nextBackoffInterval`: initial × coefficientⁿ⁻¹, capped at the maximum interval). The
+    activity fails instead when the attempts are used up or the retry would start after the
+    schedule-to-close deadline. A retry clears the attempt's timers
+    (`UpdateActivityInfoForRetries`).
+  * The write records the outcome. A failed activity adds history events and a workflow task.
+* **Stale attempts.** A worker's heartbeat, completion or failure for an attempt that has timed
+  out is rejected with `NotFound`, as a stale task token is.
+* **The workflow's reaction.** An activity that fails for good fails its workflow, as a Go
+  workflow returning the error does, unless the step says `on_failure: continue`.
+* Timeouts are counted by kind; the server metrics for activities that fail on them are
+  `schedule_to_start_timeout`, `start_to_close_timeout`, `schedule_to_close_timeout` and
+  `heartbeat_timeout`.
 
 ## Matching (`src/model/matching.rs`)
 
@@ -259,8 +340,24 @@ Workers follow the Go SDK.
     time. The workflow-task heartbeat that the SDK sends for very long local activities is not
     modelled.
   * Eager activities are requested on `RespondWorkflowTaskCompleted`.
-* **Retries.** Transient errors back off from 100 ms and `ResourceExhausted` errors from 1 s,
-  both doubling up to 10 s. Each call has a deadline, and client latency includes retries.
+* **Retries** follow the SDK's gRPC retry interceptor (`internal/common/retry/interceptor.go`).
+  * Each call gets one context deadline and every retry happens inside it. The deadline is
+    `rpc_timeout` (10 s by default, `defaultRPCTimeout`), set per worker fleet, workflow starter
+    and load generator; a history long poll gets 65 s (`defaultGetHistoryTimeout`).
+  * `ResourceExhausted` and `Unavailable` are retried after 200 ms × 2ⁿ with ±20% jitter, at
+    most 6 s apart. A call still failing at its deadline returns `DeadlineExceeded`.
+  * The deadline travels with the request, so an API caller waiting for a workflow lock gives
+    up 500 ms before it with `BUSY_WORKFLOW`, and the SDK retries until the deadline.
+  * Worker polls are single attempts with `poll_timeout`: the SDK builds their context without
+    retry options (`internal_task_pollers.go`), and the poller loop polls again.
+  * Client latency includes the retries.
+* **Activities** run for a duration drawn from the step, heartbeating every `heartbeat`. The
+  SDK gives the activity a context that ends at the earlier of start-to-close from its start
+  and schedule-to-close from its first schedule (`calculateActivityDeadline`). The activity is
+  assumed to honour it: it stops there, and the SDK drops the result without responding
+  ("Activity complete after timeout" in `internal_task_handlers.go`). A heartbeat rejected
+  with `NotFound` means the attempt already timed out; the SDK cancels the activity and sends
+  nothing.
 * **Schedule-to-start** is measured as the SDK measures it (`internal_task_pollers.go`): from the
   poll response's `ScheduledTime` for a workflow task, or `CurrentAttemptScheduledTime` for an
   activity, to `StartedTime`.
@@ -292,11 +389,26 @@ Each operation has a CPU cost in microseconds per service (`Costs::default` in
 260 µs. These defaults are rough estimates for current-generation x86 cores. Two ways to adjust
 them:
 
-* **Calibrate** with `container_cpu_usage_seconds_total`. A pilot run of the observed
-  configuration scales each service's costs by observed ÷ simulated cores, clamped to 0.05–20×.
+* **Calibrate** with `container_cpu_usage_seconds_total`. Pilot runs of the observed
+  configuration scale each service's costs by observed ÷ simulated cores, clamped to 0.05–20×.
 * **Override** individual entries under `costs:`. Keys are API names, task types, or
   `per_command`, `per_event_read`, `cache_miss`, `task_noop`, `dispatch`, `forward`,
   `backlog_per_task` and `scheduler_workflow_task`.
+
+## Calibrating persistence latency (`src/calibrate.rs`, `src/run.rs`)
+
+Production's `persistence_latency` measures the whole call: the wait for a connection, queueing
+in the database, and for Create/UpdateWorkflowExecution the history append inside the call.
+Used directly as the service time, it would count the queueing twice, and the append once more.
+
+* An observed Create/UpdateWorkflowExecution latency replaces the write together with its
+  append, so calibrated writes run no separate append statement.
+* Each operation's service time is the observed distribution times a factor. Up to three pilot
+  runs of the observed configuration, at the observed load, adjust the factor by observed ÷
+  simulated mean latency until they agree within 3%. The factor stays between 0.05 and 1,
+  since latency can't be shorter than service time, and an operation with fewer than 50 calls
+  in the pilot keeps the observed distribution.
+* The CPU fit runs in the same pilots. Sweep cells and `--load` runs reuse the results.
 
 ## Hotspot rules (`src/report/rules.rs`)
 
@@ -307,7 +419,18 @@ knobs.
   critical. Both are configurable under `report:`.
 * **Rate limiters.** A limiter that rejects requests is a `rate-limit` hotspot. One that runs at
   70% or more of its limit on any pod is a `headroom` warning, raised before rejections start.
-* **Throughput.** A shortfall is flagged only beyond a 3σ Poisson band.
+* **Throughput.** Two tests, each flagged only beyond a 3σ Poisson band:
+  * *start shortfall*: accepted starts fall short of the offered rate, or more than 1% of
+    starts fail;
+  * *not keeping up*: workflows close (complete or fail) more slowly than a healthy cluster
+    would close them. The expected rate allows for the workflow's own run time, estimated from
+    its steps (activities, timers, children, signal timeouts and a workflow task per step), and
+    for the warm-up: a workflow that runs longer than the warm-up closes during only part of
+    the window. It needs a 10% shortfall at least, and shows how fast the number of running
+    workflows grew. Workflows with no known run time (waiting for signals without a timeout)
+    get only the start test.
+* **Activity timeouts.** Timeouts that fired, by kind, are an `activity-timeouts` hotspot:
+  critical when activities failed for good or more than 1% of attempts timed out.
 * **Causal ranking.** After detection, a causal pass re-ranks results:
   * when polls are rejected, the frontend or matching limiter that rejects them outranks the
     worker schedule-to-start latency and the matching backlog they cause;
@@ -333,7 +456,6 @@ knobs.
 * DNS caching, TLS handshake cost and cross-AZ effects of the client load-balancing modes.
 * GC pauses and memory pressure.
 * Database-internal contention (row locks, vacuum, compaction).
-* Per-namespace persistence limits (`*.persistenceNamespaceMaxQPS` and their global forms).
 * The minute a new pod runs on its per-pod persistence setting before its limiter first
   re-reads the cluster-wide share.
 * Kubernetes scheduling and pod restarts other than scaling events.

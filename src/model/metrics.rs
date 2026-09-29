@@ -53,6 +53,8 @@ pub struct TaskStats {
     pub other_errors: u64,
     /// refusals by the task scheduler's rate limiter (`task_scheduler_throttled`)
     pub sched_throttled: u64,
+    /// runs on a workflow's execution queue (execution queue scheduler)
+    pub exec_queue_runs: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -60,13 +62,21 @@ pub struct WfStats {
     pub started: u64,
     pub start_failed: u64,
     pub completed: u64,
+    /// workflows that closed as failed (an activity failed for good)
+    pub failed: u64,
     pub e2e: Histogram,
     pub wft_completed: u64,
     pub wft_timeouts: u64,
     pub wft_sched_to_start: Histogram,
     pub act_sched_to_start: Histogram,
     pub activities_completed: u64,
+    /// failed attempts (RespondActivityTaskFailed)
     pub activity_failures: u64,
+    /// activity timeouts that fired, by kind (start-to-close, schedule-to-start,
+    /// schedule-to-close, heartbeat), whether retried or not
+    pub activity_timeouts: [u64; 4],
+    /// activities that failed for good: a timeout that is not retried, or retries used up
+    pub activities_failed: u64,
     pub sticky_hits: u64,
     pub sticky_misses: u64,
     /// workflow tasks delivered through the normal queue (first task, after sticky timeouts)
@@ -106,6 +116,8 @@ pub struct Metrics {
     /// rejected ones included. AppendHistoryNodes is not charged: it is part of the
     /// Create/UpdateWorkflowExecution call.
     pub persist_limited_by_pod: Vec<u64>,
+    /// calls offered to each pod's namespace persistence limiter, per (pod, namespace)
+    pub persist_ns_limited: BTreeMap<(PodId, usize), u64>,
     pub persist_conn_wait: [Histogram; 4],
     pub vis_persist: Vec<OpStats>,
     pub tasks: Vec<TaskStats>,

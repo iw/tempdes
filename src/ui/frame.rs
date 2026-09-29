@@ -717,13 +717,15 @@ impl Sampler {
             Api::SignalWorkflowExecution,
             Api::QueryWorkflow,
             Api::DescribeWorkflowExecution,
-            Api::GetWorkflowExecutionHistory,
+            Api::PollWorkflowExecutionHistory,
             Api::ListWorkflowExecutions,
             Api::CountWorkflowExecutions,
         ];
         let worker_apis = [
             Api::PollWorkflowTaskQueue,
             Api::PollActivityTaskQueue,
+            // workers fetch history to replay after a sticky cache miss
+            Api::GetWorkflowExecutionHistory,
             Api::RespondWorkflowTaskCompleted,
             Api::RespondActivityTaskCompleted,
             Api::RespondActivityTaskFailed,

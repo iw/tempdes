@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::sim::executor::{Sender, Time, now};
 use crate::sim::rng::Rng;
 use crate::sim::stats::{Histogram, TimeGauge};
-use crate::sim::sync::Semaphore;
+use crate::sim::sync::{Semaphore, WeightedSemaphore};
 use crate::util::lru::Lru;
 
 use super::metrics::Metrics;
@@ -34,6 +34,12 @@ pub struct Pod {
     pub db_pool: Semaphore,
     /// persistence priority limiter (7 levels, `common/persistence/client/quotas.go`)
     pub persist_limiter: PriorityLimiter,
+    /// per-namespace persistence priority limiters (`<service>.persistenceNamespaceMaxQPS`,
+    /// falling back to the pod's rate); empty when the pod's persistence is unlimited
+    pub ns_persist_limiters: Vec<PriorityLimiter>,
+    /// history: per (namespace, shard) limiters, created when
+    /// `history.persistencePerShardNamespaceMaxQPS` is set for the namespace
+    pub shard_ns_limiters: std::collections::BTreeMap<(usize, ShardId), PriorityLimiter>,
     /// history `history.rps` / matching `matching.rps` / frontend host `frontend.rps` limiter
     pub rps_limiter: PriorityLimiter,
     pub fe: Option<FrontendState>,
@@ -61,7 +67,12 @@ pub struct FrontendState {
 
 pub struct HistoryHostState {
     pub cache: Lru,
-    pub schedulers: [Semaphore; 3],
+    /// the host task schedulers (transfer, timer, visibility): IWRR over (namespace, priority)
+    /// channels in front of `history.*ProcessorSchedulerWorkerCount` workers
+    pub schedulers: [WeightedSemaphore; 3],
+    /// each scheduler's execution queue scheduler
+    /// (`history.taskSchedulerEnableExecutionQueueScheduler`)
+    pub exec_queues: [ExecQueues; 3],
     pub load_limiters: [TokenBucket; 3],
     pub pending_in_scheduler: [TimeGauge; 3],
     pub owned_shards: u32,
@@ -72,6 +83,98 @@ pub struct HistoryHostState {
     pub started_at: Time,
     /// tasks the limiter refused (`task_scheduler_throttled`), in shadow mode too
     pub sched_throttled: u64,
+}
+
+/// The execution queue scheduler of one host task scheduler
+/// (`common/tasks/execution_queue_scheduler.go`): per-workflow FIFO queues, each with up to
+/// `history.taskSchedulerExecutionQueueSchedulerQueueConcurrency` workers of its own, so tasks
+/// of a contended workflow run one or two at a time instead of failing on its lock. A queue is
+/// created when a task fails with BUSY_WORKFLOW, receives every later task of that workflow, and
+/// is removed once idle for `...QueueTTL`. At `...MaxQueues` queues, new workflows fall back to
+/// the regular scheduler.
+#[derive(Default)]
+pub struct ExecQueues {
+    pub queues: std::collections::BTreeMap<(WfId, u32), ExecQueue>,
+    /// tasks accepted into a queue
+    pub submitted: u64,
+    /// busy-workflow tasks refused because `MaxQueues` queues existed
+    pub rejected: u64,
+    pub max_queues_seen: usize,
+}
+
+pub struct ExecQueue {
+    pub workers: Semaphore,
+    /// tasks queued or running
+    pub tasks: u32,
+    pub idle_since: Time,
+}
+
+impl ExecQueues {
+    /// Whether `key` has a live queue at `t` (removing it once idle for longer than `ttl`).
+    pub fn has(&mut self, key: (WfId, u32), t: Time, ttl: Time) -> bool {
+        match self.queues.get(&key) {
+            Some(q) if q.tasks > 0 || t.saturating_sub(q.idle_since) <= ttl => true,
+            Some(_) => {
+                self.queues.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Add a task to `key`'s queue, creating it when `create` and fewer than `max` queues exist.
+    /// Returns the queue's workers.
+    pub fn submit(
+        &mut self,
+        key: (WfId, u32),
+        create: bool,
+        t: Time,
+        ttl: Time,
+        max: usize,
+        concurrency: u32,
+    ) -> Option<Semaphore> {
+        if !self.has(key, t, ttl) {
+            if !create {
+                return None;
+            }
+            // the sweeper removes queues idle for longer than the TTL
+            self.queues
+                .retain(|_, q| q.tasks > 0 || t.saturating_sub(q.idle_since) <= ttl);
+            if self.queues.len() >= max {
+                self.rejected += 1;
+                return None;
+            }
+            self.queues.insert(
+                key,
+                ExecQueue {
+                    workers: Semaphore::new(concurrency.max(1)),
+                    tasks: 0,
+                    idle_since: t,
+                },
+            );
+            self.max_queues_seen = self.max_queues_seen.max(self.queues.len());
+        }
+        let q = self.queues.get_mut(&key).expect("queue exists");
+        q.tasks += 1;
+        self.submitted += 1;
+        Some(q.workers.clone())
+    }
+
+    /// A task of `key`'s queue finished.
+    pub fn done(&mut self, key: (WfId, u32), t: Time) {
+        if let Some(q) = self.queues.get_mut(&key) {
+            q.tasks = q.tasks.saturating_sub(1);
+            if q.tasks == 0 {
+                q.idle_since = t;
+            }
+        }
+    }
+
+    pub fn reset_stats(&mut self) {
+        self.submitted = 0;
+        self.rejected = 0;
+        self.max_queues_seen = self.queues.len();
+    }
 }
 
 // --- history shards -----------------------------------------------------------------------------
@@ -198,8 +301,17 @@ pub struct ActInfo {
     pub state: ActState,
     pub step: usize,
     pub tq: usize,
+    /// when the current attempt was scheduled (a retry: when it became due)
     pub scheduled_at: Time,
+    /// when the first attempt was scheduled (schedule-to-close counts from here)
+    pub first_scheduled_at: Time,
     pub started_at: Time,
+    /// the last heartbeat of the running attempt (0 = none yet)
+    pub last_heartbeat: Time,
+    /// activity timeout timer tasks created, one bit per timeout kind (`TimerTaskStatus`)
+    pub timers: u8,
+    /// fire time of the current heartbeat timer task
+    pub hb_timer_at: Time,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +342,8 @@ pub struct Wf {
     pub step_started: bool,
     pub step_remaining: u32,
     pub completed_in_step: u32,
+    /// activities of the current step that failed for good (timed out or out of retries)
+    pub failed_in_step: u32,
     pub timer_seq: u32,
     pub timer_pending: Option<u32>,
     pub timer_fired: bool,
@@ -597,5 +711,10 @@ impl Sim {
 
     pub fn wf_shard(&self, wf: WfId, wgen: u32) -> Option<ShardId> {
         self.wfs.borrow().get(wf, wgen).map(|w| w.shard)
+    }
+
+    /// The namespace of a workflow (0 once its slot is gone).
+    pub fn wf_ns(&self, wf: WfId, wgen: u32) -> usize {
+        self.wfs.borrow().get(wf, wgen).map_or(0, |w| w.ns)
     }
 }

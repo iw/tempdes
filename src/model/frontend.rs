@@ -1,11 +1,13 @@
 //! Frontend service: admission (interceptor order ConcurrentRequestLimit → NamespaceRateLimit →
 //! host RateLimit, `service/frontend/fx.go`) followed by the handler body.
 //!
-//! * `frontend.namespaceCount` limits concurrent long-running requests (polls, queries) per
-//!   namespace per API per instance (or `frontend.globalNamespaceCount` / #frontends).
+//! * `frontend.namespaceCount` limits concurrent long-running requests (polls, queries, history
+//!   long polls) per namespace per API per instance (or `frontend.globalNamespaceCount` /
+//!   #frontends).
 //! * Namespace RPS (`frontend.namespaceRPS`, or `frontend.globalNamespaceRPS` / #frontends) and
 //!   host RPS (`frontend.rps`) are priority limiters: P1 calls reserve tokens from lower
-//!   priorities, so polls (P4) are throttled first under load.
+//!   priorities, so polls (P4) are throttled first under load, and history long polls (P5 in
+//!   the namespace limiter) before them.
 //! * Visibility APIs use separate buckets (`frontend.namespaceRPS.visibility` = 10/s default).
 
 use std::future::Future;
@@ -163,7 +165,7 @@ pub async fn admit(ctx: &Ctx, pod: PodId, ns: usize, api: Api) -> Res<Option<Con
         });
     }
     // namespace limiter
-    let prio = api.frontend_priority();
+    let prio = api.namespace_priority();
     loop {
         let ok = {
             let mut pods = ctx.pods.borrow_mut();
@@ -198,7 +200,7 @@ pub async fn admit(ctx: &Ctx, pod: PodId, ns: usize, api: Api) -> Res<Option<Con
         if api.is_visibility() {
             pods[pod].fe.as_mut().unwrap().vis_limiter.allow(1)
         } else {
-            pods[pod].rps_limiter.allow(prio)
+            pods[pod].rps_limiter.allow(api.host_priority())
         }
     };
     if !ok {

@@ -6,23 +6,39 @@ use std::path::Path;
 
 use tempdes::config::dynamic::{Constraints, DcValue};
 use tempdes::config::scenario::{ClientLb, Scenario};
+use tempdes::model::types::{Api, PersistOp};
 use tempdes::report::{self, RunResult, Severity};
 use tempdes::run::{self, Overrides};
+use tempdes::util::units::Dur;
 
-fn simulate(file: &str, ov: Overrides) -> RunResult {
-    let sc = Scenario::load(
+fn scenario(file: &str) -> Scenario {
+    Scenario::load(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples/scenarios")
             .join(file),
     )
-    .expect("scenario loads");
-    simulate_scenario(&sc, ov)
+    .expect("scenario loads")
+}
+
+fn simulate(file: &str, ov: Overrides) -> RunResult {
+    simulate_scenario(&scenario(file), ov)
 }
 
 fn simulate_scenario(sc: &Scenario, ov: Overrides) -> RunResult {
+    simulate_with_ctx(sc, ov).0
+}
+
+/// The result together with the simulated cluster, for checks on raw metrics.
+fn simulate_with_ctx(sc: &Scenario, ov: Overrides) -> (RunResult, run::RunOutput) {
     let p = run::prepare(sc, &ov, None).expect("parameters resolve");
     let out = run::run_params(p);
-    report::analyze(&out.ctx, &out.info, None)
+    let r = report::analyze(&out.ctx, &out.info, None);
+    (r, out)
+}
+
+fn with_dc(mut ov: Overrides, key: &str, value: DcValue) -> Overrides {
+    ov.dc.push((key.into(), value, Constraints::default()));
+    ov
 }
 
 fn short() -> Overrides {
@@ -437,10 +453,11 @@ fn load_multiplier_scales_the_calibrated_workload() {
 }
 
 #[test]
-fn persistence_limit_utilisation_counts_only_charged_calls() {
-    // At 150 wf/s each history pod makes ~3,900 persistence calls/s, ~3,000 of them charged to
-    // the limiter (AppendHistoryNodes rides inside Create/UpdateWorkflowExecution). A 3,600/s
-    // limit therefore has room: no rejections, and the reported use stays below 100%.
+fn history_appends_ride_inside_their_writes() {
+    // Create/UpdateWorkflowExecution persist their history events inside the call (the SQL
+    // and Cassandra stores append, then write the mutable state), so there is no separate
+    // AppendHistoryNodes call, and every persistence call is charged to the limiter. At
+    // 150 wf/s each history pod makes about 3,000 calls/s: a 3,600/s limit has room.
     let mut ov = short();
     ov.dc.push((
         "history.persistenceMaxQPS".into(),
@@ -451,9 +468,17 @@ fn persistence_limit_utilisation_counts_only_charged_calls() {
     assert!(
         !r.limits
             .iter()
-            .any(|l| l.limiter == "history.persistenceMaxQPS"),
+            .any(|l| l.limiter.starts_with("history.persistence")),
         "{:#?}",
         r.limits
+    );
+    assert!(
+        !r.persistence
+            .ops
+            .iter()
+            .any(|o| o.op == "AppendHistoryNodes"),
+        "{:#?}",
+        r.persistence.ops
     );
     let history = r.services.iter().find(|s| s.service == "history").unwrap();
     for p in &history.pods {
@@ -463,13 +488,17 @@ fn persistence_limit_utilisation_counts_only_charged_calls() {
             .find(|(n, _)| n == "history.persistenceMaxQPS")
             .map(|(_, u)| *u)
             .unwrap();
-        let all_calls = p.persistence_per_s / 3600.0;
+        let calls = p.persistence_per_s / 3600.0;
         assert!(
             util < 1.0 && util > 0.5,
             "{}: persistence limit use {util}",
             p.name
         );
-        assert!(util < all_calls * 0.9, "{}: {util} vs {all_calls}", p.name);
+        assert!(
+            (util / calls - 1.0).abs() < 0.02,
+            "{}: {util} vs {calls}",
+            p.name
+        );
     }
 }
 
@@ -715,4 +744,365 @@ fn markdown_report_covers_the_run() {
             Some(n) => assert_eq!(cells, n, "ragged row: {line}"),
         }
     }
+}
+
+#[test]
+fn sdk_retries_share_the_call_deadline() {
+    // The Go SDK gives each call one context deadline (10s unless the client sets another) and
+    // retries inside it, so a signal queued behind a hot workflow's lock fails at the deadline
+    // instead of retrying past it.
+    let signal = |r: &RunResult| {
+        r.apis
+            .iter()
+            .find(|a| a.api == "SignalWorkflowExecution")
+            .cloned()
+            .expect("signals")
+    };
+    // within 20s the celebrity carts' lock queues stay under the default 10s
+    let s = signal(&simulate("hot-entity.yaml", short()));
+    assert!(
+        s.latency.p99_ms > 3_000.0 && s.latency.max_ms < 10_000.0,
+        "{:?}",
+        s.latency
+    );
+    assert!(!s.errors.contains_key("DeadlineExceeded"), "{:?}", s.errors);
+    // the deadline is set per client, and no retry outlives it
+    let mut sc = scenario("hot-entity.yaml");
+    for l in &mut sc.load.signals {
+        l.rpc_timeout = Dur::from_secs(2.0);
+    }
+    let s = signal(&simulate_scenario(&sc, short()));
+    assert!(s.latency.max_ms <= 2_000.0, "{:?}", s.latency);
+    assert!(s.errors["DeadlineExceeded"] > 100, "{:?}", s.errors);
+}
+
+/// Clients that wait for each result with a history long poll; `LIMIT` is replaced by a
+/// frontend limit.
+const RESULT_WAITERS: &str = r#"
+name: result-waiters
+duration: 20s
+cluster:
+  num_history_shards: 128
+  replicas: { frontend: 1, history: 2, matching: 2, worker: 1 }
+  persistence: { store: postgresql }
+dynamic_config:
+  LIMIT
+namespaces:
+  - name: orders
+workers:
+  - name: order-workers
+    namespace: orders
+    task_queue: orders
+    processes: 2
+    workflow_pollers: 4
+    activity_pollers: 4
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 50/s
+    await_result: true
+    steps:
+      - timer: 5s
+"#;
+
+#[test]
+fn history_long_polls_are_counted_and_shed_first() {
+    // GetWorkflowExecutionHistory with WaitNewEvent is a long-running request for
+    // frontend.namespaceCount ...
+    let sc = Scenario::parse_str(
+        &RESULT_WAITERS.replace("LIMIT", "frontend.namespaceCount: [{ value: 100 }]"),
+    )
+    .expect("scenario parses");
+    let r = simulate_scenario(&sc, short());
+    assert!(
+        r.limits
+            .iter()
+            .any(|l| l.limiter == "frontend.namespaceCount" && l.rejected > 0),
+        "{:#?}",
+        r.limits
+    );
+    // ... and the namespace rate limiter runs it at P5, below worker polls at P4
+    let sc = Scenario::parse_str(
+        &RESULT_WAITERS.replace("LIMIT", "frontend.namespaceRPS: [{ value: 150 }]"),
+    )
+    .expect("scenario parses");
+    let (_, out) = simulate_with_ctx(&sc, short());
+    let m = out.ctx.m.borrow();
+    let rejected = |api: Api| {
+        let o = m.fe_total(api);
+        o.error_count() as f64 / o.count.max(1) as f64
+    };
+    let (long_polls, polls) = (
+        rejected(Api::PollWorkflowExecutionHistory),
+        rejected(Api::PollWorkflowTaskQueue),
+    );
+    assert!(
+        long_polls > 0.5 && long_polls > 3.0 * polls,
+        "long polls {long_polls}, worker polls {polls}"
+    );
+}
+
+/// Long activities that heartbeat, on workers with fewer slots than the load needs; `EXTRA` is
+/// replaced by more activity options.
+const TIMEOUTS: &str = r#"
+name: activity-timeouts
+duration: 20s
+cluster:
+  num_history_shards: 256
+  replicas: { frontend: 2, history: 2, matching: 2, worker: 1 }
+  persistence: { store: postgresql }
+namespaces:
+  - name: orders
+workers:
+  - name: order-workers
+    namespace: orders
+    task_queue: orders
+    processes: 2
+    workflow_pollers: 8
+    activity_pollers: 8
+    activity_slots: 50
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 40/s
+    steps:
+      - activity: { count: 1, duration: { p50: 3s, p99: 5s }, heartbeat: 1s, schedule_to_start_timeout: 5s EXTRA }
+      - activity: { count: 1, duration: { p50: 20ms, p99: 150ms } }
+"#;
+
+#[test]
+fn schedule_to_start_timeouts_fail_activities() {
+    // 100 slots for about 130 concurrent activities: tasks queue, and those waiting longer than
+    // the schedule-to-start timeout fail without a retry, failing their workflows
+    let sc = Scenario::parse_str(&TIMEOUTS.replace("EXTRA", "")).expect("scenario parses");
+    let r = simulate_scenario(&sc, short());
+    let w = &r.workflows[0];
+    assert!(
+        w.activity_timeouts
+            .get("ScheduleToStart")
+            .copied()
+            .unwrap_or(0)
+            > 10,
+        "{:?}",
+        w.activity_timeouts
+    );
+    assert!(w.activities_failed > 10 && w.failed_per_s > 0.5, "{w:#?}");
+    // heartbeats keep arriving, so no heartbeat timeout; each heartbeat timer re-arms itself
+    assert!(!w.activity_timeouts.contains_key("Heartbeat"));
+    let timers = r
+        .history
+        .tasks
+        .iter()
+        .find(|t| t.task_type == "TimerActiveTaskActivityTimeout")
+        .expect("activity timer tasks");
+    assert!(timers.noop_fraction < 0.9, "{timers:#?}");
+    assert!(
+        has(&r, "activity-timeouts", Severity::Critical),
+        "{:#?}",
+        categories(&r)
+    );
+    // a workflow that handles the failure goes on to its next step
+    let sc = Scenario::parse_str(&TIMEOUTS.replace("EXTRA", ", on_failure: continue"))
+        .expect("scenario parses");
+    let r = simulate_scenario(&sc, short());
+    let w = &r.workflows[0];
+    assert!(w.activities_failed > 10, "{w:#?}");
+    assert_eq!(w.failed_per_s, 0.0);
+    assert!(w.completed_per_s > 0.5 * w.started_per_s, "{w:#?}");
+}
+
+#[test]
+fn start_to_close_timeouts_retry_until_attempts_run_out() {
+    // every attempt runs 3s against a 1s start-to-close timeout: three attempts, then the
+    // activity and its workflow fail
+    let sc = Scenario::parse_str(
+        &TIMEOUTS
+            .replace("start_rate: 40/s", "start_rate: 5/s")
+            .replace("activity_slots: 50", "activity_slots: 200")
+            .replace(
+                "heartbeat: 1s, schedule_to_start_timeout: 5s EXTRA",
+                "start_to_close_timeout: 1s, max_attempts: 3, retry_initial: 100ms",
+            ),
+    )
+    .expect("scenario parses");
+    let r = simulate_scenario(&sc, short());
+    let w = &r.workflows[0];
+    let timeouts = w
+        .activity_timeouts
+        .get("StartToClose")
+        .copied()
+        .unwrap_or(0);
+    assert!(w.activities_failed > 10, "{w:#?}");
+    let per_activity = timeouts as f64 / w.activities_failed as f64;
+    assert!(
+        (2.5..3.5).contains(&per_activity),
+        "{timeouts} timeouts for {} activities",
+        w.activities_failed
+    );
+    assert!(w.failed_per_s > 0.0);
+    let retries = r
+        .history
+        .tasks
+        .iter()
+        .find(|t| t.task_type == "TimerActiveTaskActivityRetryTimer")
+        .map_or(0.0, |t| t.per_s);
+    assert!(retries > 0.0);
+}
+
+#[test]
+fn falling_behind_is_reported_with_its_cause_first() {
+    // at a 2,000/s persistence limit per history pod the cluster completes a fraction of the
+    // workflows it starts
+    let r = simulate(
+        "baseline.yaml",
+        with_dc(short(), "history.persistenceMaxQPS", DcValue::Int(2000)),
+    );
+    let pos = |f: &dyn Fn(&report::Hotspot) -> bool| r.hotspots.iter().position(f);
+    let behind = pos(&|h| h.category == "throughput" && h.title.contains("not keeping up"))
+        .unwrap_or_else(|| panic!("{:#?}", categories(&r)));
+    let limiter = pos(&|h| h.resource == "history.persistenceMaxQPS").expect("limiter hotspot");
+    assert!(limiter < behind, "{:#?}", categories(&r));
+}
+
+#[test]
+fn long_workflows_are_not_mistaken_for_falling_behind() {
+    // workflows that run a minute keep piling up during a 20s window in a healthy cluster: the
+    // expected completions allow for their duration
+    let sc = Scenario::parse_str(
+        &RESULT_WAITERS
+            .replace("LIMIT", "frontend.namespaceRPS: [{ value: 2400 }]")
+            .replace("await_result: true", "await_result: false")
+            .replace("timer: 5s", "timer: 60s"),
+    )
+    .expect("scenario parses");
+    let r = simulate_scenario(&sc, short());
+    assert!(
+        !r.hotspots
+            .iter()
+            .any(|h| h.title.contains("not keeping up")),
+        "{:#?}",
+        categories(&r)
+    );
+    // while short workflows keep up in the baseline
+    let r = simulate("baseline.yaml", short());
+    assert!(
+        !r.hotspots
+            .iter()
+            .any(|h| h.title.contains("not keeping up"))
+    );
+}
+
+/// Two tenants on one cluster; `LIMIT` is replaced by dynamic config.
+const TENANTS: &str = r#"
+name: two-tenants
+duration: 20s
+cluster:
+  num_history_shards: 256
+  replicas: { frontend: 2, history: 2, matching: 2, worker: 1 }
+  persistence: { store: postgresql }
+dynamic_config:
+  LIMIT
+namespaces:
+  - name: orders
+  - name: batch
+workers:
+  - { name: order-workers, namespace: orders, task_queue: orders, processes: 2, workflow_pollers: 8, activity_pollers: 8 }
+  - { name: batch-workers, namespace: batch, task_queue: batch, processes: 2, workflow_pollers: 8, activity_pollers: 8 }
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 50/s
+    steps:
+      - activity: { count: 2, duration: { p50: 20ms, p99: 100ms } }
+  - type: BatchWorkflow
+    namespace: batch
+    task_queue: batch
+    start_rate: 100/s
+    steps:
+      - activity: { count: 4, duration: { p50: 20ms, p99: 100ms } }
+"#;
+
+#[test]
+fn namespace_persistence_limits_isolate_tenants() {
+    // a per-namespace persistence limit throttles only its own namespace
+    let sc = Scenario::parse_str(&TENANTS.replace(
+        "LIMIT",
+        "history.persistenceNamespaceMaxQPS: [{ value: 300, constraints: { namespace: batch } }]",
+    ))
+    .expect("scenario parses");
+    let r = simulate_scenario(&sc, short());
+    let ns_limit: Vec<_> = r
+        .limits
+        .iter()
+        .filter(|l| l.limiter == "history.persistenceNamespaceMaxQPS")
+        .collect();
+    assert!(!ns_limit.is_empty(), "{:#?}", r.limits);
+    assert!(
+        ns_limit.iter().all(|l| l.place.ends_with("ns=batch")),
+        "{ns_limit:#?}"
+    );
+    assert!(
+        !r.limits
+            .iter()
+            .any(|l| l.limiter == "history.persistenceMaxQPS"),
+        "{:#?}",
+        r.limits
+    );
+    let orders = r
+        .workflows
+        .iter()
+        .find(|w| w.workflow_type == "OrderWorkflow")
+        .unwrap();
+    assert!(
+        orders.completed_per_s > 0.9 * orders.started_per_s,
+        "{orders:#?}"
+    );
+}
+
+#[test]
+fn execution_queues_take_busy_workflows_off_the_shared_pool() {
+    // with the execution queue scheduler, a task that fails on a busy workflow moves to that
+    // workflow's own queue instead of being resubmitted to the shared scheduler
+    let off = simulate("hot-entity.yaml", short());
+    let on = simulate(
+        "hot-entity.yaml",
+        with_dc(
+            short(),
+            "history.taskSchedulerEnableExecutionQueueScheduler",
+            DcValue::Bool(true),
+        ),
+    );
+    assert!(off.history.exec_queues.is_none());
+    let q = on.history.exec_queues.as_ref().expect("execution queues");
+    assert!(q.submitted_per_s > 0.0 && q.max_queues > 0, "{q:?}");
+    let runs: f64 = on
+        .history
+        .tasks
+        .iter()
+        .map(|t| t.exec_queue_runs_per_s)
+        .sum();
+    assert!(runs > 0.0);
+}
+
+#[test]
+fn calibration_fits_service_times_to_observed_latency() {
+    // production measures persistence latency with queueing and, for writes, the history append
+    // included; the fitted service times make the calibrated run reproduce it
+    let (sc, cal) = calibrate("baseline.yaml", &short());
+    let update = PersistOp::UpdateWorkflowExecution.idx();
+    let fit = cal.persistence_fit[update].expect("fitted");
+    assert!(fit > 0.5 && fit <= 1.0, "fit {fit}");
+    let p = run::prepare(&sc, &short(), Some(&cal)).expect("parameters resolve");
+    assert!(p.db_includes_append[update]);
+    let out = run::run_params(p);
+    let r = report::analyze(&out.ctx, &out.info, Some(&cal.obs));
+    let row = r
+        .validation
+        .iter()
+        .find(|v| v.metric == "persistence_latency p99{UpdateWorkflowExecution}")
+        .expect("validation row");
+    assert!((row.ratio - 1.0).abs() < 0.2, "{row:?}");
 }

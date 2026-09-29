@@ -1,7 +1,7 @@
 //! SDK side: client connections, retry policy, worker processes (pollers, slots, sticky cache),
 //! workflow task processing (the workflow "program" interpreter) and activity execution.
 
-use crate::config::scenario::ClientLb;
+use crate::config::scenario::{ClientLb, OnFailure};
 use crate::sim::executor::{Time, now, sleep, spawn};
 use crate::sim::sync::Permit;
 
@@ -195,36 +195,65 @@ fn proxy_pod(ctx: &Ctx) -> PodId {
     pool[i % pool.len()]
 }
 
-/// SDK retry policy (Go SDK style): transient errors back off from 100ms, ResourceExhausted
-/// from 1s, both doubling up to 10s, within an overall expiration.
+/// How an SDK call is bounded and retried, after the Go SDK (sdk-go v1.36.0).
+///
+/// Every call gets one gRPC context with a deadline (`newGRPCContext` in `internal_utils.go`:
+/// 10 s by default, 65 s for a history long poll), and the retry interceptor retries inside
+/// that context (`internal/common/retry/interceptor.go`), so all attempts share the deadline.
+/// The interceptor's 1-minute expiration only applies to a context without a deadline, which an
+/// SDK call never has.
 #[derive(Clone, Copy, Debug)]
 pub struct Retry {
-    pub expiration: Time,
-    pub max_attempts: u32,
+    /// the call's deadline, measured from its first attempt
+    pub timeout: Time,
+    /// retry retryable errors until the deadline (worker polls handle their own errors)
+    pub retries: bool,
 }
 
 impl Retry {
-    pub const DEFAULT: Retry = Retry {
-        expiration: 10_000_000,
-        max_attempts: 50,
-    };
-    pub const NONE: Retry = Retry {
-        expiration: 0,
-        max_attempts: 1,
-    };
+    /// The Go SDK's default per-call timeout (`defaultRPCTimeout`).
+    pub const DEFAULT_TIMEOUT: Time = 10_000_000;
+    /// The Go SDK's timeout for a history long poll (`defaultGetHistoryTimeout`).
+    pub const LONG_POLL_TIMEOUT: Time = 65_000_000;
+
+    /// A call retried within one deadline of `timeout`.
+    pub fn call(timeout: Time) -> Retry {
+        Retry {
+            timeout,
+            retries: true,
+        }
+    }
+
+    /// A single attempt with a deadline of `timeout`.
+    pub fn once(timeout: Time) -> Retry {
+        Retry {
+            timeout,
+            retries: false,
+        }
+    }
 }
 
+/// gRPC codes the Go SDK retries (`IsRetryable`): Unavailable (which a lost shard also surfaces
+/// as) and ResourceExhausted. A deadline is never retried.
 fn retryable(e: Err) -> bool {
     matches!(
         e,
-        Err::ResourceExhausted(..)
-            | Err::Unavailable
-            | Err::DeadlineExceeded
-            | Err::ShardOwnershipLost
+        Err::ResourceExhausted(..) | Err::Unavailable | Err::ShardOwnershipLost
     )
 }
 
-/// Issue an API call from the SDK through the frontend, with retries. Records the
+/// The Go SDK's wait before retry `n` (n ≥ 1): `createDynamicServiceRetryPolicy` starts at
+/// 200 ms and doubles up to 6 s (a tenth of its 60 s expiration), and go-grpc-middleware waits
+/// `initial × 2ⁿ` with ±20% jitter (`JitterUp`), so the first retry comes after about 400 ms.
+fn sdk_backoff(ctx: &Ctx, n: u32) -> Time {
+    let base = (200_000.0 * 2f64.powi(n as i32)).min(6_000_000.0);
+    (base * (0.8 + 0.4 * ctx.rand())) as Time
+}
+
+/// Issue an API call from the SDK through the frontend, with retries inside one deadline.
+/// `body` runs the frontend handler's work for an attempt and receives the call's deadline,
+/// which the server propagates to history and matching. When the deadline passes, the client
+/// gives up with `DeadlineExceeded` while the server may still finish the attempt. Records the
 /// client-observed latency.
 pub async fn sdk_call<T, F, Fut>(
     ctx: &Ctx,
@@ -236,40 +265,56 @@ pub async fn sdk_call<T, F, Fut>(
     body: F,
 ) -> Res<T>
 where
-    F: Fn(Ctx, PodId) -> Fut,
-    Fut: std::future::Future<Output = Res<T>>,
+    T: 'static,
+    F: Fn(Ctx, PodId, Time) -> Fut + 'static,
+    Fut: std::future::Future<Output = Res<T>> + 'static,
 {
     let t0 = now();
+    let deadline = t0.saturating_add(retry.timeout);
+    let body = std::rc::Rc::new(body);
+    let fail = |e: Err| {
+        ctx.m.borrow_mut().client[api.idx()].record(now() - t0, Some(e));
+        Err(e)
+    };
     let mut attempt = 0u32;
     loop {
-        attempt += 1;
-        let fe = conn_pod(ctx, conn);
-        client_hop(ctx).await;
-        if ctx.p.client_lb == ClientLb::Proxy && ctx.p.proxy_latency > 0 {
-            sleep(ctx.p.proxy_latency).await;
+        if attempt > 0 {
+            let d = sdk_backoff(ctx, attempt);
+            if now().saturating_add(d) >= deadline {
+                // the context expires during the backoff
+                crate::sim::executor::sleep_until(deadline).await;
+                return fail(Err::DeadlineExceeded);
+            }
+            sleep(d).await;
         }
-        let r = frontend::handle(ctx, fe, ns, api, extra_cpu, &body).await;
-        client_hop(ctx).await;
+        attempt += 1;
+        let remaining = deadline.saturating_sub(now());
+        if remaining == 0 {
+            return fail(Err::DeadlineExceeded);
+        }
+        let fe = conn_pod(ctx, conn);
+        let c = ctx.clone();
+        let b = body.clone();
+        let r = call_with_timeout(remaining, async move {
+            client_hop(&c).await;
+            if c.p.client_lb == ClientLb::Proxy && c.p.proxy_latency > 0 {
+                sleep(c.p.proxy_latency).await;
+            }
+            let r = frontend::handle(&c, fe, ns, api, extra_cpu, move |c2, pod| {
+                (*b)(c2, pod, deadline)
+            })
+            .await;
+            client_hop(&c).await;
+            r
+        })
+        .await;
         match r {
             Ok(v) => {
                 ctx.m.borrow_mut().client[api.idx()].record(now() - t0, None);
                 return Ok(v);
             }
-            Err(e)
-                if retryable(e)
-                    && attempt < retry.max_attempts
-                    && now() - t0 < retry.expiration =>
-            {
-                let d = match e {
-                    Err::ResourceExhausted(..) => backoff(ctx, 1_000_000, 2.0, 10_000_000, attempt),
-                    _ => backoff(ctx, 100_000, 2.0, 10_000_000, attempt),
-                };
-                sleep(d).await;
-            }
-            Err(e) => {
-                ctx.m.borrow_mut().client[api.idx()].record(now() - t0, Some(e));
-                return Err(e);
-            }
+            Err(e) if retry.retries && retryable(e) && attempt < 1_000 => {}
+            Err(e) => return fail(e),
         }
     }
 }
@@ -323,15 +368,14 @@ async fn wft_poller(ctx: Ctx, wk: usize, idx: u32) {
             s
         };
         let sticky_worker = sticky.then_some(wk);
-        let deadline = now() + f.poll_timeout;
         let r = sdk_call(
             &ctx,
             Conn::Worker(wk),
             f.ns,
             Api::PollWorkflowTaskQueue,
-            Retry::NONE,
+            Retry::once(f.poll_timeout),
             0.0,
-            move |c, fe| async move {
+            move |c, fe, deadline| async move {
                 matching_poll(&c, fe, tq, TqKind::Workflow, sticky_worker, deadline).await
             },
         )
@@ -389,15 +433,14 @@ async fn activity_poller(ctx: Ctx, wk: usize) {
     let mut failures = 0u32;
     loop {
         let permit = slots.acquire().await;
-        let deadline = now() + f.poll_timeout;
         let r = sdk_call(
             &ctx,
             Conn::Worker(wk),
             f.ns,
             Api::PollActivityTaskQueue,
-            Retry::NONE,
+            Retry::once(f.poll_timeout),
             0.0,
-            move |c, fe| async move {
+            move |c, fe, deadline| async move {
                 matching_poll(&c, fe, tq, TqKind::Activity, None, deadline).await
             },
         )
@@ -425,6 +468,12 @@ async fn activity_poller(ctx: Ctx, wk: usize) {
             }
         }
     }
+}
+
+/// Deadline of worker process `wk`'s SDK calls other than polls.
+fn worker_rpc_timeout(ctx: &Ctx, wk: usize) -> Time {
+    let fleet = ctx.workers.borrow()[wk].fleet;
+    ctx.p.fleets[fleet].rpc_timeout
 }
 
 /// Frontend → matching poll with the matching client's retry (polls retried up to 1 min).
@@ -482,6 +531,7 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
         return (cmds, 0.0);
     }
     let mut completed_in_step = snap.completed_in_step;
+    let mut failed_in_step = snap.failed_in_step;
     let mut timer_fired = snap.timer_fired;
     let mut children_done = snap.children_done;
     let mut rng = ctx.rng.borrow_mut();
@@ -501,6 +551,7 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
                 count,
                 parallel,
                 tq,
+                on_failure,
                 ..
             } => {
                 if !prog.step_started {
@@ -510,17 +561,24 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
                     cmds.schedule_activities.push((prog.step, *tq, n));
                     break;
                 }
-                if completed_in_step >= *count {
+                if failed_in_step > 0 && *on_failure == OnFailure::Fail {
+                    // the workflow returns the activity's error: FailWorkflowExecution
+                    cmds.complete = true;
+                    cmds.fail = true;
+                    prog.done = true;
+                    break;
+                }
+                // with `on_failure: continue` a failed activity counts as done
+                let done = completed_in_step + failed_in_step;
+                if done >= *count {
                     advance(&mut prog);
                     completed_in_step = 0;
+                    failed_in_step = 0;
                     timer_fired = false;
                     children_done = 0;
                     continue;
                 }
-                if !*parallel
-                    && completed_in_step >= prog.step_scheduled
-                    && prog.step_scheduled < *count
-                {
+                if !*parallel && done >= prog.step_scheduled && prog.step_scheduled < *count {
                     prog.step_scheduled += 1;
                     cmds.schedule_activities.push((prog.step, *tq, 1));
                 }
@@ -533,6 +591,7 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
                 cmds.markers += count;
                 advance(&mut prog);
                 completed_in_step = 0;
+                failed_in_step = 0;
                 timer_fired = false;
                 children_done = 0;
                 continue;
@@ -546,6 +605,7 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
                 if timer_fired {
                     advance(&mut prog);
                     completed_in_step = 0;
+                    failed_in_step = 0;
                     timer_fired = false;
                     children_done = 0;
                     continue;
@@ -561,6 +621,7 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
                 if children_done >= *count {
                     advance(&mut prog);
                     completed_in_step = 0;
+                    failed_in_step = 0;
                     timer_fired = false;
                     children_done = 0;
                     continue;
@@ -572,6 +633,7 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
                     prog.signals_consumed += count;
                     advance(&mut prog);
                     completed_in_step = 0;
+                    failed_in_step = 0;
                     timer_fired = false;
                     children_done = 0;
                     continue;
@@ -586,6 +648,7 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
                 if timeout.is_some() && timer_fired {
                     advance(&mut prog);
                     completed_in_step = 0;
+                    failed_in_step = 0;
                     timer_fired = false;
                     children_done = 0;
                     continue;
@@ -594,7 +657,12 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
             }
         }
     }
-    let _ = (completed_in_step, timer_fired, children_done);
+    let _ = (
+        completed_in_step,
+        failed_in_step,
+        timer_fired,
+        children_done,
+    );
     cmds.new_prog = prog;
     (cmds, la_time)
 }
@@ -645,22 +713,14 @@ pub async fn process_wft(ctx: Ctx, wk: usize, first: WftInfo, permit: Permit) {
                         Conn::Worker(wk),
                         ns,
                         Api::GetWorkflowExecutionHistory,
-                        Retry::DEFAULT,
+                        Retry::call(f.rpc_timeout),
                         0.0,
-                        move |c, _fe| async move {
+                        move |c, _fe, deadline| async move {
                             history_call(&c, shard, |c2, hp| {
                                 let c2 = c2.clone();
                                 async move {
-                                    history::get_history(
-                                        &c2,
-                                        hp,
-                                        wf,
-                                        wgen,
-                                        pages,
-                                        false,
-                                        now() + 10_000_000,
-                                    )
-                                    .await
+                                    history::get_history(&c2, hp, wf, wgen, pages, false, deadline)
+                                        .await
                                 }
                             })
                             .await
@@ -762,18 +822,15 @@ async fn respond_wft_full(
         Conn::Worker(wk),
         ns,
         Api::RespondWorkflowTaskCompleted,
-        Retry::DEFAULT,
+        Retry::call(worker_rpc_timeout(ctx, wk)),
         ctx.p.costs.frontend_per_command * ncmd as f64,
-        move |c, _fe| {
+        move |c, _fe, deadline| {
             let cmds = cmds.clone();
             async move {
                 history_call(&c, shard, |c2, hp| {
                     let c2 = c2.clone();
                     let cmds = cmds.clone();
-                    async move {
-                        history::respond_wft_completed(&c2, hp, info, cmds, now() + 10_000_000)
-                            .await
-                    }
+                    async move { history::respond_wft_completed(&c2, hp, info, cmds, deadline).await }
                 })
                 .await
             }
@@ -795,49 +852,75 @@ async fn respond_wft(
 }
 
 /// Execute an activity task: run for its duration (heartbeating), then respond.
+///
+/// The Go SDK runs the activity under a context whose deadline is the earlier of start-to-close
+/// from now and schedule-to-close from the first schedule (`calculateActivityDeadline`). The
+/// activity is assumed to honour it and stop there; a result past the deadline is dropped
+/// without a response ("Activity complete after timeout" in `internal_task_handlers.go`), and
+/// history's timeout task retries or fails the attempt.
 pub async fn process_activity(ctx: Ctx, wk: usize, info: ActTaskInfo, permit: Permit) {
-    let (duration, heartbeat, failure_rate) =
+    let (duration, heartbeat, failure_rate, timeouts) =
         match ctx.p.wf_types[info.wf_type].steps.get(info.step) {
             Some(StepP::Activity {
                 duration,
                 heartbeat,
                 failure_rate,
+                timeouts,
                 ..
             }) => (
                 duration.sample_us(&mut ctx.rng.borrow_mut()),
                 *heartbeat,
                 *failure_rate,
+                *timeouts,
             ),
-            _ => (1_000, None, 0.0),
+            _ => (1_000, None, 0.0, Default::default()),
         };
     let ns = ctx.p.wf_types[info.wf_type].ns;
     let Some(shard) = ctx.wf_shard(info.wf, info.wgen) else {
         drop(permit);
         return;
     };
-    let end = now() + duration;
+    let mut deadline = Time::MAX;
+    if timeouts.start_to_close > 0 {
+        deadline = now().saturating_add(timeouts.start_to_close);
+    }
+    if timeouts.schedule_to_close > 0 {
+        deadline = deadline.min(info.first_scheduled_at + timeouts.schedule_to_close);
+    }
+    let end = (now() + duration).min(deadline);
     if let Some(hb) = heartbeat {
         while now() + hb < end {
             sleep(hb).await;
-            let _ = sdk_call(
+            let r = sdk_call(
                 &ctx,
                 Conn::Worker(wk),
                 ns,
                 Api::RecordActivityTaskHeartbeat,
-                Retry::DEFAULT,
+                Retry::call(worker_rpc_timeout(&ctx, wk)),
                 0.0,
-                move |c, _fe| async move {
+                move |c, _fe, deadline| async move {
                     history_call(&c, shard, |c2, hp| {
                         let c2 = c2.clone();
-                        async move { history::heartbeat(&c2, hp, info, now() + 10_000_000).await }
+                        async move { history::heartbeat(&c2, hp, info, deadline).await }
                     })
                     .await
                 },
             )
             .await;
+            if r == Err(Err::NotFound) {
+                // the attempt timed out (or the workflow is gone): the Go SDK cancels the
+                // activity's context, the activity returns, and its result is not recorded
+                drop(permit);
+                return;
+            }
         }
     }
     crate::sim::executor::sleep_until(end).await;
+    if end >= deadline {
+        // timed out on the worker: no response
+        drop(permit);
+        return;
+    }
     let failed = ctx.rand() < failure_rate;
     let api = if failed {
         Api::RespondActivityTaskFailed
@@ -849,16 +932,14 @@ pub async fn process_activity(ctx: Ctx, wk: usize, info: ActTaskInfo, permit: Pe
         Conn::Worker(wk),
         ns,
         api,
-        Retry::DEFAULT,
+        Retry::call(worker_rpc_timeout(&ctx, wk)),
         0.0,
-        move |c, _fe| async move {
+        move |c, _fe, deadline| async move {
             history_call(&c, shard, |c2, hp| {
-                    let c2 = c2.clone();
-                    async move {
-                        history::respond_activity(&c2, hp, info, failed, now() + 10_000_000).await
-                    }
-                })
-                .await
+                let c2 = c2.clone();
+                async move { history::respond_activity(&c2, hp, info, failed, deadline).await }
+            })
+            .await
         },
     )
     .await;
@@ -936,9 +1017,9 @@ async fn scheduler_decide(ctx: &Ctx, wk: usize, info: &WftInfo) -> Commands {
             Conn::Worker(wk),
             tns,
             Api::StartWorkflowExecution,
-            Retry::DEFAULT,
+            Retry::call(Retry::DEFAULT_TIMEOUT),
             0.0,
-            move |c, _fe| async move {
+            move |c, _fe, deadline| async move {
                 history_call(&c, shard, |c2, hp| {
                     let c2 = c2.clone();
                     async move {
@@ -950,7 +1031,7 @@ async fn scheduler_decide(ctx: &Ctx, wk: usize, info: &WftInfo) -> Commands {
                             target,
                             StartOrigin::Schedule,
                             false,
-                            now() + 10_000_000,
+                            deadline,
                         )
                         .await
                     }

@@ -1,5 +1,6 @@
 //! Temporal 1.31.0 service model.
 
+pub mod activity;
 pub mod build;
 pub mod frontend;
 pub mod history;

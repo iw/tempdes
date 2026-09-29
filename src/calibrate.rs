@@ -2,7 +2,7 @@
 //!
 //! | Observed metric (Temporal name)                                  | Informs                                    |
 //! |------------------------------------------------------------------|--------------------------------------------|
-//! | `persistence_latency{operation=X}` (histogram / quantiles)        | DB service time distribution of X          |
+//! | `persistence_latency{operation=X}` (histogram / quantiles)        | DB service time distribution of X, fitted  |
 //! | `visibility_persistence_latency{operation=X}`                     | visibility store latency                    |
 //! | `persistence_requests{operation}` + DB utilisation observation    | database capacity (concurrency)             |
 //! | `container_cpu_usage_seconds_total` per service                   | per-service CPU cost scale (pilot run)      |
@@ -16,15 +16,34 @@ use crate::model::params::Params;
 use crate::model::types::*;
 use crate::util::units::{fmt_rate, fmt_us};
 
+/// Observed `persistence_latency` of `op` as a distribution.
+pub fn observed_latency(obs: &Observations, op: PersistOp) -> Option<crate::sim::dist::Dist> {
+    let name = if op.is_visibility() {
+        "visibility_persistence_latency"
+    } else {
+        "persistence_latency"
+    };
+    obs.latency(name, &[("operation", op.as_str())])
+        .and_then(|o| o.to_dist())
+}
+
 /// Apply observations to `p`. With `workload`, start and signal rates are set to the observed
 /// rates times `load` (the `--load` / sweep `load=` multiplier), so a load multiplier scales
 /// the calibrated workload instead of being undone by it.
+///
+/// Observed persistence latency is the whole call as the history service measures it: the wait
+/// for a connection, queueing in the database, and for Create/UpdateWorkflowExecution the history
+/// append inside the call. Its distribution sets the operation's service time scaled by
+/// `fit[op]` (`None` = as observed), the factor a pilot run finds so that the simulated latency,
+/// queueing included, reproduces the observed one (`run::calibrate`, whose notes describe the
+/// fitted operations); and the write operations then no longer add a separate append.
 pub fn apply(
     p: &mut Params,
     obs: &Observations,
     persistence_latency: bool,
     workload: bool,
     load: f64,
+    fit: &[Option<f64>],
 ) {
     let mut notes = Vec::new();
     // --- persistence latency → DB service times ------------------------------------------------
@@ -32,20 +51,19 @@ pub fn apply(
         if !persistence_latency {
             break;
         }
-        let name = if op.is_visibility() {
-            "visibility_persistence_latency"
-        } else {
-            "persistence_latency"
-        };
-        if let Some(o) = obs.latency(name, &[("operation", op.as_str())])
-            && let Some(d) = o.to_dist()
-        {
-            notes.push(format!(
-                "calibrated {} service time from {name}: p50 {} p99 {}",
-                op.as_str(),
-                fmt_us(d.quantile(0.5)),
-                fmt_us(d.quantile(0.99))
-            ));
+        if let Some(d) = observed_latency(obs, op) {
+            let d = match fit.get(op.idx()).copied().flatten() {
+                Some(k) => d.scaled(k),
+                None => {
+                    notes.push(format!(
+                        "calibrated {} service time from observed latency: p50 {} p99 {}",
+                        op.as_str(),
+                        fmt_us(d.quantile(0.5)),
+                        fmt_us(d.quantile(0.99))
+                    ));
+                    d
+                }
+            };
             if op.is_visibility() {
                 match op {
                     PersistOp::ListWorkflowExecutions | PersistOp::CountWorkflowExecutions => {
@@ -55,8 +73,18 @@ pub fn apply(
                 }
             } else {
                 p.db_latency[op.idx()] = d;
+                if matches!(
+                    op,
+                    PersistOp::CreateWorkflowExecution | PersistOp::UpdateWorkflowExecution
+                ) {
+                    // production measured the append inside the call
+                    p.db_includes_append[op.idx()] = true;
+                }
             }
         }
+    }
+    if persistence_latency && observed_latency(obs, PersistOp::AppendHistoryNodes).is_some() {
+        notes.push("observed AppendHistoryNodes latency applies only where a write appends history on its own: history appends inside Create/UpdateWorkflowExecution, whose latency includes it".into());
     }
 
     // --- database capacity from observed utilisation -----------------------------------------------

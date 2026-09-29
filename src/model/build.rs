@@ -8,7 +8,7 @@ use std::rc::Rc;
 use crate::sim::executor::{Executor, Time, now, sleep, sleep_until, spawn};
 use crate::sim::rng::Rng;
 use crate::sim::stats::TimeGauge;
-use crate::sim::sync::Semaphore;
+use crate::sim::sync::{Semaphore, WeightedSemaphore};
 use crate::util::lru::Lru;
 
 use super::frontend;
@@ -87,8 +87,56 @@ pub fn task_scheduler_qps(p: &Params, owned: u32) -> (f64, Vec<f64>) {
     (host, ns)
 }
 
-/// Set a history pod's persistence and task scheduler rates from the shards it owns.
-fn apply_history_limits(p: &Params, pod: &mut Pod) {
+/// A pod's per-namespace persistence rates (`PersistenceNamespaceMaxQps`). History splits a
+/// cluster-wide namespace limit by shard ownership (`OwnershipAwareNamespaceQuotaCalculator`),
+/// or divides it by its pods before it owns shards; matching divides it by its pods
+/// (`ClusterAwareNamespaceQuotaCalculator`); otherwise the per-pod setting applies. A rate of 0
+/// falls back to the pod's own persistence rate `host` (`newPriorityNamespaceRateLimiter`), so a
+/// namespace limiter always runs, at that rate by default. Frontend and worker pods make no
+/// namespace calls in the model.
+pub fn namespace_persistence_qps(
+    p: &Params,
+    svc: Service,
+    n_same: usize,
+    owned: u32,
+    host: f64,
+) -> Vec<f64> {
+    p.namespaces
+        .iter()
+        .map(|ns| {
+            let q = match svc {
+                Service::History => {
+                    let global = ns.hist_persist_global_ns_qps;
+                    ownership_share(global, owned, p.num_shards)
+                        .or_else(|| (global > 0.0 && n_same > 0).then(|| global / n_same as f64))
+                        .unwrap_or(ns.hist_persist_ns_qps)
+                }
+                Service::Matching => frontend::per_instance(
+                    ns.matching_persist_global_ns_qps,
+                    ns.matching_persist_ns_qps,
+                    n_same,
+                ),
+                _ => 0.0,
+            };
+            if q > 0.0 { q } else { host }
+        })
+        .collect()
+}
+
+/// Set `pod`'s namespace persistence limiters from `rates`.
+fn set_namespace_limits(p: &Params, pod: &mut Pod, rates: &[f64]) {
+    for (l, &r) in pod.ns_persist_limiters.iter_mut().zip(rates) {
+        l.set_rate(
+            r,
+            r * p.k.persistence_burst_ratio,
+            Some(p.k.operator_rps_ratio),
+        );
+    }
+}
+
+/// Set a history pod's persistence and task scheduler rates from the shards it owns;
+/// `n_history` is the number of live history pods.
+fn apply_history_limits(p: &Params, pod: &mut Pod, n_history: usize) {
     let Some(owned) = pod.hist.as_ref().map(|h| h.owned_shards) else {
         return;
     };
@@ -99,6 +147,8 @@ fn apply_history_limits(p: &Params, pod: &mut Pod) {
             q * p.k.persistence_burst_ratio,
             Some(p.k.operator_rps_ratio),
         );
+        let rates = namespace_persistence_qps(p, Service::History, n_history, owned, q);
+        set_namespace_limits(p, pod, &rates);
     }
     let (host, ns) = task_scheduler_qps(p, owned);
     if let Some(h) = pod.hist.as_mut() {
@@ -108,8 +158,9 @@ fn apply_history_limits(p: &Params, pod: &mut Pod) {
 
 /// Re-derive every live history pod's limits after shard ownership changes.
 pub fn refresh_history_limits(ctx: &Ctx) {
+    let n = ctx.n_live(Service::History);
     for pod in ctx.live_pods(Service::History) {
-        apply_history_limits(&ctx.p, &mut ctx.pods.borrow_mut()[pod]);
+        apply_history_limits(&ctx.p, &mut ctx.pods.borrow_mut()[pod], n);
     }
 }
 
@@ -132,6 +183,23 @@ pub fn make_pod(
         )
     } else {
         PriorityLimiter::unlimited(7)
+    };
+    // Temporal builds the namespace limiters only when the pod's persistence is limited
+    // (`FactoryProvider`)
+    let ns_persist_limiters = if pq > 0.0 {
+        namespace_persistence_qps(p, svc, n_same, 0, pq)
+            .into_iter()
+            .map(|r| {
+                PriorityLimiter::new(
+                    7,
+                    r,
+                    r * k.persistence_burst_ratio,
+                    Some(k.operator_rps_ratio),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
     };
     let (rps_limiter, fe) = match svc {
         Service::Frontend => {
@@ -161,10 +229,11 @@ pub fn make_pod(
     let hist = (svc == Service::History).then(|| HistoryHostState {
         cache: Lru::new(k.cache_max_size),
         schedulers: [
-            Semaphore::new(k.scheduler_workers[0]),
-            Semaphore::new(k.scheduler_workers[1]),
-            Semaphore::new(k.scheduler_workers[2]),
+            WeightedSemaphore::new(k.scheduler_workers[0]),
+            WeightedSemaphore::new(k.scheduler_workers[1]),
+            WeightedSemaphore::new(k.scheduler_workers[2]),
         ],
+        exec_queues: Default::default(),
         load_limiters: [
             TokenBucket::new(k.max_poll_host_rps[0], k.max_poll_host_rps[0]),
             TokenBucket::new(k.max_poll_host_rps[1], k.max_poll_host_rps[1]),
@@ -189,6 +258,8 @@ pub fn make_pod(
         cpu: FcfsServers::new(p.cpu[svc.idx()]),
         db_pool: Semaphore::new(p.max_conns[svc.idx()].max(1)),
         persist_limiter,
+        ns_persist_limiters,
+        shard_ns_limiters: Default::default(),
         rps_limiter,
         fe,
         hist,
@@ -265,8 +336,9 @@ pub fn build(p: Params) -> (Ctx, Executor) {
             persistence_ops: 0,
         });
     }
+    let n_history = service_replicas(&p, Service::History);
     for pod in pods.iter_mut() {
-        apply_history_limits(&p, pod);
+        apply_history_limits(&p, pod, n_history);
     }
 
     // matching partitions
@@ -680,12 +752,19 @@ pub fn apply_dc(ctx: &Ctx, key: &str, v: &crate::config::dynamic::DcValue) -> bo
                 ));
                 return false;
             }
+            let n = ctx.n_live(svc);
             for pod in ctx.live_pods(svc) {
-                ctx.pods.borrow_mut()[pod].persist_limiter.set_rate(
+                let mut pods = ctx.pods.borrow_mut();
+                let pd = &mut pods[pod];
+                pd.persist_limiter.set_rate(
                     num,
                     num * ctx.p.k.persistence_burst_ratio,
                     Some(ctx.p.k.operator_rps_ratio),
                 );
+                // namespace limiters without a setting of their own follow the pod's rate
+                let owned = pd.hist.as_ref().map_or(0, |h| h.owned_shards);
+                let rates = namespace_persistence_qps(&ctx.p, svc, n, owned, num);
+                set_namespace_limits(&ctx.p, pd, &rates);
             }
         }
         "history.transferprocessorschedulerworkercount"
@@ -771,12 +850,15 @@ pub async fn scale(ctx: &Ctx, svc: Service, target: usize) {
     }
     let n = ctx.n_live(svc);
     let q = persistence_qps(&ctx.p, svc, n);
+    let rates = namespace_persistence_qps(&ctx.p, svc, n, 0, q);
     for pod in ctx.live_pods(svc) {
-        ctx.pods.borrow_mut()[pod].persist_limiter.set_rate(
+        let mut pods = ctx.pods.borrow_mut();
+        pods[pod].persist_limiter.set_rate(
             q,
             q * ctx.p.k.persistence_burst_ratio,
             Some(ctx.p.k.operator_rps_ratio),
         );
+        set_namespace_limits(&ctx.p, &mut pods[pod], &rates);
     }
 }
 
@@ -854,8 +936,15 @@ async fn rebalance_history(ctx: &Ctx) {
             let sem = sem.clone();
             spawn(async move {
                 let _p = sem.acquire().await;
-                let _ = persist(&c, owner, PersistOp::GetOrCreateShard, Caller::ShardMgmt).await;
-                let _ = persist(&c, owner, PersistOp::UpdateShard, Caller::ShardMgmt).await;
+                let _ = persist(
+                    &c,
+                    owner,
+                    PersistOp::GetOrCreateShard,
+                    Caller::ShardMgmt,
+                    None,
+                )
+                .await;
+                let _ = persist(&c, owner, PersistOp::UpdateShard, Caller::ShardMgmt, None).await;
                 // engine creation + queue processor start
                 cpu(&c, owner, 2_000.0).await;
                 sleep(c.p.k.shard_engine_start).await;

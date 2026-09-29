@@ -86,6 +86,8 @@ pub struct WorkflowResult {
     pub offered_start_rate: f64,
     pub started_per_s: f64,
     pub completed_per_s: f64,
+    /// workflows closed as failed per second (an activity failed for good)
+    pub failed_per_s: f64,
     pub start_failures: u64,
     pub e2e: Lat,
     pub wft_schedule_to_start: Lat,
@@ -99,6 +101,10 @@ pub struct WorkflowResult {
     pub history_pages_fetched: u64,
     pub activities_per_s: f64,
     pub activity_failures: u64,
+    /// activity timeouts that fired, by kind (`StartToClose`, `ScheduleToStart`, ...)
+    pub activity_timeouts: BTreeMap<String, u64>,
+    /// activities that failed for good (a timeout that is not retried, or retries used up)
+    pub activities_failed: u64,
     pub signals_per_s: f64,
     pub signals_failed: u64,
     pub eager_starts: u64,
@@ -217,6 +223,21 @@ pub struct TaskResult {
     pub other_retries: u64,
     /// the task scheduler limiter's refusals (`task_scheduler_throttled`) per second
     pub sched_throttled_per_s: f64,
+    /// runs on workflows' execution queues (execution queue scheduler) per second
+    pub exec_queue_runs_per_s: f64,
+}
+
+/// The execution queue scheduler (`history.taskSchedulerEnableExecutionQueueScheduler`).
+#[derive(Clone, Debug, Serialize)]
+pub struct ExecQueueResult {
+    /// tasks accepted into per-workflow queues per second
+    pub submitted_per_s: f64,
+    /// busy-workflow tasks turned away because `MaxQueues` queues existed
+    pub rejected: u64,
+    /// most queues open at once on one scheduler
+    pub max_queues: usize,
+    /// `...MaxQueues`
+    pub queue_limit: usize,
 }
 
 /// The history task scheduler's rate limiter (`history.taskSchedulerEnableRateLimiter`).
@@ -255,6 +276,8 @@ pub struct HistoryResult {
     pub events_cache_hit_ratio: f64,
     pub tasks: Vec<TaskResult>,
     pub task_scheduler: TaskSchedulerResult,
+    /// present when the execution queue scheduler is on
+    pub exec_queues: Option<ExecQueueResult>,
     pub shards_per_pod: Vec<(String, u64)>,
     pub shard_moves: u64,
     pub shard_unavailable: Lat,
@@ -411,6 +434,7 @@ pub fn analyze_window(
             offered_start_rate: t.start_rate,
             started_per_s: w.started as f64 / dur,
             completed_per_s: w.completed as f64 / dur,
+            failed_per_s: w.failed as f64 / dur,
             start_failures: w.start_failed,
             e2e: Lat::of(&w.e2e),
             wft_schedule_to_start: Lat::of(&w.wft_sched_to_start),
@@ -428,6 +452,12 @@ pub fn analyze_window(
             history_pages_fetched: w.history_pages_fetched,
             activities_per_s: w.activities_completed as f64 / dur,
             activity_failures: w.activity_failures,
+            activity_timeouts: crate::model::activity::TimeoutKind::ALL
+                .iter()
+                .filter(|k| w.activity_timeouts[k.idx()] > 0)
+                .map(|k| (k.as_str().to_string(), w.activity_timeouts[k.idx()]))
+                .collect(),
+            activities_failed: w.activities_failed,
             signals_per_s: w.signals_sent as f64 / dur,
             signals_failed: w.signals_failed,
             eager_starts: w.eager_starts,
@@ -530,9 +560,24 @@ pub fn analyze_window(
             }
             let pq = pod.persist_limiter.rate();
             if pq > 0.0 {
-                // calls the limiter charges (not AppendHistoryNodes), rejected ones included
+                // calls that reach the pod's limiter, rejected ones included
                 let n = m.persist_limited_by_pod.get(id).copied().unwrap_or(0) as f64;
                 limit_util.push((format!("{}.persistenceMaxQPS", svc.as_str()), n / dur / pq));
+                // a namespace limit set below the pod's rate
+                for (ni, l) in pod.ns_persist_limiters.iter().enumerate() {
+                    let r = l.rate();
+                    let n = m.persist_ns_limited.get(&(id, ni)).copied().unwrap_or(0) as f64;
+                    if r > 0.0 && r < pq && n > 0.0 {
+                        limit_util.push((
+                            format!(
+                                "{}.persistenceNamespaceMaxQPS[{}]",
+                                svc.as_str(),
+                                p.namespaces[ni].name
+                            ),
+                            n / dur / r,
+                        ));
+                    }
+                }
             }
             if let Some(fe) = &pod.fe {
                 for (ni, lim) in fe.ns_limiters.iter().enumerate() {
@@ -748,6 +793,7 @@ pub fn analyze_window(
                 .collect(),
             other_retries: o.other_errors,
             sched_throttled_per_s: o.sched_throttled as f64 / dur,
+            exec_queue_runs_per_s: o.exec_queue_runs as f64 / dur,
         });
     }
     let task_scheduler = {
@@ -783,6 +829,24 @@ pub fn analyze_window(
                 .map(|(p, h)| (p.addr.clone(), h.sched_throttled as f64 / dur)),
         }
     };
+    let exec_queues = p.k.eqs_enabled.then(|| {
+        let qs = pods
+            .iter()
+            .filter_map(|p| p.hist.as_ref())
+            .flat_map(|h| h.exec_queues.iter());
+        let (mut submitted, mut rejected, mut max_queues) = (0u64, 0u64, 0usize);
+        for q in qs {
+            submitted += q.submitted;
+            rejected += q.rejected;
+            max_queues = max_queues.max(q.max_queues_seen);
+        }
+        ExecQueueResult {
+            submitted_per_s: submitted as f64 / dur,
+            rejected,
+            max_queues,
+            queue_limit: p.k.eqs_max_queues,
+        }
+    });
     let shards_per_pod: Vec<(String, u64)> = pods
         .iter()
         .enumerate()
@@ -810,6 +874,7 @@ pub fn analyze_window(
         lock_wait: Lat::of(&m.lock_wait),
         lock_timeouts: m.lock_timeouts,
         task_scheduler,
+        exec_queues,
         hot_workflows: locks,
         cache_hit_ratio: if hits + misses > 0 {
             hits as f64 / (hits + misses) as f64

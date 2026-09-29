@@ -11,7 +11,7 @@ You describe a deployment and a workload. Two dimensions are adjustable:
 
 * **replica counts** for the frontend, history, matching and worker services;
 * **dynamic config**, in Temporal's own file format, for the settings that matter most for
-  throughput. 75 settings are simulated, and all 613 keys in 1.31.0 are validated.
+  throughput. 95 settings are simulated, and all 613 keys in 1.31.0 are validated.
 
 tempdes simulates the cluster request by request and reports what saturates first: CPU, database
 connections, a shard's IO semaphore, a single workflow's lock, a rate limiter, a history task
@@ -26,14 +26,14 @@ your observed values.
 ```text
 $ tempdes run examples/scenarios/hot-entity.yaml
 
-  3 critical / 2 warning hotspots — top: workflow lock contention (lock wait p99 9.50s, 4961 BUSY_WORKFLOW
+  4 critical / 1 warning hotspots — top: workflow lock contention (lock wait p99 9.50s, 5998 BUSY_WORKFLOW
   timeouts). Busiest resource: shard 151 IO at 100%.
 
-  CRITICAL #1  workflow-lock  workflow lock contention (lock wait p99 9.50s, 4961 BUSY_WORKFLOW timeouts)
-             · CartWorkflow-0 (#0) (shard 363): lock 100% busy, wait p99 9.50s, 1953 busy-workflow timeouts
+  CRITICAL #1  workflow-lock  workflow lock contention (lock wait p99 9.50s, 5998 BUSY_WORKFLOW timeouts)
+             · CartWorkflow-0 (#0) (shard 363): lock 100% busy, wait p99 9.50s, 1921 busy-workflow timeouts
              watch: history_workflow_execution_cache_latency, acquire_lock_failed, task_errors_workflow_busy, …
              knob: history.cacheNonUserContextLockTimeout = 500ms (default)  — longer waits reduce retries …
-  CRITICAL #3  shard  hot history shard 151 (100% IO busy, wait p99 2.11ms)
+  CRITICAL #2  shard  hot history shard 151 (100% IO busy, wait p99 2.02ms)
              Shard 151 is busy because workflow CartWorkflow-1 (#1) writes to it continuously … raising
              history.shardIOConcurrency or adding history pods will not help — the fix is fewer writes per
              workflow (batch signals, split the entity) or a faster database write.
@@ -112,7 +112,7 @@ tempdes profile save prod my-cluster.yaml -r history=4 -o observed.yaml
 tempdes run --profile prod --load 1.5
 
 # dynamic config tooling
-tempdes dc modeled                       # the 75 simulated keys, with 1.31.0 defaults
+tempdes dc modeled                       # the 95 simulated keys, with 1.31.0 defaults
 tempdes dc explain history.shardIOConcurrency
 tempdes dc validate examples/dynamicconfig/with-mistakes.yaml
 
@@ -213,14 +213,14 @@ useful fix for a hotspot, the report marks it *(not simulated)*.
 
 ### Simulated settings (highlights)
 
-Run `tempdes dc modeled` for the full list of 82 keys with their defaults and descriptions.
+Run `tempdes dc modeled` for the full list of 95 keys with their defaults and descriptions.
 
 | Area | Keys |
 |---|---|
 | Frontend limits | `frontend.rps`, `frontend.globalRPS`, `frontend.namespaceRPS`, `frontend.globalNamespaceRPS`, `frontend.namespaceBurstRatio`, `frontend.namespaceCount` / `globalNamespaceCount`, `frontend.namespaceRPS.visibility` (+ global/burst), `frontend.pollWaitForNamespaceRateLimitToken`, `frontend.keepAliveMaxConnectionAge`, `system.operatorRPSRatio` |
-| Persistence | `{frontend,history,matching,worker}.persistenceMaxQPS`, `{history,matching}.persistenceGlobalMaxQPS`, `system.persistenceQPSBurstRatio` |
-| History | `history.rps`, `history.shardIOConcurrency`, `history.hostLevelCacheMaxSize`, `history.cacheNonUserContextLockTimeout`, `history.eventsCacheMaxSizeBytes`, `history.acquireShardConcurrency`, `history.defaultWorkflowTaskTimeout`, `history.longPollExpirationInterval` |
-| History task queues | `*ProcessorSchedulerWorkerCount`, `*TaskBatchSize`, `*ProcessorMaxPollRPS`, `*ProcessorMaxPollHostRPS`, `*ProcessorUpdateAckInterval`, `history.queuePendingTasksMaxCount`, `history.timerProcessorMaxTimeShift`, `history.shardUpdateMin{Interval,TasksCompleted}`, the task scheduler's rate limiter: `history.taskSchedulerEnableRateLimiter{,ShadowMode}`, `history.taskSchedulerRateLimiterStartupDelay`, `history.taskScheduler{,Global}{,Namespace}MaxQPS` |
+| Persistence | `{frontend,history,matching,worker}.persistenceMaxQPS`, `{history,matching}.persistenceGlobalMaxQPS`, the per-namespace limits `{history,matching}.persistence{,Global}NamespaceMaxQPS` and `history.persistencePerShardNamespaceMaxQPS`, `system.persistenceQPSBurstRatio` |
+| History | `history.rps`, `history.shardIOConcurrency`, `history.hostLevelCacheMaxSize`, `history.cacheNonUserContextLockTimeout`, `history.eventsCacheMaxSizeBytes`, `history.acquireShardConcurrency`, `history.defaultWorkflowTaskTimeout`, `history.defaultActivityRetryPolicy`, `history.longPollExpirationInterval` |
+| History task queues | `*ProcessorSchedulerWorkerCount`, `*TaskBatchSize`, `*ProcessorMaxPollRPS`, `*ProcessorMaxPollHostRPS`, `*ProcessorUpdateAckInterval`, `history.queuePendingTasksMaxCount`, `history.timerProcessorMaxTimeShift`, `history.shardUpdateMin{Interval,TasksCompleted}`, the task scheduler's rate limiter: `history.taskSchedulerEnableRateLimiter{,ShadowMode}`, `history.taskSchedulerRateLimiterStartupDelay`, `history.taskScheduler{,Global}{,Namespace}MaxQPS`, the scheduler's weights per priority `history.{transfer,timer,visibility}ProcessorSchedulerActiveRoundRobinWeights`, and the execution queue scheduler `history.taskSchedulerEnableExecutionQueueScheduler`, `history.taskSchedulerExecutionQueueScheduler{MaxQueues,QueueTTL,QueueConcurrency}` |
 | Matching | `matching.rps`, `matching.numTaskqueue{Read,Write}Partitions`, `matching.forwarderMax{OutstandingPolls,OutstandingTasks,RatePerSecond,ChildrenPerNode}`, `matching.outstandingTaskAppendsThreshold`, `matching.maxTaskBatchSize`, `matching.getTasksBatchSize`, `matching.getTasksReloadAt`, `matching.maxWaitForPollerBeforeFwd`, `matching.backlogNegligibleAge`, `matching.longPollExpirationInterval`, `admin.matching*DispatchRate` |
 | Worker service | `worker.perNamespaceWorkerCount`, `worker.schedulerNamespaceStartWorkflowRPS`, `worker.schedulerLocalActivitySleepLimit`, `worker.ESProcessor{BulkActions,FlushInterval,NumOfWorkers}` |
 | Membership / features | `system.ringpopReplicaPoints`, `system.ringpopApproximateMaxPropagationTime`, `system.enableEagerWorkflowStart`, `system.enableActivityEagerExecution` |
@@ -351,7 +351,7 @@ are recognised.
 
 | Observed metric | Calibrates |
 |---|---|
-| `persistence_latency{operation}` | database service-time distribution per persistence operation. Quantiles are fitted piecewise in log space, so heavy tails are kept. |
+| `persistence_latency{operation}` | database service time per persistence operation. The observed distribution is fitted piecewise in log space, so heavy tails are kept, then scaled by a factor that pilot simulations adjust until the simulated mean latency, queueing included, matches the observed mean. The observed Create/UpdateWorkflowExecution latency includes the history append, so those writes add no separate `AppendHistoryNodes`. |
 | `visibility_persistence_latency{operation}` | visibility store read/write latency |
 | `persistence_requests{operation}` + `db_utilization` (or `rds_cpu_utilization`) | database capacity (concurrent operations before queueing) |
 | `container_cpu_usage_seconds_total{container=temporal-<svc>}` (or `cpu_cores{service_name}`) | per-service CPU cost scale, from a pilot simulation of the observed configuration. Sweep cells reuse the same scale. |
@@ -366,16 +366,16 @@ Validation rows cover these values:
 * CPU cores per service;
 * `approximate_backlog_count`.
 
-In the calibrated example, history CPU is 4.01 simulated vs 3.90 observed, sync match 0.72 vs
-0.78, and persistence p99s are within ±9%.
+In the calibrated example, history CPU is 3.96 simulated vs 3.90 observed, sync match 0.87 vs
+0.78, and persistence p99s are within 5%.
 
 Turn individual calibrations off in the scenario with
 `calibration: { persistence_latency: false, cpu: false, workload: false }`.
 
 `--load` and sweep `load=` columns multiply the calibrated workload. For example,
-`-o observed.yaml --load 1.5` simulates 1.5× the observed start rate. CPU calibration still comes
-from a pilot run at the observed load. The comparison with observed metrics is skipped, because
-the simulated workload is no longer the observed one.
+`-o observed.yaml --load 1.5` simulates 1.5× the observed start rate. CPU and persistence
+calibration still come from pilot runs at the observed load. The comparison with observed
+metrics is skipped, because the simulated workload is no longer the observed one.
 
 ## Saved run profiles
 
@@ -436,12 +436,13 @@ single hot workflow writing to it.
 
 | Category | Meaning |
 |---|---|
-| `throughput` | completions fall short of offered starts (a Poisson 3σ test, so noise isn't flagged) |
+| `throughput` | accepted starts fall short of the offered load, or workflows close more slowly than they start once their own run time (from their steps) is allowed for, so the number running grows. Both use a Poisson 3σ test, so noise isn't flagged. Workflows that wait for signals without a timeout have no known run time and get only the start test. |
 | `cpu`, `imbalance` | pod CPU saturation; uneven load across pods of one service |
 | `database`, `connection-pool` | database busy; per-pod SQL `maxConns` pools saturated (bursty pools are labelled as such) |
 | `shard` | a shard's IO semaphore is busy, or bursty write contention |
-| `workflow-lock` | per-workflow mutable-state lock saturation and `BUSY_WORKFLOW` timeouts |
+| `workflow-lock` | per-workflow mutable-state lock saturation and `BUSY_WORKFLOW` timeouts, and the execution queue scheduler's per-workflow queues when it is enabled |
 | `history-queue` | transfer/timer/visibility task retries, throttling and scheduler backlog, with the throttle cause |
+| `activity-timeouts` | activity schedule-to-start, start-to-close, schedule-to-close and heartbeat timeouts, and workflows failed because an activity failed for good |
 | `visibility` | Elasticsearch bulk processor or visibility persistence saturation |
 | `matching-backlog`, `matching-placement` | task backlogs and dispatch latency; uneven partition placement |
 | `rate-limit` | limiters rejecting requests, e.g. `frontend.namespaceRPS`, `history.rps`, `matching.rps`, persistence QPS, `namespaceCount` |
@@ -500,6 +501,7 @@ workers:                       # SDK worker fleets (Go SDK behaviour)
     sticky_cache_size: 5000
     sticky_schedule_to_start_timeout: 5s
     # cpu: 2, task_queue_activities_per_second: 500, poll_timeout: 70s, eager_activities: false
+    # rpc_timeout: 10s         # deadline of each respond/heartbeat/history call, retries included
 
 workflows:
   - type: OrderWorkflow
@@ -509,19 +511,22 @@ workflows:
     arrival: poisson           # poisson | uniform
     # ramp: { from: 0.2, over: 30s }
     starters: 4                # client processes (each pins one frontend connection)
-    # eager_start: false, await_result: false
+    # eager_start: false, await_result: false, rpc_timeout: 10s
     wft_processing: { p50: 2ms, p99: 12ms }
     # replay_per_event: 50us, payload_bytes: 2KiB
     steps:
       - activity: { count: 1, duration: { p50: 30ms, p99: 250ms } }
       - activity: { count: 2, parallel: true, duration: { p50: 60ms, p99: 400ms },
-                    failure_rate: 0.01, heartbeat: 10s }
+                    failure_rate: 0.01, heartbeat: 10s, heartbeat_timeout: 30s,
+                    start_to_close_timeout: 2m, schedule_to_start_timeout: 1m,
+                    retry_initial: 1s, backoff_coefficient: 2, max_interval: 1m, max_attempts: 5,
+                    on_failure: fail }     # fail | continue: when an activity fails for good
       - local_activity: { count: 1, duration: 5ms }
       - timer: 2s
       - child_workflow: { workflow_type: ShipmentWorkflow, count: 1 }
       - wait_signal: { count: 1, timeout: 1h }
 
-load:                          # traffic that is not workflow starts
+load:                          # traffic that is not workflow starts; each takes an rpc_timeout
   signals:   [ { workflow_type: CartWorkflow, rate: 400/s, target: hot, hot_workflows: 3 } ]
   queries:   [ { workflow_type: OrderWorkflow, rate: 20/s } ]
   describes: [ { workflow_type: OrderWorkflow, rate: 10/s } ]
@@ -547,6 +552,23 @@ report: { warn_utilization: 0.7, critical_utilization: 0.9, api_p99_slo: 500ms, 
 Durations and latencies accept a constant (`5ms`), `{ p50, p99 }` for a lognormal fit, a
 `quantiles` map, `{ dist: exp, mean }` and `{ dist: uniform, min, max }`. Rates accept `150/s`,
 `9000/m` or a bare number.
+
+**SDK calls.** As in the Go SDK, each call has one deadline, `rpc_timeout` (10s by default),
+and its retries happen inside it: a call still failing at the deadline returns
+`DeadlineExceeded`. Worker polls use `poll_timeout` and aren't retried by the call itself, and a
+client waiting for a result (`await_result`) long-polls the history for up to 65s.
+
+**Activities.** Retry-policy fields an activity leaves unset come from
+`history.defaultActivityRetryPolicy` for its namespace (1s initial interval, coefficient 2, a
+maximum interval of 100 × the initial one, unlimited attempts), as the server fills them in.
+Timeouts are filled in as the server does: a schedule-to-close timeout bounds the others and
+stands in for those not given, and the heartbeat timeout never exceeds start-to-close. An
+activity with neither schedule-to-close nor start-to-close gets a start-to-close of ten times its
+duration's p99, between 10s and 1h (a real SDK would refuse to schedule it), and an activity
+that heartbeats without a `heartbeat_timeout` gets twice its heartbeat interval. Schedule-to-start
+and schedule-to-close timeouts fail the activity; start-to-close and heartbeat timeouts retry the
+attempt while the policy allows. An activity that fails for good fails its workflow, unless
+the step says `on_failure: continue`.
 
 ## Example scenarios
 
@@ -576,18 +598,25 @@ source. In summary:
     proxy (`cluster.network.client_lb`).
 * **Frontend.**
   * `frontend.rps` and namespace priority rate limiters: higher priorities reserve tokens from
-    lower ones, so polls starve first.
-  * The long-running-request concurrency limit.
+    lower ones, so worker polls and history long polls (priority 5 in the namespace limiter)
+    starve first.
+  * The long-running-request concurrency limit, which counts polls, queries and history long
+    polls.
   * The visibility limiter.
 * **History.**
   * Per-workflow lock, with API deadline versus the non-user lock timeout.
   * Host-level mutable-state LRU cache and events cache.
   * Shard IO semaphore.
-  * Persistence priority rate limiter, which rejects immediately.
+  * Persistence priority rate limiters per pod, per namespace and per shard and namespace,
+    which reject immediately.
   * `history.rps`.
   * Transfer, timer and visibility queues: reader rate limits and batching, pending-task limits,
-    the 512-worker scheduler, and busy/throttled retry backoff.
+    and the 512-worker scheduler, which interleaves namespaces and priorities by weight. The
+    optional execution queue scheduler runs a busy workflow's tasks in their own queue. Failed
+    tasks retry as in Temporal: resubmitted at once (once only when throttled), then backed off.
   * Timer lookahead and checkpoints.
+  * Activity timeouts (schedule-to-start, start-to-close, schedule-to-close, heartbeat) on the
+    timer queue, with the activity's retry policy deciding between a retry and failure.
 * **Matching.**
   * The 1.31 matcher: sync match or backlog, and forwarding from child to root partitions.
   * Writer buffer overflow (`SystemOverloaded`), task batching and backlog reloads.
@@ -596,7 +625,7 @@ source. In summary:
   * Poller balancing between sticky and normal queues.
   * Slots and the sticky cache, with replay on a miss.
   * Eager workflow start and eager activities.
-  * Heartbeats, retries and timeouts.
+  * Activity heartbeats and failures, with each attempt stopping at its deadline.
   * Child workflows, signals with buffered events, and local activities.
 * **Worker service.**
   * Scheduler workflows on the per-namespace worker.
@@ -607,7 +636,7 @@ source. In summary:
   * The database as a multi-server queue with per-operation service times. Cassandra LWT
     operations are slower.
   * Network round trips.
-  * SDK retries with backoff.
+  * SDK retries with backoff, inside one deadline per call.
 
 ## Limitations
 

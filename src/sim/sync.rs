@@ -319,6 +319,258 @@ impl Semaphore {
     }
 }
 
+/// A worker pool fed by interleaved weighted round robin over keyed channels, after Temporal's
+/// host task scheduler (`common/tasks/interleaved_weighted_round_robin.go` in front of a FIFO
+/// worker pool). A caller that finds a free worker and nobody waiting takes it at once, as
+/// `TrySubmit` dispatches directly when no task is pending. Otherwise it waits in its key's
+/// channel, and each freed worker goes to the next non-empty channel in the flattened IWRR
+/// order: with weights high 10 and low 9, a saturated pool serves ten high tasks for every
+/// nine low ones rather than all high tasks first. Cheap to clone (reference counted).
+#[derive(Clone)]
+pub struct WeightedSemaphore {
+    st: Rc<RefCell<WState>>,
+}
+
+struct WChannel {
+    key: u64,
+    weight: u32,
+    waiters: VecDeque<(Sender<()>, Time)>,
+}
+
+#[derive(Default)]
+struct WState {
+    capacity: u32,
+    in_use: u32,
+    channels: Vec<WChannel>,
+    /// the flattened IWRR order, as indices into `channels`
+    order: Vec<usize>,
+    cursor: usize,
+    queued: usize,
+    // statistics
+    acquisitions: u64,
+    busy_area: f64,
+    queue_area: f64,
+    last_change: Time,
+    max_queue: usize,
+    wait: Histogram,
+    stats_start: Time,
+}
+
+impl WState {
+    fn account(&mut self) {
+        let t = now();
+        let dt = t.saturating_sub(self.last_change) as f64;
+        self.busy_area += dt * f64::from(self.in_use);
+        self.queue_area += dt * self.queued as f64;
+        self.last_change = t;
+    }
+
+    /// `flattenWeightedChannelsLocked`: channels sorted by weight; in round `r` (from the
+    /// largest weight down to 1) every channel heavier than `r - 1` gets a turn, heaviest first.
+    /// Equal weights are ordered by key so runs stay deterministic.
+    fn flatten(&mut self) {
+        let mut by_weight: Vec<usize> = (0..self.channels.len()).collect();
+        by_weight.sort_by_key(|&i| (self.channels[i].weight, self.channels[i].key));
+        let max = by_weight.last().map_or(0, |&i| self.channels[i].weight);
+        self.order.clear();
+        for round in (0..max).rev() {
+            for &i in by_weight.iter().rev() {
+                if self.channels[i].weight <= round {
+                    break;
+                }
+                self.order.push(i);
+            }
+        }
+        self.cursor = 0;
+    }
+
+    fn channel(&mut self, key: u64, weight: u32) -> usize {
+        match self.channels.iter().position(|c| c.key == key) {
+            Some(i) => i,
+            None => {
+                self.channels.push(WChannel {
+                    key,
+                    weight: weight.max(1),
+                    waiters: VecDeque::new(),
+                });
+                self.flatten();
+                self.channels.len() - 1
+            }
+        }
+    }
+}
+
+/// RAII permit of a [`WeightedSemaphore`]; releases on drop.
+pub struct WeightedPermit {
+    sem: WeightedSemaphore,
+}
+
+impl Drop for WeightedPermit {
+    fn drop(&mut self) {
+        self.sem.release();
+    }
+}
+
+impl WeightedSemaphore {
+    pub fn new(capacity: u32) -> Self {
+        let st = WState {
+            capacity: capacity.max(1),
+            last_change: now(),
+            stats_start: now(),
+            ..Default::default()
+        };
+        WeightedSemaphore {
+            st: Rc::new(RefCell::new(st)),
+        }
+    }
+
+    pub fn capacity(&self) -> u32 {
+        self.st.borrow().capacity
+    }
+
+    pub fn in_use(&self) -> u32 {
+        self.st.borrow().in_use
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.st.borrow().queued
+    }
+
+    /// Change the number of workers at runtime (dynamic config change).
+    pub fn set_capacity(&self, capacity: u32) {
+        {
+            let mut st = self.st.borrow_mut();
+            st.account();
+            st.capacity = capacity.max(1);
+        }
+        self.dispatch();
+    }
+
+    /// Wait for a worker in channel `key`, whose weight is `weight` (used when the channel is
+    /// first seen).
+    pub async fn acquire(&self, key: u64, weight: u32) -> WeightedPermit {
+        let rx = {
+            let mut st = self.st.borrow_mut();
+            if st.queued == 0 && st.in_use < st.capacity {
+                st.account();
+                st.in_use += 1;
+                st.acquisitions += 1;
+                st.wait.record(0);
+                drop(st);
+                return WeightedPermit { sem: self.clone() };
+            }
+            let (tx, rx) = oneshot();
+            st.account();
+            let i = st.channel(key, weight);
+            st.channels[i].waiters.push_back((tx, now()));
+            st.queued += 1;
+            st.max_queue = st.max_queue.max(st.queued);
+            rx
+        };
+        // the releaser counts the permit as ours before it sends
+        let _ = rx.await;
+        WeightedPermit { sem: self.clone() }
+    }
+
+    fn release(&self) {
+        {
+            let mut st = self.st.borrow_mut();
+            st.account();
+            st.in_use = st.in_use.saturating_sub(1);
+        }
+        self.dispatch();
+    }
+
+    /// Hand free workers to waiters in IWRR order.
+    fn dispatch(&self) {
+        loop {
+            let mut st = self.st.borrow_mut();
+            if st.in_use >= st.capacity || st.queued == 0 || st.order.is_empty() {
+                return;
+            }
+            // the next channel in the IWRR order that has a waiter
+            let n = st.order.len();
+            let mut found = None;
+            for k in 0..n {
+                let pos = (st.cursor + k) % n;
+                let ch = st.order[pos];
+                if !st.channels[ch].waiters.is_empty() {
+                    found = Some((pos, ch));
+                    break;
+                }
+            }
+            let Some((pos, ch)) = found else {
+                st.queued = 0;
+                st.cursor = 0;
+                return;
+            };
+            st.cursor = (pos + 1) % n;
+            let (tx, since) = st.channels[ch]
+                .waiters
+                .pop_front()
+                .expect("non-empty channel");
+            st.account();
+            st.queued -= 1;
+            if st.queued == 0 {
+                // the dispatcher's pass ends when nothing is pending; the next starts afresh
+                st.cursor = 0;
+            }
+            if tx.is_canceled() {
+                continue;
+            }
+            st.in_use += 1;
+            st.acquisitions += 1;
+            let waited = now().saturating_sub(since);
+            st.wait.record(waited);
+            drop(st);
+            if tx.send(()).is_err() {
+                let mut st = self.st.borrow_mut();
+                st.account();
+                st.in_use -= 1;
+                st.acquisitions -= 1;
+            }
+        }
+    }
+
+    /// Reset statistics (end of warm-up).
+    pub fn reset_stats(&self) {
+        let mut st = self.st.borrow_mut();
+        st.account();
+        st.acquisitions = 0;
+        st.busy_area = 0.0;
+        st.queue_area = 0.0;
+        st.max_queue = st.queued;
+        st.wait = Histogram::default();
+        st.stats_start = now();
+    }
+
+    /// Worker-microseconds used since the statistics window started.
+    pub fn busy_us(&self) -> f64 {
+        let mut st = self.st.borrow_mut();
+        st.account();
+        st.busy_area
+    }
+
+    pub fn stats(&self) -> SemStats {
+        let mut st = self.st.borrow_mut();
+        st.account();
+        let window = now().saturating_sub(st.stats_start).max(1) as f64;
+        SemStats {
+            capacity: st.capacity,
+            acquisitions: st.acquisitions,
+            timeouts: 0,
+            utilization: st.busy_area / window / f64::from(st.capacity),
+            mean_queue: st.queue_area / window,
+            max_queue: st.max_queue,
+            wait_p50_us: st.wait.quantile(0.50),
+            wait_p99_us: st.wait.quantile(0.99),
+            wait_max_us: st.wait.max(),
+            wait_mean_us: st.wait.mean(),
+            busy_us: st.busy_area,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +631,66 @@ mod tests {
         ex.run_until(1_000);
         assert_eq!(*got.borrow(), vec![("a", false, 21), ("b", true, 100)]);
         assert_eq!(sem.in_use(), 0);
+    }
+
+    #[test]
+    fn weighted_pool_interleaves_channels_by_weight() {
+        let mut ex = Executor::new();
+        let pool = WeightedSemaphore::new(1);
+        let order = Rc::new(RefCell::new(Vec::new()));
+        // hold the only worker while 20 high (key 0, weight 10) and 20 low (key 1, weight 9)
+        // tasks queue up
+        {
+            let pool = pool.clone();
+            ex.spawn(async move {
+                let _p = pool.acquire(0, 10).await;
+                sleep(10).await;
+            });
+        }
+        for i in 0..40u64 {
+            let pool = pool.clone();
+            let order = order.clone();
+            spawn(async move {
+                sleep(1).await;
+                let (key, weight) = if i < 20 { (0, 10) } else { (1, 9) };
+                let _p = pool.acquire(key, weight).await;
+                order.borrow_mut().push(key);
+                sleep(1).await;
+            });
+        }
+        ex.run_until(1_000);
+        let order = order.borrow();
+        assert_eq!(order.len(), 40);
+        // IWRR order for weights 10 and 9: high, then (high, low) nine times, then the rest
+        let first_19: Vec<u64> = order[..19].to_vec();
+        let mut expected = vec![0];
+        for _ in 0..9 {
+            expected.extend([0, 1]);
+        }
+        assert_eq!(first_19, expected);
+        // over the first 19 dispatches low gets 9, not 0 as under strict priority
+        assert_eq!(first_19.iter().filter(|&&k| k == 1).count(), 9);
+        assert_eq!(pool.in_use(), 0);
+        let s = pool.stats();
+        assert_eq!(s.acquisitions, 41);
+    }
+
+    #[test]
+    fn weighted_pool_dispatches_directly_when_idle() {
+        let mut ex = Executor::new();
+        let pool = WeightedSemaphore::new(2);
+        let got = Rc::new(RefCell::new(Vec::new()));
+        for i in 0..3u64 {
+            let pool = pool.clone();
+            let got = got.clone();
+            ex.spawn(async move {
+                sleep(i).await;
+                let _p = pool.acquire(i, 1).await;
+                got.borrow_mut().push((i, now()));
+                sleep(10).await;
+            });
+        }
+        ex.run_until(100);
+        assert_eq!(*got.borrow(), vec![(0, 0), (1, 1), (2, 10)]);
     }
 }

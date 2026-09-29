@@ -99,9 +99,9 @@ pub async fn start_flow(ctx: Ctx, wf_type: usize, client: usize) {
         Conn::Client(client),
         ns,
         Api::StartWorkflowExecution,
-        Retry::DEFAULT,
+        Retry::call(tp.rpc_timeout),
         0.0,
-        move |c, _fe| async move {
+        move |c, _fe, deadline| async move {
             history_call(&c, shard, |c2, hp| {
                 let c2 = c2.clone();
                 async move {
@@ -113,7 +113,7 @@ pub async fn start_flow(ctx: Ctx, wf_type: usize, client: usize) {
                         wf_type,
                         StartOrigin::Client,
                         eager,
-                        now() + 10_000_000,
+                        deadline,
                     )
                     .await
                 }
@@ -154,15 +154,13 @@ async fn await_result(ctx: &Ctx, client: usize, ns: usize, wf: WfId, wgen: u32, 
             ctx,
             Conn::Client(client),
             ns,
-            Api::GetWorkflowExecutionHistory,
-            Retry::DEFAULT,
+            Api::PollWorkflowExecutionHistory,
+            Retry::call(Retry::LONG_POLL_TIMEOUT),
             0.0,
-            move |c, _fe| async move {
+            move |c, _fe, deadline| async move {
                 history_call(&c, shard, |c2, hp| {
                     let c2 = c2.clone();
-                    async move {
-                        history::get_history(&c2, hp, wf, wgen, 1, true, now() + 60_000_000).await
-                    }
+                    async move { history::get_history(&c2, hp, wf, wgen, 1, true, deadline).await }
                 })
                 .await
             },
@@ -193,9 +191,9 @@ pub async fn start_entities(ctx: Ctx, client: usize) {
                 Conn::Client(client),
                 ns,
                 Api::StartWorkflowExecution,
-                Retry::DEFAULT,
+                Retry::call(Retry::DEFAULT_TIMEOUT),
                 0.0,
-                move |c, _fe| async move {
+                move |c, _fe, deadline| async move {
                     history_call(&c, shard, |c2, hp| {
                         let c2 = c2.clone();
                         async move {
@@ -207,7 +205,7 @@ pub async fn start_entities(ctx: Ctx, client: usize) {
                                 wf_type,
                                 StartOrigin::Entity,
                                 false,
-                                now() + 10_000_000,
+                                deadline,
                             )
                             .await
                         }
@@ -273,6 +271,7 @@ pub fn start_signalers(ctx: &Ctx, rates: &Rc<RefCell<Rates>>, client_base: usize
                 let client = client_base + c.rand_index(s.clients as usize);
                 let c2 = c.clone();
                 let wf_type = s.wf_type;
+                let rpc_timeout = s.rpc_timeout;
                 spawn(async move {
                     let ns = c2.p.wf_types[wf_type].ns;
                     let Some(shard) = c2.wf_shard(wf, wgen) else {
@@ -283,14 +282,12 @@ pub fn start_signalers(ctx: &Ctx, rates: &Rc<RefCell<Rates>>, client_base: usize
                         Conn::Client(client),
                         ns,
                         Api::SignalWorkflowExecution,
-                        Retry::DEFAULT,
+                        Retry::call(rpc_timeout),
                         0.0,
-                        move |c, _fe| async move {
+                        move |c, _fe, deadline| async move {
                             history_call(&c, shard, |c3, hp| {
                                 let c3 = c3.clone();
-                                async move {
-                                    history::signal(&c3, hp, wf, wgen, now() + 10_000_000).await
-                                }
+                                async move { history::signal(&c3, hp, wf, wgen, deadline).await }
                             })
                             .await
                         },
@@ -335,6 +332,7 @@ pub fn start_queries(ctx: &Ctx, client_base: usize, n_clients: usize) {
                 let c2 = c.clone();
                 let describe = q.describe;
                 let wf_type = q.wf_type;
+                let rpc_timeout = q.rpc_timeout;
                 spawn(async move {
                     let ns = c2.p.wf_types[wf_type].ns;
                     let Some(shard) = c2.wf_shard(wf, wgen) else {
@@ -354,14 +352,13 @@ pub fn start_queries(ctx: &Ctx, client_base: usize, n_clients: usize) {
                         Conn::Client(client),
                         ns,
                         api,
-                        Retry::DEFAULT,
+                        Retry::call(rpc_timeout),
                         0.0,
-                        move |c, _fe| async move {
+                        move |c, _fe, deadline| async move {
                             history_call(&c, shard, |c3, hp| {
                                 let c3 = c3.clone();
                                 async move {
-                                    history::describe(&c3, hp, wf, wgen, happ, now() + 10_000_000)
-                                        .await
+                                    history::describe(&c3, hp, wf, wgen, happ, deadline).await
                                 }
                             })
                             .await?;
@@ -425,15 +422,16 @@ pub fn start_visibility(ctx: &Ctx, client_base: usize, n_clients: usize) {
                     ),
                 };
                 let ns = v.ns;
+                let rpc_timeout = v.rpc_timeout;
                 spawn(async move {
                     let _ = sdk_call(
                         &c2,
                         Conn::Client(client),
                         ns,
                         api,
-                        Retry::NONE,
+                        Retry::call(rpc_timeout),
                         0.0,
-                        move |c, fe| async move { vis_read(&c, fe, op).await },
+                        move |c, fe, _deadline| async move { vis_read(&c, fe, op).await },
                     )
                     .await;
                 });
@@ -461,9 +459,9 @@ pub async fn start_schedules(ctx: Ctx, client: usize) {
                 Conn::Client(client),
                 ns,
                 Api::StartWorkflowExecution,
-                Retry::DEFAULT,
+                Retry::call(Retry::DEFAULT_TIMEOUT),
                 0.0,
-                move |c, _fe| async move {
+                move |c, _fe, deadline| async move {
                     history_call(&c, shard, |c2, hp| {
                         let c2 = c2.clone();
                         async move {
@@ -475,7 +473,7 @@ pub async fn start_schedules(ctx: Ctx, client: usize) {
                                 wf_type,
                                 StartOrigin::Schedule,
                                 false,
-                                now() + 10_000_000,
+                                deadline,
                             )
                             .await
                         }
@@ -599,6 +597,9 @@ pub fn reset_stats(c: &Ctx) {
             h.cache.reset_stats();
             for s in &h.schedulers {
                 s.reset_stats();
+            }
+            for q in &mut h.exec_queues {
+                q.reset_stats();
             }
             h.sched_throttled = 0;
             h.sched_limiter.refused_ns = 0;

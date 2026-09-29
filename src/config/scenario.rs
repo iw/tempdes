@@ -27,6 +27,10 @@ fn one() -> u32 {
 fn yes() -> bool {
     true
 }
+/// The Go SDK's per-call gRPC timeout (`defaultRPCTimeout`, sdk-go `internal_utils.go`).
+fn rpc_timeout() -> Dur {
+    Dur::from_secs(10.0)
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -387,6 +391,11 @@ pub struct WorkerFleetSpec {
     /// SDK long-poll deadline.
     #[serde(default = "WorkerFleetSpec::poll_timeout")]
     pub poll_timeout: Dur,
+    /// Deadline of every other SDK call from these workers (respond, heartbeat, history fetch).
+    /// Retries of a call share it: the Go SDK sets one context deadline per call (10s by
+    /// default) and retries inside it.
+    #[serde(default = "rpc_timeout")]
+    pub rpc_timeout: Dur,
     /// Request eager activity execution (needs `system.enableActivityEagerExecution`).
     #[serde(default)]
     pub eager_activities: bool,
@@ -455,6 +464,9 @@ pub struct WorkflowSpec {
     /// Client waits for the result (long-polls GetWorkflowExecutionHistory).
     #[serde(default)]
     pub await_result: bool,
+    /// Deadline of each StartWorkflowExecution call from the starters, retries included.
+    #[serde(default = "rpc_timeout")]
+    pub rpc_timeout: Dur,
     /// Worker-side time to process a workflow task when the workflow is in the sticky cache.
     #[serde(default = "WorkflowSpec::wft")]
     pub wft_processing: DurDist,
@@ -520,12 +532,53 @@ pub struct ActivityStep {
     /// Probability an attempt fails (retried by the server with backoff).
     #[serde(default)]
     pub failure_rate: f64,
-    /// Initial retry interval (Temporal default 1s, coefficient 2).
+    /// Retry policy: initial interval. Unset fields of the policy come from the namespace's
+    /// `history.defaultActivityRetryPolicy` (1s initial, coefficient 2, maximum interval 100 ×
+    /// initial, unlimited attempts).
     #[serde(default)]
     pub retry_initial: Option<Dur>,
+    /// Retry policy: backoff coefficient.
+    #[serde(default)]
+    pub backoff_coefficient: Option<f64>,
+    /// Retry policy: longest interval between attempts.
+    #[serde(default)]
+    pub max_interval: Option<Dur>,
+    /// Retry policy: attempts in total, the first included (0 = unlimited).
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    /// Longest wait in a task queue before a worker starts the attempt. Not retried: the
+    /// activity fails.
+    #[serde(default)]
+    pub schedule_to_start_timeout: Option<Dur>,
+    /// Longest run of one attempt; a timed-out attempt is retried.
+    #[serde(default)]
+    pub start_to_close_timeout: Option<Dur>,
+    /// Longest time for the whole activity, retries included. Not retried.
+    #[serde(default)]
+    pub schedule_to_close_timeout: Option<Dur>,
+    /// Longest gap between heartbeats of a running attempt (default twice `heartbeat`); a
+    /// timed-out attempt is retried.
+    #[serde(default)]
+    pub heartbeat_timeout: Option<Dur>,
+    /// What the workflow does when the activity fails for good (a timeout that is not retried,
+    /// or its retries run out): `fail` the workflow, as a Go workflow returning the error does,
+    /// or `continue` with the next step.
+    #[serde(default)]
+    pub on_failure: OnFailure,
     /// Dispatch to a different task queue than the workflow's.
     #[serde(default)]
     pub task_queue: Option<String>,
+}
+
+/// A workflow's reaction to an activity that failed for good.
+#[derive(Clone, Copy, Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFailure {
+    /// The workflow fails (the Go SDK default when the workflow returns the activity error).
+    #[default]
+    Fail,
+    /// The workflow handles the error and goes on.
+    Continue,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -589,6 +642,9 @@ pub struct SignalLoad {
     pub hot_workflows: u32,
     #[serde(default = "WorkflowSpec::starters")]
     pub clients: u32,
+    /// Deadline of each SignalWorkflowExecution call, retries included.
+    #[serde(default = "rpc_timeout")]
+    pub rpc_timeout: Dur,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -596,6 +652,9 @@ pub struct SignalLoad {
 pub struct QueryLoad {
     pub workflow_type: String,
     pub rate: Rate,
+    /// Deadline of each call, retries included.
+    #[serde(default = "rpc_timeout")]
+    pub rpc_timeout: Dur,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Default, PartialEq, Eq)]
@@ -614,6 +673,9 @@ pub struct VisibilityLoad {
     pub rate: Rate,
     #[serde(default)]
     pub op: VisibilityOp,
+    /// Deadline of each List/Count call.
+    #[serde(default = "rpc_timeout")]
+    pub rpc_timeout: Dur,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -833,6 +895,18 @@ impl Scenario {
                             "workflow {}: failure_rate must be in [0,1)",
                             w.type_name
                         );
+                        anyhow::ensure!(
+                            a.backoff_coefficient.is_none_or(|c| c >= 1.0),
+                            "workflow {}: backoff_coefficient cannot be less than 1",
+                            w.type_name
+                        );
+                        if let (Some(i), Some(m)) = (a.retry_initial, a.max_interval) {
+                            anyhow::ensure!(
+                                m.0 >= i.0,
+                                "workflow {}: max_interval cannot be less than retry_initial",
+                                w.type_name
+                            );
+                        }
                     }
                     _ => {}
                 }
