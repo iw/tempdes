@@ -5,7 +5,7 @@
 //! least `min_path_share` of the executions becomes a workflow type of its own, with that share
 //! of the start rate; rarer paths are folded into the most common one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use crate::model::world::{EVENT_BYTES, SIGNAL_BYTES};
@@ -65,11 +65,13 @@ pub fn build(traces: &[Trace], opts: &Options) -> Program {
         yaml,
         "# Imported by `tempdes workload import` from {} histories started over {}.\n\
          # Payloads were not read; payload_bytes comes from the history sizes the server\n\
-         # recorded. Durations are each step's own time, without waits in the cluster.\n\
-         # Add a worker fleet for every task queue named here.\nworkflows:",
+         # recorded. Durations are each step's own time, without waits in the cluster.\n#",
         traces.len(),
         fmt_us((last - first).max(0) as f64)
     );
+    let fleets = fleets(traces);
+    workers(&fleets, opts, &mut yaml);
+    let _ = writeln!(yaml, "workflows:");
     let mut types: Vec<(&str, Vec<&Trace>)> = by_type.into_iter().collect();
     // top-level types first
     types.sort_by_key(|(name, v)| (is_child(name, v, &child_types), *name));
@@ -102,7 +104,152 @@ pub fn build(traces: &[Trace], opts: &Options) -> Program {
             "{name}: started as a child, but none of its histories were given: imported as a stub with no steps"
         );
     }
+    let end = traces
+        .iter()
+        .map(|t| t.end_us.unwrap_or(t.start_us))
+        .max()
+        .unwrap_or(first);
+    fleets_summary(&fleets, (end - first).max(0) as f64, &mut summary);
     Program { yaml, summary }
+}
+
+/// A task queue's workers as the histories saw them: the processes that polled its workflow
+/// tasks and its activities, and the SDKs they reported.
+#[derive(Default)]
+struct Fleet<'a> {
+    workflow: BTreeSet<&'a str>,
+    activity: BTreeSet<&'a str>,
+    sdks: BTreeSet<&'a str>,
+}
+
+impl Fleet<'_> {
+    fn processes(&self) -> usize {
+        self.workflow.union(&self.activity).count()
+    }
+}
+
+/// The fleets of every task queue the histories name.
+fn fleets(traces: &[Trace]) -> BTreeMap<&str, Fleet<'_>> {
+    let mut out: BTreeMap<&str, Fleet<'_>> = BTreeMap::new();
+    for t in traces {
+        let activity_queues = t
+            .steps
+            .iter()
+            .flat_map(|s| s.activities().iter().map(|a| a.task_queue.as_str()));
+        for q in std::iter::once(t.task_queue.as_str()).chain(activity_queues) {
+            if !q.is_empty() {
+                out.entry(q).or_default();
+            }
+        }
+        for (q, p) in t.pollers.iter().filter(|(q, _)| !q.is_empty()) {
+            let f = out.entry(q.as_str()).or_default();
+            f.workflow.extend(p.workflow.iter().map(String::as_str));
+            f.activity.extend(p.activity.iter().map(String::as_str));
+        }
+        if !t.task_queue.is_empty() {
+            let f = out.entry(t.task_queue.as_str()).or_default();
+            f.sdks.extend(t.sdks.iter().map(String::as_str));
+        }
+    }
+    out
+}
+
+/// What the processes of a fleet ran: "3 ran workflow tasks and 4 ran activities".
+fn ran(f: &Fleet<'_>) -> String {
+    match (f.workflow.len(), f.activity.len()) {
+        (w, 0) => format!("{w} ran workflow tasks"),
+        (0, a) => format!("{a} ran activities"),
+        (w, a) => format!("{w} ran workflow tasks and {a} ran activities"),
+    }
+}
+
+/// A commented `workers:` block with a fleet per task queue: the processes seen, and the
+/// settings histories don't record left to the user. Identities are never written.
+fn workers(fleets: &BTreeMap<&str, Fleet<'_>>, opts: &Options, yaml: &mut String) {
+    if fleets.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        yaml,
+        "# Worker fleets, one per task queue: uncomment them and set the pollers and slots,\n\
+         # which histories don't record. `processes` counts the processes seen running tasks:\n\
+         # fewer than ran if the histories are a sample, more if processes were replaced.\n\
+         # workers:"
+    );
+    for (q, f) in fleets {
+        let _ = writeln!(yaml, "#   - name: {}", quote(q));
+        let _ = writeln!(yaml, "#     namespace: {}", quote(&opts.namespace));
+        let _ = writeln!(yaml, "#     task_queue: {}", quote(q));
+        let _ = match f.processes() {
+            0 => writeln!(
+                yaml,
+                "#     processes: 1             # no worker identity recorded"
+            ),
+            n => writeln!(yaml, "#     processes: {n:<13} # {}", ran(f)),
+        };
+        if !f.sdks.is_empty() {
+            let sdks: Vec<&str> = f.sdks.iter().copied().collect();
+            let _ = writeln!(yaml, "#     # workers report {}", sdks.join(", "));
+        }
+        let _ = writeln!(
+            yaml,
+            "#     # workflow_pollers, activity_pollers, workflow_slots, activity_slots: set yours"
+        );
+    }
+}
+
+/// The summary's account of the fleets: processes seen per task queue, the SDKs they
+/// reported, and what the counts can't tell.
+fn fleets_summary(fleets: &BTreeMap<&str, Fleet<'_>>, span_us: f64, summary: &mut String) {
+    if fleets.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        summary,
+        "worker fleets, one per task queue, with the processes seen in histories that span {}:",
+        fmt_us(span_us)
+    );
+    let mut queues_of: BTreeMap<&str, usize> = BTreeMap::new();
+    for (q, f) in fleets {
+        for w in f.workflow.union(&f.activity) {
+            *queues_of.entry(w).or_default() += 1;
+        }
+        let sdks: Vec<&str> = f.sdks.iter().copied().collect();
+        let _ = match f.processes() {
+            0 => writeln!(summary, "  {q}: no worker identity recorded"),
+            n => writeln!(
+                summary,
+                "  {q}: {n} process{} ({}){}",
+                if n == 1 { "" } else { "es" },
+                ran(f),
+                if sdks.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", sdks.join(", "))
+                }
+            ),
+        };
+    }
+    let shared = queues_of.values().filter(|&&n| n > 1).count();
+    if shared > 0 {
+        let _ = writeln!(
+            summary,
+            "  note: {shared} process{} ran tasks from more than one task queue, and count in each fleet: tempdes runs a fleet per task queue",
+            if shared == 1 { "" } else { "es" }
+        );
+    }
+    let others: BTreeSet<&str> = fleets
+        .values()
+        .flat_map(|f| f.sdks.iter().copied())
+        .filter(|s| !s.starts_with("temporal-go "))
+        .collect();
+    if !others.is_empty() {
+        let _ = writeln!(
+            summary,
+            "  note: workers report {}: tempdes follows the Go SDK's pollers and sticky cache, which other SDKs handle differently in detail",
+            others.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
 }
 
 fn is_child(name: &str, runs: &[&Trace], child_types: &[&str]) -> bool {

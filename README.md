@@ -392,9 +392,10 @@ temporal workflow show --workflow-id <id> --output json > histories/<id>.json   
 tempdes workload import histories/ --namespace orders --rate 150/s -o workflows.yaml
 ```
 
-The importer prints a `workflows:` block to paste into a scenario, and a summary of what it
-inferred. Both export spellings are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` and
-`ActivityTaskScheduled`, camelCase or snake_case keys).
+The importer prints a `workflows:` block to paste into a scenario, a commented `workers:`
+block to start the worker fleets from, and a summary of what it inferred. Both export spellings
+are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` and `ActivityTaskScheduled`, camelCase or
+snake_case keys).
 
 * **Steps.** The commands of one workflow task form a step: activities scheduled together run
   in parallel, `LocalActivity` markers are local activities run inside that task, a timer on its
@@ -433,8 +434,15 @@ inferred. Both export spellings are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` a
   that carry payloads, that gives each type's `payload_bytes`. The summary gives the range for
   events of 95–180 bytes, and notes when events that aren't modelled (markers, search attribute
   upserts, updates) may inflate it. Histories that don't record their size leave the default.
-* **Privacy.** Payloads are never read, but the output names your workflow and activity types
-  and task queues: keep it with your private profiles, not in a repository.
+* **Worker fleets are sketched.** Histories record which worker process started each task
+  (its `identity`, `pid@host` by default), but not its pollers or slots. The `workers:` block
+  has a fleet for each task queue with the number of processes seen; uncomment it and set the
+  pollers and slots from your deployment. The count is low if the histories are a sample that
+  missed some processes, and high if processes were replaced while the histories ran (a deploy,
+  autoscaling). The summary lists the SDKs the workers report.
+* **Privacy.** Payloads are never read, and worker identities, which name hosts, are counted
+  but never written. The output does name your workflow and activity types and task queues:
+  keep it with your private profiles, not in a repository.
 
 Not modelled, and counted in the summary: updates, Nexus operations, search attribute upserts,
 markers other than local activities, and continue-as-new (each run is imported as its own

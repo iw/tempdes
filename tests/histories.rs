@@ -160,6 +160,29 @@ impl History {
         }
     }
 
+    /// Record the worker processes that started its tasks, as the started events' `identity`:
+    /// `workflow` for workflow tasks and `activity` for activities, and the SDK the workflow
+    /// worker reports on its first workflow task completion (`sdkMetadata`).
+    fn record_workers(&mut self, workflow: &str, activity: &str, sdk: (&str, &str)) {
+        let mut reported = false;
+        for (e, kind) in self.events.iter_mut().zip(&self.kinds) {
+            match kind.as_str() {
+                "WorkflowTaskStarted" => {
+                    e["workflowTaskStartedEventAttributes"]["identity"] = workflow.into();
+                }
+                "ActivityTaskStarted" => {
+                    e["activityTaskStartedEventAttributes"]["identity"] = activity.into();
+                }
+                "WorkflowTaskCompleted" if !reported => {
+                    e["workflowTaskCompletedEventAttributes"]["sdkMetadata"] =
+                        json!({"sdkName": sdk.0, "sdkVersion": sdk.1});
+                    reported = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn json(&self) -> String {
         json!({"events": self.events}).to_string()
     }
@@ -765,6 +788,89 @@ fn payload_sizes_come_from_the_history_sizes_the_server_recorded() {
         p.summary.contains("payload_bytes left at the default"),
         "{}",
         p.summary
+    );
+}
+
+#[test]
+fn worker_processes_are_counted_per_task_queue_without_naming_them() {
+    // orders run by two workflow worker processes and three activity worker processes; the
+    // server's own identity isn't a worker. Two payment histories on their own task queue share
+    // a workflow worker process with the orders
+    let mut histories: Vec<String> = (0..6)
+        .map(|i| {
+            let mut h = order_history(f64::from(i) * 1000.0, 1, true, false);
+            let workflow = if i == 5 {
+                "history-service".to_string()
+            } else {
+                format!("{}@wf-host-{}@", 100 + i % 2, i % 2)
+            };
+            let activity = format!("{}@act-host-{}@", 200 + i % 3, i % 3);
+            h.record_workers(&workflow, &activity, ("temporal-java", "1.29.0"));
+            h.json()
+        })
+        .collect();
+    for i in 0..2 {
+        let mut h = order_history(f64::from(i) * 1000.0, 1, true, false);
+        h.record_workers("100@wf-host-0@", "300@pay-host@", ("temporal-go", "1.34.0"));
+        histories.push(h.json().replace("\"orders\"", "\"payments\""));
+    }
+    let p = import(&histories);
+    // a commented fleet per task queue, with the processes seen
+    for (queue, processes, ran) in [
+        ("orders", 5, "2 ran workflow tasks and 3 ran activities"),
+        ("payments", 2, "1 ran workflow tasks and 1 ran activities"),
+    ] {
+        assert!(
+            p.yaml.contains(&format!(
+                "#     task_queue: \"{queue}\"\n#     processes: {processes:<13} # {ran}\n"
+            )),
+            "{}",
+            p.yaml
+        );
+        assert!(
+            p.summary
+                .contains(&format!("  {queue}: {processes} processes ({ran})")),
+            "{}",
+            p.summary
+        );
+    }
+    assert!(
+        p.summary
+            .contains("1 process ran tasks from more than one task queue")
+    );
+    assert!(
+        p.summary
+            .contains("workers report temporal-java 1.29.0: tempdes follows the Go SDK")
+    );
+    // identities name hosts: they are counted, never written
+    for text in [&p.yaml, &p.summary] {
+        assert!(!text.contains("host") && !text.contains('@'), "{text}");
+    }
+    // uncommented, the fleets are a scenario's workers
+    let mut inside = false;
+    let uncommented: Vec<&str> = p
+        .yaml
+        .lines()
+        .map(|l| {
+            inside = (inside || l.starts_with("# workers:")) && !l.starts_with("workflows:");
+            if inside { &l[2..] } else { l }
+        })
+        .collect();
+    let scenario = format!(
+        "name: fleets\nwarmup: 5s\nduration: 10s\ncluster:\n  num_history_shards: 16\n  replicas: {{ frontend: 1, history: 1, matching: 1, worker: 1 }}\n  persistence: {{ store: postgresql }}\nnamespaces: [ {{ name: payments }} ]\n{}",
+        uncommented.join("\n")
+    );
+    let sc = Scenario::parse_str(&scenario).unwrap_or_else(|e| panic!("{e}\n{scenario}"));
+    let params = run::prepare(&sc, &Overrides::default(), None).expect("parameters resolve");
+    let processes: Vec<(String, u32)> = params
+        .fleets
+        .iter()
+        .filter(|f| !f.system)
+        .map(|f| (f.name.clone(), f.processes))
+        .collect();
+    assert_eq!(
+        processes,
+        [("orders".to_string(), 5), ("payments".to_string(), 2)]
     );
 }
 
