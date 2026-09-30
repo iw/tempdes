@@ -4,7 +4,8 @@
 //! of steps ([`trace`]), and pools executions that took the same steps into the scenario's
 //! `workflows:` entries ([`program`]): step durations, attempts, retry policies and timeouts
 //! as recorded, with waits in the cluster left out, and each type's payload size from the
-//! history sizes the server recorded (`historySizeBytes`). Payloads are never read.
+//! history sizes the server recorded (`historySizeBytes`); and a commented worker fleet per
+//! task queue, with the processes seen. Payloads are never read.
 
 pub mod parse;
 pub mod program;

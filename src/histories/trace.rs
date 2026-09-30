@@ -13,7 +13,7 @@
 //! dispatch) are recorded separately, for comparison, because a history taken from a busy
 //! cluster would otherwise bake its queueing into the workload.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
 
@@ -278,6 +278,15 @@ pub struct SizeSample {
     pub unmodelled: u32,
 }
 
+/// The worker processes that polled a task queue's tasks, by their `identity` (the SDKs'
+/// default is `pid@host`). Kept only to be counted: identities name hosts, and are never
+/// written out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pollers {
+    pub workflow: BTreeSet<String>,
+    pub activity: BTreeSet<String>,
+}
+
 /// One workflow execution read from its history.
 #[derive(Clone, Debug)]
 pub struct Trace {
@@ -300,6 +309,11 @@ pub struct Trace {
     pub notes: Vec<String>,
     /// the history's size before its last workflow task that recorded one
     pub size: Option<SizeSample>,
+    /// worker processes that ran its tasks, by task queue: workflow tasks under the workflow's
+    /// task queue (sticky queues belong to its workers), activities under their own
+    pub pollers: BTreeMap<String, Pollers>,
+    /// SDKs its workers reported (`sdkMetadata` on workflow task completions), "name version"
+    pub sdks: BTreeSet<String>,
 }
 
 /// What one workflow task's completion issued.
@@ -340,6 +354,8 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
         skipped: BTreeMap::new(),
         notes: Vec::new(),
         size: None,
+        pollers: BTreeMap::new(),
+        sdks: BTreeSet::new(),
     };
     let id_of = |e: &Event, key: &str| get(&e.attrs, key).and_then(int);
     let mut wft_scheduled: HashMap<i64, i64> = HashMap::new();
@@ -391,12 +407,27 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
             }
             Kind::WftStarted => {
                 wft_started.insert(e.id, e.time_us);
+                if let Some(w) = worker(e) {
+                    t.pollers
+                        .entry(t.task_queue.clone())
+                        .or_default()
+                        .workflow
+                        .insert(w);
+                }
                 if let Some(s) = id_of(e, "scheduledEventId").and_then(|s| wft_scheduled.get(&s)) {
                     t.wft_queue_wait_us
                         .push(e.time_us.saturating_sub(*s).max(0) as u64);
                 }
             }
             Kind::WftCompleted => {
+                // SDKs report their name and version when it changes, not on every task
+                if let Some(m) = get(&e.attrs, "sdkMetadata") {
+                    let field = |k: &str| get(m, k).and_then(Value::as_str).unwrap_or("");
+                    if !field("sdkName").is_empty() {
+                        t.sdks
+                            .insert(format!("{} {}", field("sdkName"), field("sdkVersion")));
+                    }
+                }
                 let span_us = id_of(e, "startedEventId")
                     .and_then(|s| wft_started.get(&s))
                     .map_or(0, |s| e.time_us.saturating_sub(*s).max(0) as u64);
@@ -459,6 +490,15 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
                 }
             }
             Kind::ActivityStarted => {
+                if let Some(a) = id_of(e, "scheduledEventId").and_then(|s| activities.get(&s))
+                    && let Some(w) = worker(e)
+                {
+                    t.pollers
+                        .entry(a.task_queue.clone())
+                        .or_default()
+                        .activity
+                        .insert(w);
+                }
                 if let Some(a) = id_of(e, "scheduledEventId").and_then(|s| activities.get_mut(&s)) {
                     a.attempts = get(&e.attrs, "attempt").and_then(int).unwrap_or(1).max(1) as u32;
                     a.started_us = Some(e.time_us);
@@ -685,4 +725,14 @@ fn marker_name(e: &Event) -> &str {
 /// `core_local_activity`.
 fn local_activity(e: &Event) -> bool {
     matches!(marker_name(e), "LocalActivity" | "core_local_activity")
+}
+
+/// The identity of the worker process that polled a task, as the started event records it;
+/// none for tasks the server started itself.
+fn worker(e: &Event) -> Option<String> {
+    get(&e.attrs, "identity")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|w| !w.is_empty() && *w != "history-service")
+        .map(String::from)
 }

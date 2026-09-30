@@ -58,7 +58,8 @@ enum WorkloadCmd {
     /// Infer `workflows:` entries from exported histories (`temporal workflow show --output
     /// json`, or the Web UI's download): steps, durations, attempts, retry policies and
     /// timeouts, with waits in the cluster left out, and payload sizes from the history sizes
-    /// the server recorded. Payloads are not read.
+    /// the server recorded, with a commented worker fleet per task queue. Payloads are not
+    /// read.
     Import(ImportArgs),
 }
 

@@ -491,6 +491,13 @@ Workers follow the Go SDK.
   events, those the simulator charges a payload to, across its histories, and 0 at least. The
   summary gives it for 95 and 180 bytes an event too, and notes when events that aren't
   modelled outnumber the payload events, since their data is counted as payloads.
+* **Worker fleets.** A started event records the identity of the worker that polled the task
+  (the SDKs default to `pid@host`). `WorkflowTaskStarted` counts for the workflow's task queue,
+  sticky queues included, since they belong to its workers; `ActivityTaskStarted` for the
+  activity's. The server's own identity (`history-service`) isn't a worker. Each task queue gets
+  a commented fleet with the number of distinct identities as its `processes`, and the SDKs
+  its workers report (`sdkMetadata` on `WorkflowTaskCompleted`, sent when it changes).
+  Identities are counted, never written.
 
 ## CPU costs
 

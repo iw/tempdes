@@ -178,6 +178,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the events that carry payloads, it gives each type's `payload_bytes`, still without reading
   payloads. The summary gives the range for events of 95–180 bytes, and notes when events that
   aren't modelled (markers, search attribute upserts, updates) may inflate the estimate.
+- **`workload import` sketches worker fleets.** Histories record which worker process started
+  each task. The output now opens with a commented `workers:` block: a fleet per task queue
+  with the number of processes seen, to uncomment once its pollers and slots, which histories
+  don't record, are set. The summary lists the SDKs the workers report. Identities, which name
+  hosts, are counted but never written.
 
 ### Fixed
 
