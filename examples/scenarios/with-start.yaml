@@ -1,0 +1,76 @@
+# Shopping carts updated through update-with-start, and notification inboxes fed through
+# signal-with-start. The cart workers can't keep up with the updates, so each update-with-start
+# call waits out history.longPollExpirationInterval (20s) and is sent again: the waiting calls
+# are long-running requests, and they fill frontend.namespaceCount on every frontend.
+#
+#   tempdes run examples/scenarios/with-start.yaml
+#   tempdes sweep examples/scenarios/with-start.yaml \
+#       --rows worker=1 --cols frontend.namespaceCount=1200,4000
+name: carts-with-start
+description: >
+  Cart workflows at 200 updates/s through update-with-start, most of them to open carts, and
+  inboxes at 100 signals/s through signal-with-start, on 3 frontend, 3 history and 3 matching
+  pods.
+seed: 11
+warmup: 30s
+duration: 60s
+
+cluster:
+  num_history_shards: 512
+  replicas:
+    frontend: 3
+    history: 3
+    matching: 3
+    worker: 1
+  resources:
+    frontend: { cpu: 2 }
+    history:  { cpu: 4 }
+    matching: { cpu: 2 }
+    worker:   { cpu: 1 }
+  network:
+    client_lb: round_robin
+    client_rtt: 2ms
+    internal_rtt: 0.5ms
+  persistence:
+    store: postgresql
+    max_conns: { frontend: 20, history: 50, matching: 30, worker: 10 }
+    capacity: 160
+
+namespaces:
+  - name: shop
+
+workers:
+  - name: cart-workers
+    namespace: shop
+    task_queue: carts
+    processes: 1
+    workflow_pollers: 2          # the Go SDK's default
+    workflow_slots: 2            # two workflow tasks at a time: about 50 tasks/s
+    activity_pollers: 2
+  - name: inbox-workers
+    namespace: shop
+    task_queue: inboxes
+    processes: 2
+    workflow_pollers: 8
+    activity_pollers: 8
+
+workflows:
+  - type: CartWorkflow
+    namespace: shop
+    task_queue: carts
+    start_rate: 200/s
+    start_with: update           # update-with-start: ExecuteMultiOperation, waiting for the update
+    existing: 0.8                # most calls add to an open cart: a speculative workflow task
+    wft_processing: { p50: 25ms, p99: 100ms }
+    steps:
+      - activity: { count: 1, duration: { p50: 20ms, p99: 100ms } }   # reserve stock
+      - timer: 10m                                                     # the cart stays open
+  - type: InboxWorkflow
+    namespace: shop
+    task_queue: inboxes
+    start_rate: 100/s
+    start_with: signal           # signal-with-start
+    existing: 0.5
+    steps:
+      - wait_signal: { count: 5 }
+      - activity: { count: 1, duration: { p50: 50ms, p99: 300ms } }    # send a digest

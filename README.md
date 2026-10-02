@@ -11,7 +11,7 @@ You describe a deployment and a workload. Two dimensions are adjustable:
 
 * **replica counts** for the frontend, history, matching and worker services;
 * **dynamic config**, in Temporal's own file format, for the settings that matter most for
-  throughput. 95 settings are simulated, and all 613 keys in 1.31.0 are validated.
+  throughput. 96 settings are simulated, and all 613 keys in 1.31.0 are validated.
 
 tempdes simulates the cluster request by request and reports what saturates first: CPU, database
 connections, a shard's IO semaphore, a single workflow's lock, a rate limiter, a history task
@@ -113,7 +113,7 @@ tempdes profile save prod my-cluster.yaml -r history=4 -o observed.yaml
 tempdes run --profile prod --load 1.5
 
 # dynamic config tooling
-tempdes dc modeled                       # the 99 simulated keys, with 1.31.0 defaults
+tempdes dc modeled                       # the 100 simulated keys, with 1.31.0 defaults
 tempdes dc explain history.shardIOConcurrency
 tempdes dc validate examples/dynamicconfig/with-mistakes.yaml
 
@@ -361,6 +361,7 @@ are recognised.
 | `persistence_requests{operation}` + `db_utilization` (or `rds_cpu_utilization`) | database capacity (concurrent operations before queueing) |
 | `container_cpu_usage_seconds_total{container=temporal-<svc>}` (or `cpu_cores{service_name}`) | per-service CPU cost scale, from a pilot simulation of the observed configuration. Sweep cells reuse the same scale. |
 | `service_requests{service_name=frontend, operation=StartWorkflowExecution / SignalWorkflowExecution}` | workload start and signal rates |
+| `service_requests{service_name=frontend, operation=SignalWithStartWorkflowExecution / ExecuteMultiOperation}` | the start rates of types started with signal- or update-with-start; each call scales its own types. `ExecuteMultiOperation` also counts the SDK's re-sends of updates that waited out the long poll. |
 
 Validation rows cover these values:
 
@@ -585,6 +586,8 @@ workflows:
     # ramp: { from: 0.2, over: 30s }
     starters: 4                # client processes (each pins one frontend connection)
     # eager_start: false, await_result: false, rpc_timeout: 10s
+    # start_with: start        # start | signal (signal-with-start) | update (update-with-start)
+    # existing: 0.0            # with signal / update: share of calls to a running workflow
     wft_processing: { p50: 2ms, p99: 12ms }
     # replay_per_event: 50us, payload_bytes: 2KiB
     steps:
@@ -635,7 +638,10 @@ Durations and latencies accept a constant (`5ms`), `{ p50, p99 }` for a lognorma
 **SDK calls.** As in the Go SDK, each call has one deadline, `rpc_timeout` (10s by default),
 and its retries happen inside it: a call still failing at the deadline returns
 `DeadlineExceeded`. Worker polls use `poll_timeout` and aren't retried by the call itself, and a
-client waiting for a result (`await_result`) long-polls the history for up to 65s.
+client waiting for a result (`await_result`) long-polls the history for up to 65s. An
+update-with-start call waits for its update instead: history holds it for up to
+`history.longPollExpirationInterval` (20s), and while the update is still waiting the SDK sends
+the call again, each attempt with a 60s deadline.
 
 **Activities.** Retry-policy fields an activity leaves unset come from
 `history.defaultActivityRetryPolicy` for its namespace (1s initial interval, coefficient 2, a
@@ -697,6 +703,7 @@ signal's input 256. Sizes cost time and room:
 | `cassandra-large.yaml` | 4,096 shards on Cassandra at 1,000 wf/s, with shard IO forced to 1. Useful for sweeps. |
 | `from-helm.yaml` | Deployment read from a `temporalio/helm-charts` values file. |
 | `frontend-lb.yaml` | 270 wf/s on 3 frontends with default limits. Pinned SDK connections overload one frontend; `round_robin` or `proxy` spreads the load evenly. |
+| `with-start.yaml` | Carts updated through update-with-start and inboxes fed through signal-with-start. The cart workers fall behind, so update calls wait out the 20s long poll and are sent again, and the waiting calls overflow `frontend.namespaceCount`. |
 | `frontend-scale-out.yaml` | Frontends scale from 3 to 6 mid-run. The new pods only get traffic once clients reconnect, re-resolve DNS or the proxy registers them. |
 
 ## What is modelled
@@ -743,6 +750,8 @@ source. In summary:
   * Eager workflow start and eager activities.
   * Activity heartbeats and failures, with each attempt stopping at its deadline.
   * Child workflows, signals with buffered events, and local activities.
+  * Signal-with-start and update-with-start, with speculative workflow tasks for updates to
+    running workflows.
 * **Worker service.**
   * Scheduler workflows on the per-namespace worker.
   * Elasticsearch bulk processor.

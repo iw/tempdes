@@ -9,6 +9,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Signal-with-start and update-with-start.** A workflow type's `start_with: signal` or
+  `start_with: update` starts it with SignalWithStartWorkflowExecution or update-with-start
+  (`ExecuteMultiOperation`), and `existing` sends a share of the calls to the type's running
+  workflows, which are signaled or updated instead. Both read the workflow ID's current run
+  first. Update-with-start keeps the update in memory until the first workflow task carries it,
+  sends an update to a running workflow on a speculative workflow task that is written only when
+  it completes, writes the update's accepted and completed events with that completion, holds
+  the call for up to `history.longPollExpirationInterval`, and re-sends it as the Go SDK does.
+  The call counts against `frontend.namespaceCount`, and `history.maxInFlightUpdates` is
+  simulated. Reports summarise the calls under the workflow table, calibration scales each start
+  call's types by its own observed rate, and `with-start.yaml` is a new example.
+
 - **Run profiles.** `tempdes profile save NAME SCENARIO [options]` saves a scenario with a run's
   options under a name. The options are replica counts, dynamic config, observed metrics, load,
   client load balancing, duration, warm-up and seed. `--profile NAME` repeats the run with
@@ -185,6 +197,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hosts, are counted but never written.
 
 ### Fixed
+
+- **Observed metric labels match whole name parts.** A label filter that matched any value
+  ending with it counted an observed `SignalWithStartWorkflowExecution` as
+  `StartWorkflowExecution`. A value now has to end with the filter after a separator, as in
+  `temporal-history` or a gRPC method path.
 
 - **The events cache was never filled.** Activity starts looked their scheduled event up in the
   shard's events cache, but nothing put events in, so every start read history from the

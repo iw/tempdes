@@ -168,6 +168,17 @@ pub fn render_run(r: &RunResult, verbose: bool) -> String {
         &rows,
         1,
     ));
+    let with_start: Vec<String> = r
+        .workflows
+        .iter()
+        .filter_map(|w| w.with_start_summary())
+        .collect();
+    if !with_start.is_empty() {
+        for line in with_start {
+            let _ = writeln!(o, "- {line}");
+        }
+        o.push('\n');
+    }
 
     // --- APIs ---------------------------------------------------------------------------------
     o.push_str("## API latency (client-observed, including SDK retries)\n\n");

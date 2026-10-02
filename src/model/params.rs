@@ -56,6 +56,8 @@ impl Default for Costs {
             frontend[api.idx()] = match api {
                 Api::StartWorkflowExecution => 180.0,
                 Api::SignalWorkflowExecution => 130.0,
+                Api::SignalWithStartWorkflowExecution => 190.0,
+                Api::ExecuteMultiOperation => 220.0,
                 Api::PollWorkflowTaskQueue | Api::PollActivityTaskQueue => 110.0,
                 Api::RespondWorkflowTaskCompleted => 160.0,
                 Api::RespondActivityTaskCompleted | Api::RespondActivityTaskFailed => 110.0,
@@ -72,6 +74,8 @@ impl Default for Costs {
             history[api.idx()] = match api {
                 HistApi::StartWorkflowExecution => 650.0,
                 HistApi::SignalWorkflowExecution => 420.0,
+                HistApi::SignalWithStartWorkflowExecution => 700.0,
+                HistApi::ExecuteMultiOperation => 750.0,
                 HistApi::RecordWorkflowTaskStarted => 420.0,
                 HistApi::RecordActivityTaskStarted => 320.0,
                 HistApi::RespondWorkflowTaskCompleted => 520.0,
@@ -278,6 +282,8 @@ pub struct NsParams {
     pub task_sched_global_ns_max_qps: f64,
     pub default_wft_timeout: Time,
     pub history_long_poll: Time,
+    /// `history.maxInFlightUpdates`: updates a workflow holds admitted but not completed
+    pub max_in_flight_updates: u32,
     /// `limit.historySize.error` and `.warn`: a running workflow whose history is larger than
     /// the error limit is terminated at its next update; the warn limit only logs
     pub history_size_error: f64,
@@ -575,6 +581,10 @@ pub struct WfTypeParams {
     pub starters: u32,
     pub eager_start: bool,
     pub await_result: bool,
+    /// the call the clients start it with
+    pub start_with: StartWith,
+    /// with signal- or update-with-start, the share of calls that find the workflow running
+    pub existing: f64,
     /// deadline of each start call, retries included
     pub rpc_timeout: Time,
     pub wft_processing: Dist,
@@ -783,6 +793,7 @@ pub const MODELED_KEYS: &[&str] = &[
     "history.defaultWorkflowTaskTimeout",
     "history.defaultActivityRetryPolicy",
     "history.longPollExpirationInterval",
+    "history.maxInFlightUpdates",
     "matching.rps",
     "matching.persistenceMaxQPS",
     "matching.persistenceGlobalMaxQPS",
@@ -974,6 +985,7 @@ impl Params {
                     &p,
                     20.0 * SEC,
                 )),
+                max_in_flight_updates: dc.int("history.maxInFlightUpdates", &p, 10).max(1) as u32,
                 history_size_error: dc.int("limit.historySize.error", &p, 50 * 1024 * 1024) as f64,
                 history_size_warn: dc.int("limit.historySize.warn", &p, 10 * 1024 * 1024) as f64,
                 per_ns_worker_count: dc.int("worker.perNamespaceWorkerCount", &p, 1).max(1) as u32,
@@ -1469,6 +1481,23 @@ impl Params {
                     fmt_bytes(blob_warn)
                 ));
             }
+            if w.start_with != StartWith::Start && w.eager_start {
+                // signal-with-start and ExecuteMultiOperation take no eager start request
+                bail!(
+                    "{}: eager_start can't be combined with start_with: {:?}: only StartWorkflowExecution can start eagerly",
+                    w.type_name,
+                    w.start_with
+                );
+            }
+            if !(0.0..=1.0).contains(&w.existing) {
+                bail!("{}: existing must be between 0 and 1", w.type_name);
+            }
+            if w.existing > 0.0 && w.start_with == StartWith::Start {
+                bail!(
+                    "{}: existing applies to start_with: signal or update; a StartWorkflowExecution always starts a new workflow here",
+                    w.type_name
+                );
+            }
             if w.eager_start && !namespaces[ns].enable_eager_start {
                 prov.warnings.push(format!(
                     "{}: eager_start requested but system.enableEagerWorkflowStart is false for namespace {} — starts go through matching",
@@ -1488,6 +1517,8 @@ impl Params {
                 starters: w.starters.max(1),
                 eager_start: w.eager_start && namespaces[ns].enable_eager_start,
                 await_result: w.await_result,
+                start_with: w.start_with,
+                existing: w.existing,
                 rpc_timeout: w.rpc_timeout.us().max(1_000),
                 wft_processing: w.wft_processing.build().map_err(|e| anyhow::anyhow!(e))?,
                 replay_per_event: w.replay_per_event.0,
@@ -1553,6 +1584,8 @@ impl Params {
                         starters: 1,
                         eager_start: false,
                         await_result: false,
+                        start_with: StartWith::Start,
+                        existing: 0.0,
                         rpc_timeout: 10_000_000,
                         wft_processing: Dist::lognormal_p50_p99(1_500.0, 8_000.0),
                         replay_per_event: 20.0,

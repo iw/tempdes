@@ -914,7 +914,7 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                             task.r2 != 0 && seq == task.r && attempt == task.r2
                         }
                         WftState::Scheduled { seq, sticky, .. } => {
-                            task.r2 == 0 && sticky && seq == task.r
+                            task.r2 == 0 && (sticky || w.wft_speculative) && seq == task.r
                         }
                         WftState::None => false,
                     }
@@ -955,8 +955,12 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                     }
                     WftState::None => 1,
                 };
-                // timed out: clear stickiness, reschedule on the normal queue
+                // timed out: clear stickiness, reschedule on the normal queue; the next task
+                // carries the updates this one did not complete, and a speculative task turns
+                // into a normal one with this write
                 w.sticky_worker = None;
+                w.updates_delivered = w.updates_done;
+                w.wft_speculative = false;
                 w.wft_seq += 1;
                 w.wft = WftState::Scheduled {
                     seq: w.wft_seq,

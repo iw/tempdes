@@ -360,7 +360,7 @@ impl Observations {
                 && filter.iter().all(|(k, v)| {
                     o.labels
                         .get(*k)
-                        .map(|lv| lv.eq_ignore_ascii_case(v) || lv.ends_with(v))
+                        .map(|lv| lv.eq_ignore_ascii_case(v) || ends_with_part(lv, v))
                         .unwrap_or(false)
                 })
         })
@@ -561,9 +561,32 @@ pub fn is_gauge(name: &str) -> bool {
     GAUGES.contains(&name)
 }
 
+/// `value` ends with `part` after a separator (`temporal-history` ends with `history`, a gRPC
+/// method path with its method), so `SignalWithStartWorkflowExecution` doesn't match
+/// `StartWorkflowExecution`.
+fn ends_with_part(value: &str, part: &str) -> bool {
+    value.len() > part.len()
+        && value.ends_with(part)
+        && !value.as_bytes()[value.len() - part.len() - 1].is_ascii_alphanumeric()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_values_match_whole_name_parts() {
+        assert!(ends_with_part("temporal-history", "history"));
+        assert!(ends_with_part(
+            "/temporal.api.workflowservice.v1.WorkflowService/StartWorkflowExecution",
+            "StartWorkflowExecution"
+        ));
+        assert!(!ends_with_part(
+            "SignalWithStartWorkflowExecution",
+            "StartWorkflowExecution"
+        ));
+        assert!(!ends_with_part("history", "history"));
+    }
 
     #[test]
     fn bucket_quantile_matches_promql() {

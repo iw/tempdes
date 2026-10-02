@@ -437,6 +437,32 @@ pub enum Arrival {
     Uniform,
 }
 
+/// The call the clients start a workflow type with.
+#[derive(Clone, Copy, Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StartWith {
+    /// StartWorkflowExecution.
+    #[default]
+    Start,
+    /// SignalWithStartWorkflowExecution: start the workflow with a signal, or signal it when it
+    /// is already running.
+    Signal,
+    /// Update-with-start (ExecuteMultiOperation): start the workflow with an update, or update
+    /// it when it is already running, and wait for the update's outcome.
+    Update,
+}
+
+impl StartWith {
+    /// The frontend operation the clients call.
+    pub fn operation(self) -> &'static str {
+        match self {
+            StartWith::Start => "StartWorkflowExecution",
+            StartWith::Signal => "SignalWithStartWorkflowExecution",
+            StartWith::Update => "ExecuteMultiOperation",
+        }
+    }
+}
+
 /// How workflow IDs are chosen for starts.
 #[derive(Clone, Debug, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -471,7 +497,16 @@ pub struct WorkflowSpec {
     /// Client waits for the result (long-polls GetWorkflowExecutionHistory).
     #[serde(default)]
     pub await_result: bool,
-    /// Deadline of each StartWorkflowExecution call from the starters, retries included.
+    /// The call that starts it: `start` (StartWorkflowExecution, the default), `signal`
+    /// (signal-with-start) or `update` (update-with-start).
+    #[serde(default)]
+    pub start_with: StartWith,
+    /// With `start_with: signal` or `update`, the share of calls whose workflow is already
+    /// running: they signal or update a running workflow of the type instead of starting one.
+    #[serde(default)]
+    pub existing: f64,
+    /// Deadline of each start call from the starters, retries included. An update-with-start
+    /// call has the Go SDK's 60 s instead, and is sent again while its update waits.
     #[serde(default = "rpc_timeout")]
     pub rpc_timeout: Dur,
     /// Worker-side time to process a workflow task when the workflow is in the sticky cache.

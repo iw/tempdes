@@ -116,6 +116,16 @@ pub struct WorkflowResult {
     pub signals_per_s: f64,
     pub signals_failed: u64,
     pub eager_starts: u64,
+    /// the call the clients start it with: StartWorkflowExecution,
+    /// SignalWithStartWorkflowExecution or ExecuteMultiOperation
+    pub start_call: String,
+    /// signal- or update-with-start calls that found the workflow running
+    pub existing_per_s: f64,
+    /// update-with-start updates completed, and how long callers waited for them
+    pub updates_per_s: f64,
+    pub update_latency: Lat,
+    /// update-with-start calls sent again for updates that outlasted the first call
+    pub update_resends: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -417,6 +427,34 @@ fn quantile_of(v: &mut [f64], q: f64) -> f64 {
     v[i]
 }
 
+impl WorkflowResult {
+    /// What a signal- or update-with-start type's calls did, for the reports: the share that
+    /// found the workflow running, and the updates' outcomes. None for a plain start.
+    pub fn with_start_summary(&self) -> Option<String> {
+        use crate::util::units::{fmt_rate, fmt_us};
+        let (running, extra) = match self.start_call.as_str() {
+            "SignalWithStartWorkflowExecution" => ("signaled it", String::new()),
+            "ExecuteMultiOperation" => (
+                "updated it",
+                format!(
+                    "; {} updates completed, waited for {} (p50) / {} (p99), {} calls re-sent",
+                    fmt_rate(self.updates_per_s),
+                    fmt_us(self.update_latency.p50_ms * 1e3),
+                    fmt_us(self.update_latency.p99_ms * 1e3),
+                    self.update_resends
+                ),
+            ),
+            _ => return None,
+        };
+        Some(format!(
+            "{}: {}, {} found the workflow running and only {running}{extra}",
+            self.workflow_type,
+            self.start_call,
+            fmt_rate(self.existing_per_s)
+        ))
+    }
+}
+
 pub fn analyze(ctx: &Ctx, info: &RunInfo, obs: Option<&Observations>) -> RunResult {
     analyze_window(ctx, info, obs, ctx.p.duration as f64 / 1e6)
 }
@@ -476,6 +514,11 @@ pub fn analyze_window(
             signals_per_s: w.signals_sent as f64 / dur,
             signals_failed: w.signals_failed,
             eager_starts: w.eager_starts,
+            start_call: t.start_with.operation().into(),
+            existing_per_s: w.with_start_existing as f64 / dur,
+            updates_per_s: w.updates_completed as f64 / dur,
+            update_latency: Lat::of(&w.update_latency),
+            update_resends: w.update_resends,
         });
     }
 

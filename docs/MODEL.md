@@ -69,8 +69,9 @@ at small replica counts is realistic.
 Admission follows the interceptor order in `service/frontend/fx.go`:
 
 1. **Concurrent request limit** (`common/rpc/interceptor/concurrent_request_limit.go`).
-   Long-running requests (polls, `QueryWorkflow`, history long polls) per namespace, per API, per
-   instance are capped at `frontend.namespaceCount`, or `frontend.globalNamespaceCount` divided
+   Long-running requests (polls, `QueryWorkflow`, history long polls and update-with-start's
+   `ExecuteMultiOperation`, which waits for its update) per namespace, per API, per instance are
+   capped at `frontend.namespaceCount`, or `frontend.globalNamespaceCount` divided
    by the number of frontends. Excess requests are rejected with `ResourceExhausted` (`CONCURRENT_LIMIT`).
 2. **Namespace rate limit** (`common/rpc/interceptor/namespace_rate_limit.go`).
    * The per-instance rate is `frontend.namespaceRPS`, or `frontend.globalNamespaceRPS` divided
@@ -84,8 +85,8 @@ Limits 2 and 3 are **priority rate limiters** (`common/quotas/priority_rate_limi
 They keep one token bucket per priority. An admitted request at priority *p* also reserves a
 token from every lower-priority bucket, which can drive those buckets negative.
 
-* Priorities come from `service/frontend/configs/quotas.go`: Start, Signal, Respond and
-  heartbeat calls are P1, `GetWorkflowExecutionHistory` P2, Describe, Query and
+* Priorities come from `service/frontend/configs/quotas.go`: Start, Signal, SignalWithStart,
+  `ExecuteMultiOperation`, Respond and heartbeat calls are P1, `GetWorkflowExecutionHistory` P2, Describe, Query and
   `RespondActivityTaskFailed` P3, and polls P4. Operator traffic gets `system.operatorRPSRatio`
   of the rate at P0.
 * The namespace limiter renames a history long poll (`GetWorkflowExecutionHistory` with
@@ -144,6 +145,31 @@ These workflow behaviours are simulated:
 * Child workflows: start through a transfer task, and completion recorded on the parent.
 * Signals. A signal that arrives while a workflow task is running is buffered and flushed into
   the next workflow task.
+* Signal-with-start (`start_with: signal`, `service/history/api/signalwithstartworkflow`).
+  History reads the workflow ID's current run (`GetCurrentExecution`). A running workflow (the
+  type's `existing` share of calls) gets the signal as with `SignalWorkflowExecution`. Otherwise
+  one `CreateWorkflowExecution` writes WorkflowExecutionStarted, WorkflowExecutionSignaled and
+  WorkflowTaskScheduled, so the first workflow task carries the signal. Its persistence calls
+  have priority 1, and it can't start eagerly.
+* Update-with-start (`start_with: update`, frontend `ExecuteMultiOperation`,
+  `service/history/api/multioperation`).
+  * After the same read, a new workflow is written with only WorkflowExecutionStarted and
+    WorkflowTaskScheduled. The update registry keeps the update in memory, and the first
+    workflow task carries it as a protocol message.
+  * A running workflow (conflict policy USE_EXISTING) admits the update without a write. With no
+    workflow task outstanding, a speculative one goes straight to matching, sticky queue first,
+    with a schedule-to-start timeout of 5 s (or the sticky timeout). It starts without a write and
+    is written only when it completes, together with its scheduled and started events. Temporal
+    keeps a speculative task's timers in memory; here they use the timer queue.
+  * Update handlers don't block, so the task that accepts an update also completes it and writes
+    WorkflowExecutionUpdateAccepted and WorkflowExecutionUpdateCompleted with its completion.
+  * History holds the call until the update completes, for up to
+    `history.longPollExpirationInterval` (20 s). While the update is still waiting, the SDK
+    sends the call again, each attempt with its 60 s deadline (`pollUpdateTimeout`).
+  * The persistence calls have priority 2: `ExecuteMultiOperation` isn't in the persistence
+    limiter's table. `history.maxInFlightUpdates` (10) caps a workflow's waiting updates with
+    `ResourceExhausted`, and an update whose workflow closes before taking it starts a new run
+    (`history.enableUpdateWithStartRetryOnClosedWorkflowAbort`).
 * Queries and `DescribeWorkflowExecution`.
 * `GetWorkflowExecutionHistory` long polls, which expire at
   `history.longPollExpirationInterval`.

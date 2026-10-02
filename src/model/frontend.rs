@@ -2,8 +2,8 @@
 //! host RateLimit, `service/frontend/fx.go`) followed by the handler body.
 //!
 //! * `frontend.namespaceCount` limits concurrent long-running requests (polls, queries, history
-//!   long polls) per namespace per API per instance (or `frontend.globalNamespaceCount` /
-//!   #frontends).
+//!   long polls, update-with-start) per namespace per API per instance (or
+//!   `frontend.globalNamespaceCount` / #frontends).
 //! * Namespace RPS (`frontend.namespaceRPS`, or `frontend.globalNamespaceRPS` / #frontends) and
 //!   host RPS (`frontend.rps`) are priority limiters: P1 calls reserve tokens from lower
 //!   priorities, so polls (P4) are throttled first under load, and history long polls (P5 in

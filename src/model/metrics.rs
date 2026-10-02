@@ -94,6 +94,16 @@ pub struct WfStats {
     pub signals_sent: u64,
     pub signals_failed: u64,
     pub eager_starts: u64,
+    /// signal- or update-with-start calls that found the workflow running and only signaled or
+    /// updated it
+    pub with_start_existing: u64,
+    /// update-with-start updates that completed, and the caller's wait for them (from the
+    /// call to the outcome, polls included)
+    pub updates_completed: u64,
+    pub update_latency: Histogram,
+    /// update-with-start calls sent again because the update was still waiting when the last
+    /// one returned
+    pub update_resends: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
