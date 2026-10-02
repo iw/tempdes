@@ -1657,3 +1657,247 @@ fn calibration_fits_service_times_to_observed_latency() {
         .expect("validation row");
     assert!((row.ratio - 1.0).abs() < 0.2, "{row:?}");
 }
+
+/// Cart workflows started by signal- or update-with-start: `start_with: MODE`, a share
+/// `EXISTING` of the calls naming a running cart, and extra dynamic config `DC`.
+fn with_start(mode: &str, existing: f64, dc: &str, steps: &str) -> Scenario {
+    Scenario::parse_str(&format!(
+        r#"
+name: with-start
+duration: 20s
+cluster:
+  num_history_shards: 128
+  replicas: {{ frontend: 1, history: 2, matching: 2, worker: 1 }}
+  persistence: {{ store: postgresql }}
+dynamic_config: {dc}
+namespaces:
+  - name: carts
+workers:
+  - name: cart-workers
+    namespace: carts
+    task_queue: carts
+    processes: 2
+    workflow_pollers: 4
+    activity_pollers: 4
+workflows:
+  - type: CartWorkflow
+    namespace: carts
+    task_queue: carts
+    start_rate: 40/s
+    start_with: {mode}
+    existing: {existing}
+    steps: {steps}
+"#
+    ))
+    .expect("scenario parses")
+}
+
+fn op_rate(r: &RunResult, op: &str) -> f64 {
+    r.persistence
+        .ops
+        .iter()
+        .find(|o| o.op == op)
+        .map_or(0.0, |o| o.per_s)
+}
+
+#[test]
+fn signal_with_start_signals_running_workflows_or_starts_them() {
+    let sc = with_start(
+        "signal",
+        0.5,
+        "{}",
+        "[ { wait_signal: { count: 2 } }, { timer: 30s } ]",
+    );
+    let r = simulate_scenario(&sc, short());
+    let w = &r.workflows[0];
+    assert_eq!(w.start_call, "SignalWithStartWorkflowExecution");
+    // every call either started a cart or signaled a running one, so none fall short
+    let served = w.started_per_s + w.existing_per_s;
+    assert!((served / 40.0 - 1.0).abs() < 0.15, "{served}");
+    assert!(w.existing_per_s > 10.0, "{}", w.existing_per_s);
+    assert!(
+        !has(&r, "throughput", Severity::Warning),
+        "{:?}",
+        categories(&r)
+    );
+    // each call reads the workflow ID's current run; only new carts are created
+    let calls = r
+        .apis
+        .iter()
+        .find(|a| a.api == "SignalWithStartWorkflowExecution")
+        .expect("signal-with-start calls");
+    assert!(calls.errors.is_empty(), "{:?}", calls.errors);
+    let current = op_rate(&r, "GetCurrentExecution");
+    assert!((current / calls.per_s - 1.0).abs() < 0.05, "{current}");
+    let created = op_rate(&r, "CreateWorkflowExecution");
+    assert!((created / w.started_per_s - 1.0).abs() < 0.05, "{created}");
+    assert!(w.with_start_summary().is_some());
+}
+
+#[test]
+fn update_with_start_admits_updates_without_a_write() {
+    // A cart waiting on its timer has no workflow task: the update gets a speculative one that
+    // writes nothing until it completes, so an update to a running cart costs one write (the
+    // task's completion, with its scheduled, started and update events), against two for a
+    // new cart's first task (started, then completed).
+    let sc = with_start("update", 0.5, "{}", "[ { timer: 1h } ]");
+    let r = simulate_scenario(&sc, short());
+    let w = &r.workflows[0];
+    assert_eq!(w.start_call, "ExecuteMultiOperation");
+    assert!(w.existing_per_s > 10.0, "{}", w.existing_per_s);
+    assert!(
+        (w.updates_per_s / 40.0 - 1.0).abs() < 0.15,
+        "{}",
+        w.updates_per_s
+    );
+    assert!(w.update_latency.p50_ms < 200.0, "{:?}", w.update_latency);
+    assert_eq!(w.update_resends, 0);
+    assert_eq!(w.start_failures, 0);
+    let writes = op_rate(&r, "UpdateWorkflowExecution");
+    let expected = 2.0 * w.started_per_s + w.existing_per_s;
+    assert!(
+        (writes / expected - 1.0).abs() < 0.15,
+        "{writes} vs {expected}"
+    );
+}
+
+#[test]
+fn updates_that_outlast_the_long_poll_are_sent_again() {
+    // History holds an update-with-start for history.longPollExpirationInterval; when the
+    // update is still waiting, the SDK sends the call again until it completes.
+    let sc = with_start(
+        "update",
+        0.0,
+        "{ history.longPollExpirationInterval: [ { value: 1s } ] }",
+        "[ { local_activity: { count: 1, duration: 3s } }, { timer: 1h } ]",
+    );
+    let r = simulate_scenario(&sc, short());
+    let w = &r.workflows[0];
+    assert!(w.update_resends > 100, "{}", w.update_resends);
+    assert!(
+        (w.updates_per_s / 40.0 - 1.0).abs() < 0.2,
+        "{}",
+        w.updates_per_s
+    );
+    assert!(w.update_latency.p50_ms > 2_000.0, "{:?}", w.update_latency);
+    let calls = r
+        .apis
+        .iter()
+        .find(|a| a.api == "ExecuteMultiOperation")
+        .expect("update-with-start calls");
+    assert!(calls.per_s > 1.5 * 40.0, "{}", calls.per_s);
+    assert!(calls.errors.is_empty(), "{:?}", calls.errors);
+}
+
+#[test]
+fn with_start_options_are_checked() {
+    let prepare = |sc: &Scenario| run::prepare(sc, &short(), None).map(|_| ());
+    let mut sc = with_start("update", 0.0, "{}", "[ { timer: 1s } ]");
+    sc.workflows[0].eager_start = true;
+    let e = prepare(&sc).expect_err("eager start with update-with-start");
+    assert!(e.to_string().contains("eager_start"), "{e}");
+    let sc = with_start("start", 0.3, "{}", "[ { timer: 1s } ]");
+    let e = prepare(&sc).expect_err("existing with a plain start");
+    assert!(e.to_string().contains("existing"), "{e}");
+    let sc = with_start("signal", 1.5, "{}", "[ { timer: 1s } ]");
+    assert!(prepare(&sc).is_err());
+}
+
+#[test]
+fn calibration_scales_each_start_call_on_its_own() {
+    let mut sc = with_start("start", 0.0, "{}", "[ { timer: 1s } ]");
+    let mut signal = sc.workflows[0].clone();
+    signal.type_name = "InboxWorkflow".into();
+    signal.start_with = tempdes::config::scenario::StartWith::Signal;
+    let mut update = sc.workflows[0].clone();
+    update.type_name = "EntityWorkflow".into();
+    update.start_with = tempdes::config::scenario::StartWith::Update;
+    sc.workflows.push(signal);
+    sc.workflows.push(update);
+    let dir = std::env::temp_dir().join(format!("tempdes-with-start-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let observed = dir.join("observed.yaml");
+    std::fs::write(
+        &observed,
+        r#"
+metrics:
+  - name: service_requests
+    labels: { service_name: frontend, operation: StartWorkflowExecution }
+    rate: 20/s
+  - name: service_requests
+    labels: { service_name: frontend, operation: SignalWithStartWorkflowExecution }
+    rate: 60/s
+  - name: service_requests
+    labels: { service_name: frontend, operation: ExecuteMultiOperation }
+    rate: 10/s
+"#,
+    )
+    .unwrap();
+    let obs = run::load_observations(&sc, &[observed.display().to_string()])
+        .expect("observations load")
+        .expect("observations given");
+    let cal = run::calibrate(&sc, &short(), obs).expect("calibration");
+    let p = run::prepare(&sc, &short(), Some(&cal)).expect("parameters resolve");
+    let rate = |name: &str| {
+        p.wf_types
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.start_rate)
+            .unwrap()
+    };
+    assert!(
+        (rate("CartWorkflow") - 20.0).abs() < 0.01,
+        "{}",
+        rate("CartWorkflow")
+    );
+    assert!(
+        (rate("InboxWorkflow") - 60.0).abs() < 0.01,
+        "{}",
+        rate("InboxWorkflow")
+    );
+    assert!(
+        (rate("EntityWorkflow") - 10.0).abs() < 0.01,
+        "{}",
+        rate("EntityWorkflow")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn waiting_updates_fill_the_long_running_request_limit() {
+    // with-start.yaml's cart workers fall behind, so each update-with-start waits out the 20s
+    // long poll at history and is sent again; the waiting calls are long-running requests and
+    // overflow frontend.namespaceCount on every frontend.
+    // the waits need a few long polls to pile up
+    let ov = || Overrides {
+        warmup_s: Some(30.0),
+        duration_s: Some(20.0),
+        ..Default::default()
+    };
+    let r = simulate("with-start.yaml", ov());
+    let carts = r
+        .workflows
+        .iter()
+        .find(|w| w.workflow_type == "CartWorkflow")
+        .unwrap();
+    assert!(carts.update_resends > 0, "{}", carts.update_resends);
+    assert!(
+        r.limits
+            .iter()
+            .any(|l| l.limiter == "frontend.namespaceCount" && l.rejected > 0),
+        "{:#?}",
+        r.limits
+    );
+    // a higher limit lets the waiting calls through
+    let r = simulate(
+        "with-start.yaml",
+        with_dc(ov(), "frontend.namespaceCount", DcValue::Int(10_000)),
+    );
+    assert!(
+        !r.limits
+            .iter()
+            .any(|l| l.limiter == "frontend.namespaceCount" && l.rejected > 0),
+        "{:#?}",
+        r.limits
+    );
+}

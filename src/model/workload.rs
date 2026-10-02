@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::config::scenario::{Arrival, VisibilityOp};
+use crate::config::scenario::{Arrival, StartWith, VisibilityOp};
 use crate::sim::executor::{Time, now, sleep, sleep_until, spawn};
 
 use super::history::{self, StartOrigin};
@@ -60,7 +60,15 @@ pub fn start_generators(ctx: &Ctx, rates: &Rc<RefCell<Rates>>, client_base: &[us
                 sleep(gap.max(1.0) as Time).await;
                 let client = base + c.rand_index(n_clients);
                 let c2 = c.clone();
-                spawn(async move { start_flow(c2, t, client).await });
+                match c.p.wf_types[t].start_with {
+                    StartWith::Start => spawn(async move { start_flow(c2, t, client).await }),
+                    StartWith::Signal => {
+                        spawn(async move { signal_with_start_flow(c2, t, client).await })
+                    }
+                    StartWith::Update => {
+                        spawn(async move { update_with_start_flow(c2, t, client).await })
+                    }
+                }
             }
         });
     }
@@ -135,6 +143,162 @@ pub async fn start_flow(ctx: Ctx, wf_type: usize, client: usize) {
         Err(_) => {
             ctx.m.borrow_mut().wf[wf_type].start_failed += 1;
         }
+    }
+}
+
+/// The workflow a signal- or update-with-start call names: with probability `existing` one of
+/// the type's running workflows (its ID, so its shard), else a new ID.
+fn with_start_target(ctx: &Ctx, wf_type: usize) -> (Option<(WfId, u32)>, u64, ShardId) {
+    let tp = &ctx.p.wf_types[wf_type];
+    let key = history::alloc_key(ctx);
+    let target = if tp.existing > 0.0 && ctx.rand() < tp.existing {
+        let wfs = ctx.wfs.borrow();
+        wfs.running_by_type.get(wf_type).and_then(|v| {
+            if v.is_empty() {
+                None
+            } else {
+                let id = v[ctx.rand_index(v.len())];
+                wfs.slots[id as usize].as_ref().map(|w| (id, w.wgen))
+            }
+        })
+    } else {
+        None
+    };
+    // a closed target's ID starts a new run on the same shard
+    let shard = match target.and_then(|(wf, wgen)| ctx.wf_shard(wf, wgen)) {
+        Some(s) => s,
+        None => history::shard_for(ctx, tp.ns, wf_type, key),
+    };
+    (target, key, shard)
+}
+
+/// A client calling SignalWithStartWorkflowExecution.
+pub async fn signal_with_start_flow(ctx: Ctx, wf_type: usize, client: usize) {
+    let tp = &ctx.p.wf_types[wf_type];
+    let ns = tp.ns;
+    let (target, key, shard) = with_start_target(&ctx, wf_type);
+    let r = sdk_call(
+        &ctx,
+        Conn::Client(client),
+        ns,
+        Api::SignalWithStartWorkflowExecution,
+        Retry::call(tp.rpc_timeout),
+        0.0,
+        move |c, _fe, deadline| async move {
+            history_call(&c, shard, |c2, hp| {
+                let c2 = c2.clone();
+                async move {
+                    history::signal_with_start(&c2, hp, shard, key, wf_type, target, deadline).await
+                }
+            })
+            .await
+        },
+    )
+    .await;
+    match r {
+        Ok((wf, wgen, created)) => {
+            if !created {
+                ctx.m.borrow_mut().wf[wf_type].with_start_existing += 1;
+            }
+            if tp.await_result {
+                await_result(&ctx, client, ns, wf, wgen, shard).await;
+            }
+        }
+        Err(_) => {
+            ctx.m.borrow_mut().wf[wf_type].start_failed += 1;
+        }
+    }
+}
+
+/// A client calling update-with-start (ExecuteMultiOperation) and waiting for the update to
+/// complete, as the Go SDK's UpdateWithStartWorkflow does with WaitForStage Completed: history
+/// holds each call for up to `history.longPollExpirationInterval`, and while the update is still
+/// only admitted the SDK sends the call again, each attempt with its 60 s deadline. (It polls
+/// with PollWorkflowExecutionUpdate only for an update accepted but not completed, which can't
+/// happen here: a handler finishes in the workflow task that accepts it.)
+pub async fn update_with_start_flow(ctx: Ctx, wf_type: usize, client: usize) {
+    let tp = &ctx.p.wf_types[wf_type];
+    let ns = tp.ns;
+    let t0 = now();
+    let (target, key, shard) = with_start_target(&ctx, wf_type);
+    let r = sdk_call(
+        &ctx,
+        Conn::Client(client),
+        ns,
+        Api::ExecuteMultiOperation,
+        Retry::call(Retry::UPDATE_TIMEOUT),
+        0.0,
+        move |c, _fe, deadline| async move {
+            history_call(&c, shard, |c2, hp| {
+                let c2 = c2.clone();
+                async move {
+                    history::update_with_start(&c2, hp, shard, key, wf_type, target, deadline).await
+                }
+            })
+            .await
+        },
+    )
+    .await;
+    let u = match r {
+        Ok(u) => u,
+        Err(_) => {
+            ctx.m.borrow_mut().wf[wf_type].start_failed += 1;
+            return;
+        }
+    };
+    if !u.created {
+        ctx.m.borrow_mut().wf[wf_type].with_start_existing += 1;
+    }
+    let mut done = u.done;
+    let (mut wf, mut wgen, mut update) = (u.wf, u.wgen, u.update);
+    for _ in 0..1000 {
+        if done {
+            break;
+        }
+        ctx.m.borrow_mut().wf[wf_type].update_resends += 1;
+        let r = sdk_call(
+            &ctx,
+            Conn::Client(client),
+            ns,
+            Api::ExecuteMultiOperation,
+            Retry::call(Retry::UPDATE_TIMEOUT),
+            0.0,
+            move |c, _fe, deadline| async move {
+                history_call(&c, shard, |c2, hp| {
+                    let c2 = c2.clone();
+                    async move {
+                        match history::reattach_update(&c2, hp, wf, wgen, update, deadline).await {
+                            Ok(d) => Ok((wf, wgen, update, d)),
+                            // the workflow closed before its task took the update: the call
+                            // starts a new run with it, under the same ID (so the same shard)
+                            Err(Err::NotFound) => {
+                                let key = history::alloc_key(&c2);
+                                history::update_with_start(
+                                    &c2, hp, shard, key, wf_type, None, deadline,
+                                )
+                                .await
+                                .map(|u| (u.wf, u.wgen, u.update, u.done))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                })
+                .await
+            },
+        )
+        .await;
+        match r {
+            Ok((w, g, n, d)) => (wf, wgen, update, done) = (w, g, n, d),
+            Err(_) => sleep(1_000_000).await,
+        }
+    }
+    if done {
+        let mut m = ctx.m.borrow_mut();
+        m.wf[wf_type].updates_completed += 1;
+        m.wf[wf_type].update_latency.record(now() - t0);
+    }
+    if tp.await_result {
+        await_result(&ctx, client, ns, wf, wgen, shard).await;
     }
 }
 

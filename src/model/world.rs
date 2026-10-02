@@ -391,6 +391,17 @@ pub struct Wf {
     pub timer_fired: bool,
     pub signals_received: u32,
     pub signals_consumed: u32,
+    /// workflow updates admitted (update-with-start), handed to a started workflow task, and
+    /// completed; the update registry keeps them in memory, so admitting one writes nothing
+    pub updates_admitted: u32,
+    pub updates_delivered: u32,
+    pub updates_done: u32,
+    /// callers waiting for update number `.0`: told whether it completed (false: the workflow
+    /// closed first)
+    pub update_waiters: Vec<(u32, Sender<bool>)>,
+    /// the outstanding workflow task is speculative: scheduled for an update without a write,
+    /// so its events are persisted only when it completes
+    pub wft_speculative: bool,
     pub activities: Vec<ActInfo>,
     pub next_act_seq: u32,
     pub children_pending: u32,

@@ -7,10 +7,12 @@
 //! | `persistence_requests{operation}` + DB utilisation observation    | database capacity (concurrency)             |
 //! | `container_cpu_usage_seconds_total` per service                   | per-service CPU cost scale (pilot run)      |
 //! | `service_requests{frontend, StartWorkflowExecution / Signal...}`  | workload start / signal rates (optional)    |
+//! | `service_requests{frontend, SignalWithStart.. / ExecuteMulti..}`  | signal- / update-with-start rates (opt.)    |
 //!
 //! CPU usage is taken from `container_cpu_usage_seconds_total` (cAdvisor, rate = cores) with a
 //! `container`/`service_name` label naming the Temporal service, or from `cpu_cores{service_name}`.
 
+use crate::config::scenario::StartWith;
 use crate::metrics::observed::Observations;
 use crate::model::params::Params;
 use crate::model::types::*;
@@ -118,27 +120,41 @@ pub fn apply(
         p.prov.notes.extend(notes);
         return;
     }
-    let fe = [
-        ("service_name", "frontend"),
-        ("operation", "StartWorkflowExecution"),
-    ];
-    if let Some(obs_rate) = obs.rate("service_requests", &fe) {
+    // each start call scales the types started with it: StartWorkflowExecution,
+    // SignalWithStartWorkflowExecution, ExecuteMultiOperation (update-with-start)
+    for with in [StartWith::Start, StartWith::Signal, StartWith::Update] {
+        let fe = [
+            ("service_name", "frontend"),
+            ("operation", with.operation()),
+        ];
+        let Some(obs_rate) = obs.rate("service_requests", &fe) else {
+            continue;
+        };
+        let started_with = |t: &&mut crate::model::params::WfTypeParams| {
+            !t.system_scheduler && t.start_with == with
+        };
         let scen: f64 = p
             .wf_types
-            .iter()
-            .filter(|t| !t.system_scheduler)
+            .iter_mut()
+            .filter(started_with)
             .map(|t| t.start_rate)
             .sum();
         if scen > 0.0 && obs_rate > 0.0 {
             let k = obs_rate * load / scen;
             if (k - 1.0).abs() > 0.02 {
-                for t in p.wf_types.iter_mut().filter(|t| !t.system_scheduler) {
+                for t in p.wf_types.iter_mut().filter(started_with) {
                     t.start_rate *= k;
                 }
                 notes.push(format!(
-                    "scaled workflow start rates x{k:.2} to match observed StartWorkflowExecution {}{}",
+                    "scaled the start rates of types started with {} x{k:.2} to match its observed rate {}{}{}",
+                    with.operation(),
                     fmt_rate(obs_rate),
-                    load_note(load)
+                    load_note(load),
+                    if with == StartWith::Update {
+                        " (which counts the SDK's re-sends of updates that waited out history.longPollExpirationInterval)"
+                    } else {
+                        ""
+                    }
                 ));
             }
         }

@@ -472,14 +472,16 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 ));
             }
         }
-        // Poisson arrivals: ignore shortfalls within 3σ of arrival noise unless starts failed
+        // Poisson arrivals: ignore shortfalls within 3σ of arrival noise unless starts failed.
+        // A signal- or update-with-start call that finds its workflow running counts as served.
         let expected = w.offered_start_rate * c.r.duration_s;
-        let observed = w.started_per_s * c.r.duration_s;
+        let observed = (w.started_per_s + w.existing_per_s) * c.r.duration_s;
         let noise = 3.0 * expected.sqrt();
         let short_enough = expected - observed > noise.max(0.03 * expected);
         if w.offered_start_rate > 0.0 && (short_enough || w.start_failures as f64 > 0.01 * expected)
         {
-            let short = 1.0 - w.started_per_s / w.offered_start_rate;
+            let short = 1.0 - (w.started_per_s + w.existing_per_s) / w.offered_start_rate;
+            let calls = format!("service_requests{{operation=\"{}\"}}", w.start_call);
             out.push(hs(
                 Severity::Critical,
                 "throughput",
@@ -487,7 +489,7 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 format!(
                     "{} starts fall short of offered load ({} of {})",
                     w.workflow_type,
-                    fmt_rate(w.started_per_s),
+                    fmt_rate(w.started_per_s + w.existing_per_s),
                     fmt_rate(w.offered_start_rate)
                 ),
                 format!(
@@ -496,10 +498,7 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                     w.start_failures
                 ),
                 vec![],
-                &[
-                    "service_requests{operation=\"StartWorkflowExecution\"}",
-                    "service_errors_resource_exhausted",
-                ],
+                &[calls.as_str(), "service_errors_resource_exhausted"],
                 vec![],
                 100.0 + short * 100.0,
             ));

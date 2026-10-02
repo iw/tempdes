@@ -244,6 +244,9 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
         ]);
     }
     o.push_str(&t.render(&st, 2));
+    for line in r.workflows.iter().filter_map(|w| w.with_start_summary()) {
+        let _ = writeln!(o, "  {line}");
+    }
 
     // --- APIs ---------------------------------------------------------------------------------
     let _ = writeln!(

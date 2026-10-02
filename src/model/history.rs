@@ -9,7 +9,8 @@
 //! State changes are computed first, persisted, and applied only on success, so a throttled or
 //! timed-out write leaves the workflow unchanged (Temporal clears the mutable state instead).
 
-use crate::sim::executor::{Time, now};
+use crate::config::scenario::StartWith;
+use crate::sim::executor::{Receiver, Time, now, oneshot, spawn};
 use crate::util::farmhash::workflow_id_to_history_shard;
 
 use super::activity;
@@ -54,6 +55,8 @@ pub struct WftInfo {
     pub prog: ProgState,
     pub snap: Snapshot,
     pub scheduled_at: Time,
+    /// workflow updates this task carries (protocol messages), to accept and complete
+    pub updates: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -102,6 +105,8 @@ pub struct Commands {
     /// queue `eager_tq` (the SDK requests eager execution only for those)
     pub eager_activities: u32,
     pub eager_tq: usize,
+    /// workflow updates accepted and completed in this task (their handlers don't block)
+    pub updates: u32,
 }
 
 pub struct RespondResult {
@@ -232,10 +237,44 @@ async fn start_inner(
     )
     .await;
     shard_ready(ctx, pod, shard, deadline).await?;
+    create_execution(
+        ctx,
+        pod,
+        shard,
+        key,
+        wf_type,
+        origin,
+        eager,
+        StartWith::Start,
+        deadline,
+    )
+    .await
+}
+
+/// Write a brand-new execution and its first events. With signal-with-start the signal is among
+/// them; an update-with-start's update stays in the update registry (memory) until the first
+/// workflow task carries it.
+#[allow(clippy::too_many_arguments)]
+async fn create_execution(
+    ctx: &Ctx,
+    pod: PodId,
+    shard: ShardId,
+    key: u64,
+    wf_type: usize,
+    origin: StartOrigin,
+    eager: bool,
+    with: StartWith,
+    deadline: Time,
+) -> Res<(WfId, u32, Option<WftInfo>)> {
     let tp = &ctx.p.wf_types[wf_type];
     let payload = tp.payload_bytes;
-    // WorkflowExecutionStarted with its input, WorkflowTaskScheduled (and Started when eager)
-    let append = Append::new(2 + u32::from(eager), payload);
+    let signal = with == StartWith::Signal;
+    // WorkflowExecutionStarted with its input, WorkflowExecutionSignaled with the signal's for
+    // signal-with-start, WorkflowTaskScheduled (and Started when eager)
+    let append = Append::new(
+        2 + u32::from(eager) + u32::from(signal),
+        payload + if signal { SIGNAL_BYTES } else { 0.0 },
+    );
     // Brand new execution: no contention on its lock (unique IDs), write under the shard sem.
     shard_write(
         ctx,
@@ -298,8 +337,13 @@ async fn start_inner(
         timer_seq: 0,
         timer_pending: None,
         timer_fired: false,
-        signals_received: 0,
+        signals_received: u32::from(signal),
         signals_consumed: 0,
+        updates_admitted: u32::from(with == StartWith::Update),
+        updates_delivered: 0,
+        updates_done: 0,
+        update_waiters: Vec::new(),
+        wft_speculative: false,
         activities: Vec::new(),
         next_act_seq: 0,
         children_pending: 0,
@@ -349,8 +393,17 @@ async fn start_inner(
         prog: ProgState::default(),
         snap: Snapshot::default(),
         scheduled_at: t,
+        // only StartWorkflowExecution starts eagerly, so the task carries no update
+        updates: 0,
     });
     Ok((id, wgen, eager_wft))
+}
+
+/// Hand the admitted updates that no task carries yet to the workflow task starting now.
+fn take_updates(w: &mut Wf) -> u32 {
+    let n = w.updates_admitted - w.updates_delivered;
+    w.updates_delivered = w.updates_admitted;
+    n
 }
 
 /// Read the program/progress snapshot for a started workflow task.
@@ -414,7 +467,7 @@ async fn record_wft_started_inner(
     let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
     load_ms(ctx, pod, shard, wf, wgen, caller).await?;
     // validate
-    let (attempt, sticky, scheduled_at) = {
+    let (attempt, sticky, scheduled_at, speculative) = {
         let wfs = ctx.wfs.borrow();
         let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
         match w.wft {
@@ -423,25 +476,30 @@ async fn record_wft_started_inner(
                 attempt,
                 sticky,
                 at,
-            } if s == seq && w.status == WfStatus::Running => (attempt, sticky, at),
+            } if s == seq && w.status == WfStatus::Running => {
+                (attempt, sticky, at, w.wft_speculative)
+            }
             _ => return Err(Err::NotFound),
         }
     };
-    // WorkflowTaskStarted; a transient workflow task (attempt > 1) is a mutable-state-only write
+    // WorkflowTaskStarted; a transient workflow task (attempt > 1) is a mutable-state-only write,
+    // and a speculative one starts in memory: its events are written when it completes
     let started = Append::new(1, 0.0);
-    let r = shard_write(
-        ctx,
-        pod,
-        shard,
-        PersistOp::UpdateWorkflowExecution,
-        if attempt == 1 { started.bytes() } else { 0.0 },
-        caller,
-        deadline,
-    )
-    .await;
-    if let Err(e) = r {
-        evict_ms(ctx, pod, shard, wf, wgen);
-        return Err(e);
+    if !speculative {
+        let r = shard_write(
+            ctx,
+            pod,
+            shard,
+            PersistOp::UpdateWorkflowExecution,
+            if attempt == 1 { started.bytes() } else { 0.0 },
+            caller,
+            deadline,
+        )
+        .await;
+        if let Err(e) = r {
+            evict_ms(ctx, pod, shard, wf, wgen);
+            return Err(e);
+        }
     }
     let t = now();
     let (info, ns, page_bytes) = {
@@ -453,7 +511,9 @@ async fn record_wft_started_inner(
             sticky,
             at: t,
         };
-        w.grow(started);
+        if !speculative {
+            w.grow(started);
+        }
         let events_in_response = if sticky {
             w.history_events.saturating_sub(w.last_started_event).max(1)
         } else {
@@ -462,6 +522,7 @@ async fn record_wft_started_inner(
         w.last_started_event = w.history_events;
         let (prog, snap) = snapshot(w);
         let page_bytes = f64::from(events_in_response) * w.event_bytes();
+        let updates = take_updates(w);
         (
             WftInfo {
                 wf,
@@ -475,6 +536,7 @@ async fn record_wft_started_inner(
                 prog,
                 snap,
                 scheduled_at,
+                updates,
             },
             w.ns,
             page_bytes,
@@ -578,11 +640,13 @@ async fn respond_wft_inner(
         + cmds.start_children.iter().map(|c| c.1).sum::<u32>()
         + u32::from(cmds.complete)
         + cmds.markers;
+    // each update's acceptance and response messages, and their events
+    let n_msgs = 2 * cmds.updates;
     cpu(
         ctx,
         pod,
         ctx.p.costs.history[HistApi::RespondWorkflowTaskCompleted.idx()]
-            + ctx.p.costs.history_per_command * f64::from(n_cmds),
+            + ctx.p.costs.history_per_command * f64::from(n_cmds + n_msgs),
     )
     .await;
     let (wf, wgen) = (info.wf, info.wgen);
@@ -591,14 +655,21 @@ async fn respond_wft_inner(
     let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
     load_ms(ctx, pod, shard, wf, wgen, caller).await?;
     // validate the task is still the started one
-    let (buffered, history_bytes, ns) = {
+    let (buffered, history_bytes, ns, speculative, updates_waiting) = {
         let wfs = ctx.wfs.borrow();
         let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
         match w.wft {
             WftState::Started { seq, .. } if seq == info.seq && w.status == WfStatus::Running => {}
             _ => return Err(Err::NotFound),
         }
-        (w.buffered_events, w.history_bytes, w.ns)
+        (
+            w.buffered_events,
+            w.history_bytes,
+            w.ns,
+            w.wft_speculative,
+            // admitted while this task ran: they need the next one
+            w.updates_admitted > w.updates_delivered,
+        )
     };
     // a running workflow whose history is over `limit.historySize.error` is terminated instead
     // of updated (`enforceHistorySizeCheck` in `service/history/workflow/context.go`); the
@@ -648,7 +719,7 @@ async fn respond_wft_inner(
         return Err(Err::NotFound);
     }
     let eager_n = cmds.eager_activities;
-    let inline_new_wft = buffered > 0 && !cmds.complete;
+    let inline_new_wft = (buffered > 0 || updates_waiting) && !cmds.complete;
     // WorkflowTaskCompleted and the commands' events, with the payloads of activity and child
     // inputs, local activity results and the workflow's result; then a new workflow task inline
     let payload = ctx.p.wf_types[info.wf_type].payload_bytes;
@@ -659,9 +730,16 @@ async fn respond_wft_inner(
         .sum::<u32>()
         + cmds.start_children.iter().map(|c| c.1).sum::<u32>()
         + cmds.markers
-        + u32::from(cmds.complete);
+        + u32::from(cmds.complete)
+        // WorkflowExecutionUpdateAccepted with the request, Completed with the outcome
+        + n_msgs;
     let append = Append::new(
-        1 + n_cmds + u32::from(cmds.complete) + if inline_new_wft { 2 } else { 0 },
+        1 + n_cmds
+            + u32::from(cmds.complete)
+            + n_msgs
+            + if inline_new_wft { 2 } else { 0 }
+            // a speculative task's WorkflowTaskScheduled and Started are written only now
+            + if speculative { 2 } else { 0 },
         payload * f64::from(payloads),
     );
     let r = shard_write(
@@ -685,6 +763,7 @@ async fn respond_wft_inner(
     let mut closed = false;
     let mut parent = None;
     let mut inline_bytes = 0.0;
+    let mut updates_completed = Vec::new();
     let (ns, wf_type) = {
         let mut wfs = ctx.wfs.borrow_mut();
         let w = wfs.get_mut(wf, wgen).ok_or(Err::NotFound)?;
@@ -702,6 +781,14 @@ async fn respond_wft_inner(
             ws.max_history_bytes = ws.max_history_bytes.max(w.history_bytes);
         }
         w.wft = WftState::None;
+        w.wft_speculative = false;
+        w.updates_done += cmds.updates;
+        let done = w.updates_done;
+        updates_completed.extend(
+            w.update_waiters
+                .extract_if(.., |(n, _)| *n < done)
+                .map(|(_, tx)| tx),
+        );
         // apply program state; step change resets per-step counters
         if cmds.new_prog.step != w.step {
             w.completed_in_step = 0;
@@ -845,6 +932,7 @@ async fn respond_wft_inner(
             w.last_started_event = w.history_events;
             inline_bytes = f64::from(events_in_response) * w.event_bytes();
             let (prog, snap) = snapshot(w);
+            let updates = take_updates(w);
             new_wft = Some(WftInfo {
                 wf,
                 wgen,
@@ -857,6 +945,7 @@ async fn respond_wft_inner(
                 prog,
                 snap,
                 scheduled_at: t,
+                updates,
             });
             let to = ctx.p.namespaces[ns].default_wft_timeout;
             tasks.push(TaskSpec::at(
@@ -881,6 +970,9 @@ async fn respond_wft_inner(
     }
     commit_tasks(ctx, shard, wf, wgen, &tasks);
     drop(lock);
+    for tx in updates_completed {
+        let _ = tx.send(true);
+    }
     if new_wft.is_some() {
         read_history(ctx, pod, inline_bytes, caller, Some(shard)).await?;
     }
@@ -912,19 +1004,24 @@ fn close_workflow(
     _parent: Option<(WfId, u32)>,
     outcome: Close,
 ) {
-    let (waiters, hwaiters, start) = {
+    let (waiters, hwaiters, uw, start) = {
         let mut wfs = ctx.wfs.borrow_mut();
         let Some(w) = wfs.get_mut(wf, wgen) else {
             return;
         };
         let waiters = std::mem::take(&mut w.close_waiters);
         let hw = std::mem::take(&mut w.history_waiters);
+        // updates still waiting for a workflow task fail with the workflow's close
+        let uw = std::mem::take(&mut w.update_waiters);
         let st = w.start_time;
         wfs.mark_closed(wf);
-        (waiters, hw, st)
+        (waiters, hw, uw, st)
     };
     for tx in waiters {
         let _ = tx.send(());
+    }
+    for (_, tx) in uw {
+        let _ = tx.send(false);
     }
     for tx in hwaiters {
         let _ = tx.send(());
@@ -1177,6 +1274,9 @@ pub async fn respond_activity(
 
 /// An event that wakes the workflow: schedule a WFT, or buffer if one is in flight.
 pub fn deliver_event(ctx: &Ctx, w: &mut Wf, t: Time, tasks: &mut Vec<TaskSpec>) {
+    // a write with new events turns a speculative task into a normal one; its scheduled and
+    // started events go out with that write
+    w.wft_speculative = false;
     match w.wft {
         WftState::Started { .. } => {
             w.buffered_events += 1;
@@ -1278,43 +1378,11 @@ pub async fn signal(ctx: &Ctx, pod: PodId, wf: WfId, wgen: u32, deadline: Time) 
             Some(shard),
         )
         .await?;
-        let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
-        load_ms(ctx, pod, shard, wf, wgen, caller).await?;
-        {
-            let wfs = ctx.wfs.borrow();
-            let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
-            if w.status != WfStatus::Running {
-                return Err(Err::NotFound);
-            }
+        if signal_running(ctx, pod, shard, wf, wgen, caller, deadline).await? {
+            Ok(())
+        } else {
+            Err(Err::NotFound)
         }
-        // WorkflowExecutionSignaled, with a small input
-        let signaled = Append::new(1, SIGNAL_BYTES);
-        let r = shard_write(
-            ctx,
-            pod,
-            shard,
-            PersistOp::UpdateWorkflowExecution,
-            signaled.bytes(),
-            caller,
-            deadline,
-        )
-        .await;
-        if let Err(e) = r {
-            evict_ms(ctx, pod, shard, wf, wgen);
-            return Err(e);
-        }
-        let t = now();
-        let mut tasks = Vec::new();
-        {
-            let mut wfs = ctx.wfs.borrow_mut();
-            let w = wfs.get_mut(wf, wgen).ok_or(Err::NotFound)?;
-            w.signals_received += 1;
-            w.grow(signaled);
-            deliver_event(ctx, w, t, &mut tasks);
-        }
-        commit_tasks(ctx, shard, wf, wgen, &tasks);
-        drop(lock);
-        Ok(())
     }
     .await;
     ctx.m
@@ -1322,6 +1390,475 @@ pub async fn signal(ctx: &Ctx, pod: PodId, wf: WfId, wgen: u32, deadline: Time) 
         .hist_op(pod, HistApi::SignalWorkflowExecution)
         .record(now() - t0, r.as_ref().err().copied());
     r
+}
+
+/// Append WorkflowExecutionSignaled to a workflow and wake it. Ok(false) when it isn't running.
+async fn signal_running(
+    ctx: &Ctx,
+    pod: PodId,
+    shard: ShardId,
+    wf: WfId,
+    wgen: u32,
+    caller: Caller,
+    deadline: Time,
+) -> Res<bool> {
+    let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
+    load_ms(ctx, pod, shard, wf, wgen, caller).await?;
+    {
+        let wfs = ctx.wfs.borrow();
+        let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
+        if w.status != WfStatus::Running {
+            return Ok(false);
+        }
+    }
+    // WorkflowExecutionSignaled, with a small input
+    let signaled = Append::new(1, SIGNAL_BYTES);
+    let r = shard_write(
+        ctx,
+        pod,
+        shard,
+        PersistOp::UpdateWorkflowExecution,
+        signaled.bytes(),
+        caller,
+        deadline,
+    )
+    .await;
+    if let Err(e) = r {
+        evict_ms(ctx, pod, shard, wf, wgen);
+        return Err(e);
+    }
+    let t = now();
+    let mut tasks = Vec::new();
+    {
+        let mut wfs = ctx.wfs.borrow_mut();
+        let w = wfs.get_mut(wf, wgen).ok_or(Err::NotFound)?;
+        w.signals_received += 1;
+        w.grow(signaled);
+        deliver_event(ctx, w, t, &mut tasks);
+    }
+    commit_tasks(ctx, shard, wf, wgen, &tasks);
+    drop(lock);
+    Ok(true)
+}
+
+/// SignalWithStartWorkflowExecution (`service/history/api/signalwithstartworkflow`): signal the
+/// workflow ID's running workflow, or start one with the signal among its first events. Returns
+/// the workflow and whether this call started it.
+#[allow(clippy::too_many_arguments)]
+pub async fn signal_with_start(
+    ctx: &Ctx,
+    pod: PodId,
+    shard: ShardId,
+    key: u64,
+    wf_type: usize,
+    target: Option<(WfId, u32)>,
+    deadline: Time,
+) -> Res<(WfId, u32, bool)> {
+    let caller = Caller::Api(1, ctx.p.wf_types[wf_type].ns);
+    history_admit(ctx, pod, caller)?;
+    let t0 = now();
+    let r = async {
+        cpu(
+            ctx,
+            pod,
+            ctx.p.costs.history[HistApi::SignalWithStartWorkflowExecution.idx()],
+        )
+        .await;
+        shard_ready(ctx, pod, shard, deadline).await?;
+        // the workflow ID's current run
+        persist(
+            ctx,
+            pod,
+            PersistOp::GetCurrentExecution,
+            caller,
+            Some(shard),
+        )
+        .await?;
+        if let Some((wf, wgen)) = target {
+            if signal_running(ctx, pod, shard, wf, wgen, caller, deadline).await? {
+                return Ok((wf, wgen, false));
+            }
+            // the current run has closed: the consistency check reads the current run again
+            persist(
+                ctx,
+                pod,
+                PersistOp::GetCurrentExecution,
+                caller,
+                Some(shard),
+            )
+            .await?;
+        }
+        let (wf, wgen, _) = create_execution(
+            ctx,
+            pod,
+            shard,
+            key,
+            wf_type,
+            StartOrigin::Client,
+            false,
+            StartWith::Signal,
+            deadline,
+        )
+        .await?;
+        Ok((wf, wgen, true))
+    }
+    .await;
+    ctx.m
+        .borrow_mut()
+        .hist_op(pod, HistApi::SignalWithStartWorkflowExecution)
+        .record(now() - t0, r.as_ref().err().copied());
+    r
+}
+
+/// The outcome of an update-with-start call.
+#[derive(Clone, Copy, Debug)]
+pub struct UpdateStart {
+    pub wf: WfId,
+    pub wgen: u32,
+    /// the update's number in its workflow
+    pub update: u32,
+    /// this call started the workflow
+    pub created: bool,
+    /// the update completed before the call returned; otherwise the caller polls for it
+    pub done: bool,
+}
+
+/// ExecuteMultiOperation with a start and an update (`service/history/api/multioperation`):
+/// update the workflow ID's running workflow (conflict policy USE_EXISTING), or start one whose
+/// first workflow task carries the update, then wait for the update to complete, for up to
+/// `history.longPollExpirationInterval`. Its persistence calls run at priority 2: the call isn't
+/// among Start, Signal and SignalWithStart in the persistence limiter's table.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_with_start(
+    ctx: &Ctx,
+    pod: PodId,
+    shard: ShardId,
+    key: u64,
+    wf_type: usize,
+    target: Option<(WfId, u32)>,
+    deadline: Time,
+) -> Res<UpdateStart> {
+    let ns = ctx.p.wf_types[wf_type].ns;
+    let caller = Caller::Api(2, ns);
+    history_admit(ctx, pod, caller)?;
+    let t0 = now();
+    let r = async {
+        cpu(
+            ctx,
+            pod,
+            ctx.p.costs.history[HistApi::ExecuteMultiOperation.idx()],
+        )
+        .await;
+        shard_ready(ctx, pod, shard, deadline).await?;
+        // the workflow ID's current run
+        persist(
+            ctx,
+            pod,
+            PersistOp::GetCurrentExecution,
+            caller,
+            Some(shard),
+        )
+        .await?;
+        let admitted = match target {
+            Some((wf, wgen)) => {
+                let a = admit_update(ctx, pod, shard, wf, wgen, caller, deadline).await?;
+                if a.is_none() {
+                    // the current run has closed: the consistency check reads it again
+                    persist(
+                        ctx,
+                        pod,
+                        PersistOp::GetCurrentExecution,
+                        caller,
+                        Some(shard),
+                    )
+                    .await?;
+                }
+                a
+            }
+            None => None,
+        };
+        if let Some((n, rx)) = admitted {
+            let (wf, wgen) = target.unwrap_or_default();
+            match wait_update(ctx, ns, rx, deadline).await {
+                Ok(done) => {
+                    return Ok(UpdateStart {
+                        wf,
+                        wgen,
+                        update: n,
+                        created: false,
+                        done,
+                    });
+                }
+                // the workflow closed before its task took the update: the server starts a new
+                // run with it (`history.enableUpdateWithStartRetryOnClosedWorkflowAbort`)
+                Err(Err::NotFound) => {
+                    persist(
+                        ctx,
+                        pod,
+                        PersistOp::GetCurrentExecution,
+                        caller,
+                        Some(shard),
+                    )
+                    .await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let (wf, wgen, rx) = start_with_update(ctx, pod, shard, key, wf_type, deadline).await?;
+        let done = wait_update(ctx, ns, rx, deadline).await?;
+        Ok(UpdateStart {
+            wf,
+            wgen,
+            update: 0,
+            created: true,
+            done,
+        })
+    }
+    .await;
+    ctx.m
+        .borrow_mut()
+        .hist_op(pod, HistApi::ExecuteMultiOperation)
+        .record(now() - t0, r.as_ref().err().copied());
+    r
+}
+
+/// Start a run whose registry holds update 0 for its first workflow task, and wait on it.
+async fn start_with_update(
+    ctx: &Ctx,
+    pod: PodId,
+    shard: ShardId,
+    key: u64,
+    wf_type: usize,
+    deadline: Time,
+) -> Res<(WfId, u32, Receiver<bool>)> {
+    let (wf, wgen, _) = create_execution(
+        ctx,
+        pod,
+        shard,
+        key,
+        wf_type,
+        StartOrigin::Client,
+        false,
+        StartWith::Update,
+        deadline,
+    )
+    .await?;
+    let (tx, rx) = oneshot();
+    ctx.wfs
+        .borrow_mut()
+        .get_mut(wf, wgen)
+        .ok_or(Err::NotFound)?
+        .update_waiters
+        .push((0, tx));
+    Ok((wf, wgen, rx))
+}
+
+/// A re-sent update-with-start for an update that was still waiting when the last call
+/// returned: it attaches to the update by its ID and waits again (`multioperation/api.go`).
+/// Ok(true) once the update has completed.
+pub async fn reattach_update(
+    ctx: &Ctx,
+    pod: PodId,
+    wf: WfId,
+    wgen: u32,
+    update: u32,
+    deadline: Time,
+) -> Res<bool> {
+    let ns = ctx.wf_ns(wf, wgen);
+    let caller = Caller::Api(2, ns);
+    history_admit(ctx, pod, caller)?;
+    let t0 = now();
+    let r = async {
+        cpu(
+            ctx,
+            pod,
+            ctx.p.costs.history[HistApi::ExecuteMultiOperation.idx()],
+        )
+        .await;
+        let shard = ctx.wf_shard(wf, wgen).ok_or(Err::NotFound)?;
+        shard_ready(ctx, pod, shard, deadline).await?;
+        persist(
+            ctx,
+            pod,
+            PersistOp::GetCurrentExecution,
+            caller,
+            Some(shard),
+        )
+        .await?;
+        let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
+        load_ms(ctx, pod, shard, wf, wgen, caller).await?;
+        let rx = {
+            let mut wfs = ctx.wfs.borrow_mut();
+            let w = wfs.get_mut(wf, wgen).ok_or(Err::NotFound)?;
+            if w.updates_done > update {
+                drop(lock);
+                return Ok(true);
+            }
+            if w.status != WfStatus::Running {
+                return Err(Err::NotFound);
+            }
+            let (tx, rx) = oneshot();
+            w.update_waiters.push((update, tx));
+            rx
+        };
+        drop(lock);
+        wait_update(ctx, ns, rx, deadline).await
+    }
+    .await;
+    ctx.m
+        .borrow_mut()
+        .hist_op(pod, HistApi::ExecuteMultiOperation)
+        .record(now() - t0, r.as_ref().err().copied());
+    r
+}
+
+/// Admit an update to a running workflow: the registry keeps it in memory and nothing is
+/// written. With no workflow task outstanding, a speculative one goes straight to matching to
+/// carry it. Returns the update's number and a receiver for its outcome, or None when the
+/// workflow isn't running.
+async fn admit_update(
+    ctx: &Ctx,
+    pod: PodId,
+    shard: ShardId,
+    wf: WfId,
+    wgen: u32,
+    caller: Caller,
+    deadline: Time,
+) -> Res<Option<(u32, Receiver<bool>)>> {
+    let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
+    load_ms(ctx, pod, shard, wf, wgen, caller).await?;
+    let t = now();
+    let (n, rx, dispatch) = {
+        let mut wfs = ctx.wfs.borrow_mut();
+        let Some(w) = wfs.get_mut(wf, wgen) else {
+            return Ok(None);
+        };
+        if w.status != WfStatus::Running {
+            return Ok(None);
+        }
+        // `history.maxInFlightUpdates`: admitted updates not yet completed
+        if w.updates_admitted - w.updates_done >= ctx.p.namespaces[w.ns].max_in_flight_updates {
+            return Err(Err::ResourceExhausted(
+                ReCause::ConcurrentLimit,
+                Scope::Namespace,
+            ));
+        }
+        let n = w.updates_admitted;
+        w.updates_admitted += 1;
+        let (tx, rx) = oneshot();
+        w.update_waiters.push((n, tx));
+        let dispatch = if w.wft == WftState::None {
+            w.wft_seq += 1;
+            let sticky = w.sticky_worker.is_some();
+            w.wft = WftState::Scheduled {
+                seq: w.wft_seq,
+                attempt: 1,
+                sticky,
+                at: t,
+            };
+            w.wft_speculative = true;
+            let sticky_worker = if sticky { w.sticky_worker } else { None };
+            Some((w.wft_seq, sticky_worker, ctx.p.wf_types[w.wf_type].tq))
+        } else {
+            None
+        };
+        (n, rx, dispatch)
+    };
+    if let Some((seq, sticky_worker, tq)) = dispatch {
+        // SCHEDULE_TO_START: the sticky timeout on a sticky queue, else 5 s
+        // (`tasks.SpeculativeWorkflowTaskScheduleToStartTimeout`). Temporal keeps a speculative
+        // task's timers in memory; here they go through the timer queue.
+        let to = sticky_worker
+            .and_then(|wk| ctx.workers.borrow().get(wk).map(|x| x.fleet))
+            .map(|f| ctx.p.fleets[f].sticky_timeout)
+            .unwrap_or(5_000_000);
+        commit_tasks(
+            ctx,
+            shard,
+            wf,
+            wgen,
+            &[TaskSpec::at(
+                TaskType::TimerWorkflowTaskTimeout,
+                t + to,
+                seq,
+                0,
+            )],
+        );
+        let c = ctx.clone();
+        spawn(async move { dispatch_speculative(c, pod, wf, wgen, seq, tq, sticky_worker).await });
+    }
+    drop(lock);
+    Ok(Some((n, rx)))
+}
+
+/// AddWorkflowTask for a speculative workflow task, straight from history (no transfer task),
+/// falling back to the normal queue when the sticky worker is gone. Other errors are only
+/// logged: the task's schedule-to-start timeout recovers it.
+async fn dispatch_speculative(
+    ctx: Ctx,
+    pod: PodId,
+    wf: WfId,
+    wgen: u32,
+    seq: u32,
+    tq: usize,
+    sticky_worker: Option<usize>,
+) {
+    let task = MTask {
+        wf,
+        wf_gen: wgen,
+        kind: TqKind::Workflow,
+        r: seq,
+        r2: 0,
+        created: now(),
+        from_backlog: false,
+        query: false,
+    };
+    let add = |c: Ctx, sticky: Option<usize>| async move {
+        call_with_timeout(3_000_000, {
+            let c2 = c.clone();
+            async move {
+                super::matching::add_task(&c2, pod, tq, TqKind::Workflow, task, sticky).await
+            }
+        })
+        .await
+    };
+    if let Err(Err::StickyWorkerUnavailable) = add(ctx.clone(), sticky_worker).await {
+        {
+            let mut wfs = ctx.wfs.borrow_mut();
+            if let Some(w) = wfs.get_mut(wf, wgen) {
+                if let WftState::Scheduled {
+                    seq: s,
+                    attempt,
+                    at,
+                    ..
+                } = w.wft
+                    && s == seq
+                {
+                    w.wft = WftState::Scheduled {
+                        seq,
+                        attempt,
+                        sticky: false,
+                        at,
+                    };
+                }
+                w.sticky_worker = None;
+            }
+        }
+        let _ = add(ctx.clone(), None).await;
+    }
+}
+
+/// Wait for an update's outcome for up to `history.longPollExpirationInterval` (and the call's
+/// deadline): Ok(true) when it completed, Ok(false) when the wait ran out, NotFound when the
+/// workflow closed first.
+async fn wait_update(ctx: &Ctx, ns: usize, rx: Receiver<bool>, deadline: Time) -> Res<bool> {
+    let lp = ctx.p.namespaces[ns].history_long_poll;
+    let wait = lp.min(deadline.saturating_sub(now()));
+    match crate::sim::executor::timeout(wait, rx).await {
+        Ok(Some(true)) => Ok(true),
+        Ok(_) => Err(Err::NotFound),
+        Err(_) => Ok(false),
+    }
 }
 
 /// RecordChildExecutionCompleted on the parent (from the child's CloseExecution task).

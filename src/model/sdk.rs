@@ -217,6 +217,8 @@ impl Retry {
     pub const DEFAULT_TIMEOUT: Time = 10_000_000;
     /// The Go SDK's timeout for a history long poll (`defaultGetHistoryTimeout`).
     pub const LONG_POLL_TIMEOUT: Time = 65_000_000;
+    /// The Go SDK's deadline for each update call (`pollUpdateTimeout`).
+    pub const UPDATE_TIMEOUT: Time = 60_000_000;
 
     /// A call retried within one deadline of `timeout`.
     pub fn call(timeout: Time) -> Retry {
@@ -527,6 +529,8 @@ pub fn decide(ctx: &Ctx, info: &WftInfo, entity: bool) -> (Commands, f64) {
     let snap = info.snap;
     let mut cmds = Commands::default();
     let mut la_time = 0.0;
+    // update handlers run first and don't block: each update is accepted and completed here
+    cmds.updates = info.updates;
     if entity {
         prog.signals_consumed = snap.signals_received;
         cmds.new_prog = prog;

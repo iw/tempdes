@@ -72,6 +72,9 @@ pub type WfId = u32;
 pub enum Api {
     StartWorkflowExecution,
     SignalWorkflowExecution,
+    SignalWithStartWorkflowExecution,
+    /// Update-with-start: a StartWorkflowExecution and an UpdateWorkflowExecution in one call.
+    ExecuteMultiOperation,
     PollWorkflowTaskQueue,
     PollActivityTaskQueue,
     RespondWorkflowTaskCompleted,
@@ -91,9 +94,11 @@ pub enum Api {
 }
 
 impl Api {
-    pub const ALL: [Api; 14] = [
+    pub const ALL: [Api; 16] = [
         Api::StartWorkflowExecution,
         Api::SignalWorkflowExecution,
+        Api::SignalWithStartWorkflowExecution,
+        Api::ExecuteMultiOperation,
         Api::PollWorkflowTaskQueue,
         Api::PollActivityTaskQueue,
         Api::RespondWorkflowTaskCompleted,
@@ -112,6 +117,8 @@ impl Api {
         match self {
             Api::StartWorkflowExecution => "StartWorkflowExecution",
             Api::SignalWorkflowExecution => "SignalWorkflowExecution",
+            Api::SignalWithStartWorkflowExecution => "SignalWithStartWorkflowExecution",
+            Api::ExecuteMultiOperation => "ExecuteMultiOperation",
             Api::PollWorkflowTaskQueue => "PollWorkflowTaskQueue",
             Api::PollActivityTaskQueue => "PollActivityTaskQueue",
             Api::RespondWorkflowTaskCompleted => "RespondWorkflowTaskCompleted",
@@ -156,6 +163,8 @@ impl Api {
         match self {
             Api::StartWorkflowExecution
             | Api::SignalWorkflowExecution
+            | Api::SignalWithStartWorkflowExecution
+            | Api::ExecuteMultiOperation
             | Api::RespondWorkflowTaskCompleted
             | Api::RespondActivityTaskCompleted
             | Api::RecordActivityTaskHeartbeat => 1,
@@ -177,8 +186,9 @@ impl Api {
     }
 
     /// Counted by the per-namespace concurrent long-running request limiter
-    /// (`frontend.namespaceCount`, `ExecutionAPICountLimitOverride`): polls, queries and history
-    /// long polls, but not a plain `GetWorkflowExecutionHistory`.
+    /// (`frontend.namespaceCount`, `ExecutionAPICountLimitOverride`): polls, queries, history
+    /// long polls and update-with-start, which waits for its update, but not a plain
+    /// `GetWorkflowExecutionHistory`.
     pub fn is_long_running(self) -> bool {
         matches!(
             self,
@@ -186,15 +196,18 @@ impl Api {
                 | Api::PollActivityTaskQueue
                 | Api::QueryWorkflow
                 | Api::PollWorkflowExecutionHistory
+                | Api::ExecuteMultiOperation
         )
     }
 
     /// Persistence priority for history calls made on behalf of this API
-    /// (`common/persistence/client/quotas.go`): Start/Signal get 1, other API calls 2.
+    /// (`common/persistence/client/quotas.go`): Start/Signal/SignalWithStart get 1, other API
+    /// calls (ExecuteMultiOperation among them) 2.
     pub fn persistence_priority(self) -> usize {
         match self {
             Api::StartWorkflowExecution
             | Api::SignalWorkflowExecution
+            | Api::SignalWithStartWorkflowExecution
             | Api::GetWorkflowExecutionHistory
             | Api::PollWorkflowExecutionHistory => 1,
             _ => 2,
@@ -213,6 +226,8 @@ impl fmt::Display for Api {
 pub enum HistApi {
     StartWorkflowExecution,
     SignalWorkflowExecution,
+    SignalWithStartWorkflowExecution,
+    ExecuteMultiOperation,
     RecordWorkflowTaskStarted,
     RecordActivityTaskStarted,
     RespondWorkflowTaskCompleted,
@@ -226,9 +241,11 @@ pub enum HistApi {
 }
 
 impl HistApi {
-    pub const ALL: [HistApi; 12] = [
+    pub const ALL: [HistApi; 14] = [
         HistApi::StartWorkflowExecution,
         HistApi::SignalWorkflowExecution,
+        HistApi::SignalWithStartWorkflowExecution,
+        HistApi::ExecuteMultiOperation,
         HistApi::RecordWorkflowTaskStarted,
         HistApi::RecordActivityTaskStarted,
         HistApi::RespondWorkflowTaskCompleted,
@@ -245,6 +262,8 @@ impl HistApi {
         match self {
             HistApi::StartWorkflowExecution => "StartWorkflowExecution",
             HistApi::SignalWorkflowExecution => "SignalWorkflowExecution",
+            HistApi::SignalWithStartWorkflowExecution => "SignalWithStartWorkflowExecution",
+            HistApi::ExecuteMultiOperation => "ExecuteMultiOperation",
             HistApi::RecordWorkflowTaskStarted => "RecordWorkflowTaskStarted",
             HistApi::RecordActivityTaskStarted => "RecordActivityTaskStarted",
             HistApi::RespondWorkflowTaskCompleted => "RespondWorkflowTaskCompleted",
