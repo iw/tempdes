@@ -198,6 +198,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Failed calls clear cached mutable state as in Temporal.** A load that failed (a throttled or
+  timed-out `GetWorkflowExecution`) left the workflow counted as cached, so its next access
+  skipped the load. A call or task that fails while holding a workflow now clears the workflow's
+  mutable state for the errors Temporal's workflow cache is released with:
+  - failed writes, loads and event reads;
+  - stale tasks in `RecordWorkflowTaskStarted`, `RecordActivityTaskStarted`,
+    `RespondActivityTask*` and `RecordActivityTaskHeartbeat`;
+  - a closed parent in `RecordChildExecutionCompleted`;
+  - an update over `history.maxInFlightUpdates`.
+
+  The workflow stays in the cache, as in Temporal. Its next access counts as a hit in
+  `cache_requests` / `cache_miss` but loads the mutable state again with `GetWorkflowExecution`.
+  Under persistence throttling this multiplies the loads: in `baseline.yaml` with
+  `history.persistenceMaxQPS=600`, refused `GetWorkflowExecution` calls rise from 438/s to
+  3,537/s and successful updates halve. Runs without failures are unchanged. A parent's
+  ChildWorkflowExecutionStarted write now loads the parent's mutable state first and applies
+  only when it succeeds.
+
 - **Observed metric labels match whole name parts.** A label filter that matched any value
   ending with it counted an observed `SignalWithStartWorkflowExecution` as
   `StartWorkflowExecution`. A value now has to end with the filter after a separator, as in
