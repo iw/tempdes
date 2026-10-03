@@ -778,6 +778,8 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                 )
                 .await
             {
+                // a task that fails while holding the workflow clears its mutable state
+                clear_ms(ctx, pod, shard, wf, wgen);
                 return Outcome::Retry(e);
             }
             drop(lock);
@@ -838,6 +840,7 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             )
             .await
             {
+                clear_ms(ctx, pod, shard, wf, wgen);
                 return Outcome::Retry(e);
             }
             drop(lock);
@@ -867,13 +870,20 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             .await;
             match r {
                 Ok(_) => {
-                    // ChildWorkflowExecutionStarted recorded on the parent (another write)
+                    // ChildWorkflowExecutionStarted recorded on the parent
+                    // (`recordChildExecutionStarted`; Temporal keeps the parent locked from the
+                    // start of the task, tempdes takes the lock again). When the write fails,
+                    // Temporal retries the task, starting the child again under the same request
+                    // ID; here the event is dropped, and only the clear of the failed write kept
                     let lock = match lock_wf(ctx, wf, wgen, caller, now() + 3_000_000).await {
                         Ok(l) => l,
                         Err(_) => return Outcome::Done,
                     };
+                    if load_ms(ctx, pod, shard, wf, wgen, caller).await.is_err() {
+                        return Outcome::Done;
+                    }
                     let started = Append::new(1, 0.0);
-                    let _ = shard_write(
+                    let r = shard_write(
                         ctx,
                         pod,
                         shard,
@@ -883,7 +893,9 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
                         now() + 3_000_000,
                     )
                     .await;
-                    if let Some(w) = ctx.wfs.borrow_mut().get_mut(wf, wgen) {
+                    if r.is_err() {
+                        clear_ms(ctx, pod, shard, wf, wgen);
+                    } else if let Some(w) = ctx.wfs.borrow_mut().get_mut(wf, wgen) {
                         w.grow(started);
                     }
                     drop(lock);
@@ -939,7 +951,7 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             )
             .await
             {
-                evict_ms(ctx, pod, shard, wf, wgen);
+                clear_ms(ctx, pod, shard, wf, wgen);
                 return Outcome::Retry(e);
             }
             let t = now();
@@ -1018,7 +1030,7 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             )
             .await
             {
-                evict_ms(ctx, pod, shard, wf, wgen);
+                clear_ms(ctx, pod, shard, wf, wgen);
                 return Outcome::Retry(e);
             }
             let t = now();
@@ -1089,7 +1101,7 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
             )
             .await
             {
-                evict_ms(ctx, pod, shard, wf, wgen);
+                clear_ms(ctx, pod, shard, wf, wgen);
                 return Outcome::Retry(e);
             }
             let t = now();

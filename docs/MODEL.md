@@ -131,8 +131,32 @@ Each API follows the real handler sequence (`service/history/api/*`):
 8. Lock release, then post-lock reads. For example, `RecordWorkflowTaskStarted` reads the
    events for its poll response with `ReadHistoryBranch`.
 
-State changes are computed first and applied only if the write succeeds. A throttled or
-timed-out write evicts the workflow from the cache, like Temporal's `clearMutableState`.
+State changes are computed first and applied only if the write succeeds.
+
+A call or task that fails while it holds the workflow clears the workflow's mutable state, as
+Temporal does. Temporal's write methods call `ContextImpl.Clear` on any error
+(`service/history/workflow/context.go`), and so does the workflow cache's release function for
+any error the workflow is released with (`service/history/workflow/cache/cache.go`). The
+workflow stays in the cache: its next access counts as a cache hit (`cache_requests` without
+`cache_miss`) but loads the mutable state again with `GetWorkflowExecution`. These failures
+clear it:
+
+* a failed write: throttled, refused by the database, or timed out;
+* a failed load, which leaves the workflow cached without its mutable state;
+* an event read that fails under the lock, such as the scheduled event in
+  `RecordActivityTaskStarted`;
+* a stale or closed target: `RecordWorkflowTaskStarted` or `RecordActivityTaskStarted` for a task
+  that is gone or already started, `RespondActivityTask*` or `RecordActivityTaskHeartbeat` with
+  a stale token, `RecordChildExecutionCompleted` for a closed parent, and an update over
+  `history.maxInFlightUpdates`.
+
+A lock timeout (`BUSY_WORKFLOW`) clears nothing, since the workflow was never held. Temporal
+releases these without their error, and they leave the mutable state cached:
+
+* `RespondWorkflowTaskCompleted` for a stale task;
+* a signal to a closed workflow;
+* update-with-start on a closed workflow;
+* queue tasks that find nothing to do.
 
 These workflow behaviours are simulated:
 
@@ -629,6 +653,8 @@ knobs.
 * The minute a new pod runs on its per-pod persistence setting before its limiter first
   re-reads the cluster-wide share.
 * Kubernetes scheduling and pod restarts other than scaling events.
+* The mutable-state cache's `history.cacheTTL` (1 h). Temporal drops a cached workflow at its
+  first access an hour after it was cached, even one in constant use, and loads it again.
 
 Dynamic config keys that aren't simulated are still validated, and they appear in reports as
 *(not simulated)* when relevant.
