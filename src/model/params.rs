@@ -324,6 +324,8 @@ pub struct Knobs {
     pub history_persistence_global_max_qps: f64,
     pub shard_io_concurrency: u32,
     pub cache_max_size: usize,
+    /// `history.cacheTTL`: a cached workflow expires this long after it was cached
+    pub cache_ttl: Time,
     pub cache_non_user_lock_timeout: Time,
     pub events_cache_max_bytes: f64,
     pub scheduler_workers: [u32; 3],
@@ -750,6 +752,7 @@ pub const MODELED_KEYS: &[&str] = &[
     "history.persistencePerShardNamespaceMaxQPS",
     "history.shardIOConcurrency",
     "history.hostLevelCacheMaxSize",
+    "history.cacheTTL",
     "history.cacheNonUserContextLockTimeout",
     "history.eventsCacheMaxSizeBytes",
     "limit.historySize.error",
@@ -1063,6 +1066,7 @@ impl Params {
                 as f64,
             shard_io_concurrency: shard_io,
             cache_max_size: dc.int("history.hostLevelCacheMaxSize", &g, 128_000).max(1) as usize,
+            cache_ttl: dur_t(dc.duration_us("history.cacheTTL", &g, 3_600_000.0 * MS)),
             cache_non_user_lock_timeout: dur_t(dc.duration_us(
                 "history.cacheNonUserContextLockTimeout",
                 &g,

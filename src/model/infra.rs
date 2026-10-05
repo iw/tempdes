@@ -516,9 +516,9 @@ pub fn ms_key(ctx: &Ctx, shard: ShardId, wf: WfId, wgen: u32) -> Option<u64> {
     Some(key ^ (u64::from(epoch) << 48))
 }
 
-/// Load mutable state through the host-level cache. A miss, or a cached workflow whose mutable
-/// state was cleared, costs GetWorkflowExecution (`LoadMutableState` in
-/// `service/history/workflow/context.go`).
+/// Load mutable state through the host-level cache. A miss (including a workflow cached for
+/// longer than `history.cacheTTL`), or a cached workflow whose mutable state was cleared, costs
+/// GetWorkflowExecution (`LoadMutableState` in `service/history/workflow/context.go`).
 pub async fn load_ms(
     ctx: &Ctx,
     pod: PodId,
@@ -533,7 +533,7 @@ pub async fn load_ms(
     let loaded = {
         let mut pods = ctx.pods.borrow_mut();
         let h = pods[pod].hist.as_mut().expect("history pod");
-        let (hit, evicted) = h.cache.access(key);
+        let (hit, evicted) = h.cache.access_at(key, now());
         if let Some(k) = evicted {
             h.unloaded.remove(&k);
         }

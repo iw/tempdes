@@ -11,7 +11,7 @@ You describe a deployment and a workload. Two dimensions are adjustable:
 
 * **replica counts** for the frontend, history, matching and worker services;
 * **dynamic config**, in Temporal's own file format, for the settings that matter most for
-  throughput. 96 settings are simulated, and all 613 keys in 1.31.0 are validated.
+  throughput. 97 settings are simulated, and all 613 keys in 1.31.0 are validated.
 
 tempdes simulates the cluster request by request and reports what saturates first: CPU, database
 connections, a shard's IO semaphore, a single workflow's lock, a rate limiter, a history task
@@ -223,7 +223,7 @@ Run `tempdes dc modeled` for the full list of 99 keys with their defaults and de
 |---|---|
 | Frontend limits | `frontend.rps`, `frontend.globalRPS`, `frontend.namespaceRPS`, `frontend.globalNamespaceRPS`, `frontend.namespaceBurstRatio`, `frontend.namespaceCount` / `globalNamespaceCount`, `frontend.namespaceRPS.visibility` (+ global/burst), `frontend.pollWaitForNamespaceRateLimitToken`, `frontend.keepAliveMaxConnectionAge`, `system.operatorRPSRatio` |
 | Persistence | `{frontend,history,matching,worker}.persistenceMaxQPS`, `{history,matching}.persistenceGlobalMaxQPS`, the per-namespace limits `{history,matching}.persistence{,Global}NamespaceMaxQPS` and `history.persistencePerShardNamespaceMaxQPS`, `system.persistenceQPSBurstRatio` |
-| History | `history.rps`, `history.shardIOConcurrency`, `history.hostLevelCacheMaxSize`, `history.cacheNonUserContextLockTimeout`, `history.eventsCacheMaxSizeBytes`, `history.acquireShardConcurrency`, `history.defaultWorkflowTaskTimeout`, `history.defaultActivityRetryPolicy`, `history.longPollExpirationInterval` |
+| History | `history.rps`, `history.shardIOConcurrency`, `history.hostLevelCacheMaxSize`, `history.cacheTTL`, `history.cacheNonUserContextLockTimeout`, `history.eventsCacheMaxSizeBytes`, `history.acquireShardConcurrency`, `history.defaultWorkflowTaskTimeout`, `history.defaultActivityRetryPolicy`, `history.longPollExpirationInterval` |
 | Size limits | `limit.historySize.error`, `limit.historySize.warn`, `limit.blobSize.error`, `limit.blobSize.warn` |
 | History task queues | `*ProcessorSchedulerWorkerCount`, `*TaskBatchSize`, `*ProcessorMaxPollRPS`, `*ProcessorMaxPollHostRPS`, `*ProcessorUpdateAckInterval`, `history.queuePendingTasksMaxCount`, `history.timerProcessorMaxTimeShift`, `history.shardUpdateMin{Interval,TasksCompleted}`, the task scheduler's rate limiter: `history.taskSchedulerEnableRateLimiter{,ShadowMode}`, `history.taskSchedulerRateLimiterStartupDelay`, `history.taskScheduler{,Global}{,Namespace}MaxQPS`, the scheduler's weights per priority `history.{transfer,timer,visibility}ProcessorSchedulerActiveRoundRobinWeights`, and the execution queue scheduler `history.taskSchedulerEnableExecutionQueueScheduler`, `history.taskSchedulerExecutionQueueScheduler{MaxQueues,QueueTTL,QueueConcurrency}` |
 | Matching | `matching.rps`, `matching.numTaskqueue{Read,Write}Partitions`, `matching.forwarderMax{OutstandingPolls,OutstandingTasks,RatePerSecond,ChildrenPerNode}`, `matching.outstandingTaskAppendsThreshold`, `matching.maxTaskBatchSize`, `matching.getTasksBatchSize`, `matching.getTasksReloadAt`, `matching.maxWaitForPollerBeforeFwd`, `matching.backlogNegligibleAge`, `matching.longPollExpirationInterval`, `admin.matching*DispatchRate` |
