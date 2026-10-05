@@ -83,6 +83,7 @@ impl Default for Costs {
                 HistApi::RespondActivityTaskFailed => 420.0,
                 HistApi::RecordActivityTaskHeartbeat => 260.0,
                 HistApi::RecordChildExecutionCompleted => 420.0,
+                HistApi::ScheduleWorkflowTask => 320.0,
                 HistApi::DescribeWorkflowExecution => 260.0,
                 HistApi::GetWorkflowExecutionHistory => 220.0,
                 HistApi::QueryWorkflow => 300.0,

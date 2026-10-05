@@ -271,10 +271,14 @@ async fn create_execution(
     let tp = &ctx.p.wf_types[wf_type];
     let payload = tp.payload_bytes;
     let signal = with == StartWith::Signal;
+    // a child starts without a workflow task: its parent's start-child task schedules the first
+    // once the parent has recorded the start (`GenerateFirstWorkflowTask` in
+    // `service/history/api/create_workflow_util.go`)
+    let child = matches!(origin, StartOrigin::Child { .. });
     // WorkflowExecutionStarted with its input, WorkflowExecutionSignaled with the signal's for
     // signal-with-start, WorkflowTaskScheduled (and Started when eager)
     let append = Append::new(
-        2 + u32::from(eager) + u32::from(signal),
+        1 + u32::from(!child) + u32::from(eager) + u32::from(signal),
         payload + if signal { SIGNAL_BYTES } else { 0.0 },
     );
     // Brand new execution: no contention on its lock (unique IDs), write under the shard sem.
@@ -312,7 +316,9 @@ async fn create_execution(
         parent,
         history_events: append.events,
         history_bytes: append.bytes(),
-        wft: if eager {
+        wft: if child {
+            WftState::None
+        } else if eager {
             WftState::Started {
                 seq: 1,
                 attempt: 1,
@@ -327,7 +333,7 @@ async fn create_execution(
                 at: t,
             }
         },
-        wft_seq: 1,
+        wft_seq: u32::from(!child),
         sticky_worker: None,
         last_started_event: 0,
         buffered_events: 0,
@@ -351,6 +357,7 @@ async fn create_execution(
         children_pending: 0,
         children_done: 0,
         children_initiated: 0,
+        child_runs: Vec::new(),
         entity,
         close_waiters: Vec::new(),
         history_waiters: Vec::new(),
@@ -379,7 +386,7 @@ async fn create_execution(
             1,
             1,
         ));
-    } else {
+    } else if !child {
         tasks.push(TaskSpec::now(TaskType::TransferWorkflowTask, 1, 0));
     }
     commit_tasks(ctx, shard, id, wgen, &tasks);
@@ -399,6 +406,133 @@ async fn create_execution(
         updates: 0,
     });
     Ok((id, wgen, eager_wft))
+}
+
+/// StartWorkflowExecution sent again by a retried start-child task, for the child it already
+/// created: the create fails on the child's current run, whose request ID is the call's, and
+/// the call returns that run (`handleConflict` in `service/history/api/startworkflow/api.go`).
+/// It costs a create like the first.
+pub async fn start_child_again(
+    ctx: &Ctx,
+    pod: PodId,
+    shard: ShardId,
+    wf_type: usize,
+    deadline: Time,
+) -> Res<()> {
+    let tp = &ctx.p.wf_types[wf_type];
+    let caller = Caller::Api(1, tp.ns);
+    history_admit(ctx, pod, caller)?;
+    let t0 = now();
+    let r = async {
+        cpu(
+            ctx,
+            pod,
+            ctx.p.costs.history[HistApi::StartWorkflowExecution.idx()],
+        )
+        .await;
+        shard_ready(ctx, pod, shard, deadline).await?;
+        shard_write(
+            ctx,
+            pod,
+            shard,
+            PersistOp::CreateWorkflowExecution,
+            Append::new(1, tp.payload_bytes).bytes(),
+            caller,
+            deadline,
+        )
+        .await
+    }
+    .await;
+    ctx.m
+        .borrow_mut()
+        .hist_op(pod, HistApi::StartWorkflowExecution)
+        .record(now() - t0, r.as_ref().err().copied());
+    r
+}
+
+/// ScheduleWorkflowTask (`service/history/api/scheduleworkflowtask`): a child's first workflow
+/// task, from its parent's start-child task once the parent has recorded the start. A no-op
+/// when the child has had one.
+pub async fn schedule_first_wft(
+    ctx: &Ctx,
+    pod: PodId,
+    wf: WfId,
+    wgen: u32,
+    caller: Caller,
+    deadline: Time,
+) -> Res<()> {
+    history_admit(ctx, pod, caller)?;
+    let t0 = now();
+    let r = async {
+        cpu(
+            ctx,
+            pod,
+            ctx.p.costs.history[HistApi::ScheduleWorkflowTask.idx()],
+        )
+        .await;
+        let shard = ctx.wf_shard(wf, wgen).ok_or(Err::NotFound)?;
+        shard_ready(ctx, pod, shard, deadline).await?;
+        let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
+        load_ms(ctx, pod, shard, wf, wgen, caller).await?;
+        let (running, had_wft, key, payload) = {
+            let wfs = ctx.wfs.borrow();
+            let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
+            (
+                w.status == WfStatus::Running,
+                w.wft_seq > 0,
+                w.key,
+                ctx.p.wf_types[w.wf_type].payload_bytes,
+            )
+        };
+        if !running {
+            // `ErrWorkflowCompleted` fails the call, which clears the mutable state
+            clear_ms(ctx, pod, shard, wf, wgen);
+            return Err(Err::NotFound);
+        }
+        if had_wft {
+            return Ok(());
+        }
+        // the start event, through the events cache (`GetStartEvent`)
+        let ev = get_event(
+            ctx,
+            pod,
+            shard,
+            event_key(key, Cached::Started, 0),
+            EVENT_BYTES + payload,
+            Append::new(1, payload).bytes(),
+            caller,
+        )
+        .await;
+        clear_on_err(ctx, pod, shard, wf, wgen, ev)?;
+        // WorkflowTaskScheduled
+        let r = shard_write(
+            ctx,
+            pod,
+            shard,
+            PersistOp::UpdateWorkflowExecution,
+            Append::new(1, 0.0).bytes(),
+            caller,
+            deadline,
+        )
+        .await;
+        clear_on_err(ctx, pod, shard, wf, wgen, r)?;
+        let t = now();
+        let mut tasks = Vec::new();
+        if let Some(w) = ctx.wfs.borrow_mut().get_mut(wf, wgen)
+            && let Some((seq, sticky)) = maybe_schedule_wft(w, t)
+        {
+            wft_tasks(ctx, w, seq, sticky, t, &mut tasks);
+        }
+        commit_tasks(ctx, shard, wf, wgen, &tasks);
+        drop(lock);
+        Ok(())
+    }
+    .await;
+    ctx.m
+        .borrow_mut()
+        .hist_op(pod, HistApi::ScheduleWorkflowTask)
+        .record(now() - t0, r.as_ref().err().copied());
+    r
 }
 
 /// Hand the admitted updates that no task carries yet to the workflow task starting now.

@@ -412,6 +412,8 @@ pub struct Wf {
     pub children_done: u32,
     /// StartChildWorkflowExecutionInitiated events so far: numbers them in the events cache
     pub children_initiated: u32,
+    /// children its start-child tasks have created and not yet given a first workflow task
+    pub child_runs: Vec<ChildRun>,
     /// hot entity workflows loop on signals forever
     pub entity: bool,
     pub close_waiters: Vec<Sender<()>>,
@@ -420,6 +422,19 @@ pub struct Wf {
     pub running_idx: usize,
     /// schedule bookkeeping (scheduler workflows)
     pub schedule: Option<ScheduleState>,
+}
+
+/// A child created by a start-child task, kept until the task ends: a retried task reuses it,
+/// as the start's request ID makes Temporal do, and skips the start once the parent has
+/// recorded it.
+#[derive(Clone, Copy, Debug)]
+pub struct ChildRun {
+    /// the StartChildWorkflowExecutionInitiated event's number
+    pub n: u32,
+    pub wf: WfId,
+    pub wgen: u32,
+    /// ChildWorkflowExecutionStarted is written on the parent
+    pub recorded: bool,
 }
 
 impl Wf {

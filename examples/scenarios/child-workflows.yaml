@@ -1,0 +1,80 @@
+# Child workflows: each order fans out to four shipment child workflows, started together by one
+# workflow task. A start-child task holds the parent's lock through its child's start and the
+# write recording it, so the four start one after another, and each recorded start wakes the
+# parent with a workflow task. A child's first workflow task comes from the parent once the
+# start is recorded.
+#
+#   tempdes run examples/scenarios/child-workflows.yaml
+#   tempdes sweep examples/scenarios/child-workflows.yaml \
+#       --rows history=3,6 --cols history.shardIOConcurrency=1,4
+name: orders-child-workflows
+description: >
+  Order workflow at 50 starts/s fanning out to four shipment child workflows each, on
+  3 frontend, 3 history, 3 matching and 1 worker-service pods backed by Aurora PostgreSQL.
+seed: 7
+warmup: 20s
+duration: 60s
+
+cluster:
+  num_history_shards: 512          # static: persistence.numHistoryShards
+  replicas:
+    frontend: 3
+    history: 3
+    matching: 3
+    worker: 1
+  resources:                       # per-pod CPU limit (GOMAXPROCS)
+    frontend: { cpu: 2 }
+    history:  { cpu: 4 }
+    matching: { cpu: 2 }
+    worker:   { cpu: 1 }
+  network:
+    client_rtt: 2ms
+    internal_rtt: 0.5ms
+  persistence:
+    store: postgresql
+    max_conns: { frontend: 20, history: 50, matching: 30, worker: 10 }
+    capacity: 160                  # concurrent DB operations before queueing
+    latency:
+      UpdateWorkflowExecution: { p50: 3ms, p99: 14ms }
+      CreateWorkflowExecution: { p50: 4ms, p99: 18ms }
+  visibility:
+    store: elasticsearch
+
+dynamic_config:
+  history.shardIOConcurrency:
+    - value: 1
+  frontend.namespaceRPS:
+    - value: 2400
+
+namespaces:
+  - name: orders
+
+workers:
+  - name: order-workers
+    namespace: orders
+    task_queue: orders
+    processes: 6
+    workflow_pollers: 10
+    activity_pollers: 16
+    workflow_slots: 200
+    activity_slots: 200
+    sticky_cache_size: 5000
+
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 50/s
+    starters: 4
+    wft_processing: { p50: 2ms, p99: 12ms }
+    steps:
+      - activity: { count: 1, duration: { p50: 30ms, p99: 250ms } }   # reserve inventory
+      - child_workflow: { workflow_type: ShipmentWorkflow, count: 4 } # one per parcel
+      - activity: { count: 1, duration: { p50: 20ms, p99: 150ms } }   # confirm
+  - type: ShipmentWorkflow
+    namespace: orders
+    task_queue: orders
+    wft_processing: { p50: 2ms, p99: 12ms }
+    steps:
+      - activity: { count: 1, duration: { p50: 40ms, p99: 300ms } }   # book a carrier
+      - activity: { count: 1, duration: { p50: 20ms, p99: 150ms } }   # print the label

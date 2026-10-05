@@ -166,7 +166,19 @@ These workflow behaviours are simulated:
 * Activities: retries with the activity's retry policy, heartbeats, and the four activity
   timeouts (see [Activity timeouts](#activity-timeouts)).
 * User timers.
-* Child workflows: start through a transfer task, and completion recorded on the parent.
+* Child workflows. A transfer task starts each child (`processStartChildExecution` in
+  `service/history/transfer_queue_active_task_executor.go`):
+  * The task holds the parent's lock from loading its mutable state through the child's
+    `StartWorkflowExecution` and the write recording ChildWorkflowExecutionStarted. Children
+    started together therefore start one after another.
+  * The recorded start wakes the parent with a workflow task unless one is pending.
+  * The child starts without a workflow task. Once the parent's lock is released, the task
+    schedules the child's first one with history's `ScheduleWorkflowTask`. That call loads the
+    child (`GetWorkflowExecution`, since new runs aren't cached) and writes the task.
+  * A task that fails after starting the child is retried, and starting the child again with
+    its request ID returns the same child, at the cost of a failed `CreateWorkflowExecution`.
+    Once the start is recorded, a retry only schedules the first workflow task.
+  * A child's completion is recorded on the parent.
 * Signals. A signal that arrives while a workflow task is running is buffered and flushed into
   the next workflow task.
 * Signal-with-start (`start_with: signal`, `service/history/api/signalwithstartworkflow`).
@@ -653,6 +665,8 @@ knobs.
 * The minute a new pod runs on its per-pod persistence setting before its limiter first
   re-reads the cluster-wide share.
 * Kubernetes scheduling and pod restarts other than scaling events.
+* Parent close policies. A parent's children run on after it closes, as with
+  `PARENT_CLOSE_POLICY_ABANDON`.
 * The mutable-state cache's `history.cacheTTL` (1 h). Temporal drops a cached workflow at its
   first access an hour after it was cached, even one in constant use, and loads it again.
 

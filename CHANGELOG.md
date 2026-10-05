@@ -198,6 +198,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Child workflows start the way Temporal starts them.** Behaviour follows
+  `processStartChildExecution`:
+  - The start-child transfer task holds the parent's lock through the child's start and the
+    write recording it, so children started together start one after another.
+  - ChildWorkflowExecutionStarted wakes the parent with a workflow task unless one is pending.
+  - A child starts without a workflow task. Once the start is recorded, the parent's task
+    schedules the child's first one through history's new `ScheduleWorkflowTask` call.
+  - A task whose write fails after the child has started is retried, starting the same child
+    again under its request ID. Before, the parent's ChildWorkflowExecutionStarted was dropped.
+
+  In the new `child-workflows.yaml` example (four children per order), the change raises parent
+  workflow tasks by 18% and `UpdateWorkflowExecution` calls by 11%. The parents' lock wait p99
+  goes from 8 ms to 36 ms.
+
 - **Failed calls clear cached mutable state as in Temporal.** A load that failed (a throttled or
   timed-out `GetWorkflowExecution`) left the workflow counted as cached, so its next access
   skipped the load. A call or task that fails while holding a workflow now clears the workflow's
