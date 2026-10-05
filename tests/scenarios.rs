@@ -6,7 +6,7 @@ use std::path::Path;
 
 use tempdes::config::dynamic::{Constraints, DcValue};
 use tempdes::config::scenario::{ClientLb, Scenario};
-use tempdes::model::types::{Api, PersistOp};
+use tempdes::model::types::{Api, HistApi, PersistOp};
 use tempdes::report::{self, RunResult, Severity};
 use tempdes::run::{self, Overrides};
 use tempdes::util::units::Dur;
@@ -1899,5 +1899,34 @@ fn waiting_updates_fill_the_long_running_request_limit() {
             .any(|l| l.limiter == "frontend.namespaceCount" && l.rejected > 0),
         "{:#?}",
         r.limits
+    );
+}
+
+#[test]
+fn children_get_their_first_workflow_task_from_the_parent() {
+    // each order starts four shipments. Every child is started once and gets its first workflow
+    // task from its parent's start-child task (ScheduleWorkflowTask), and the orders keep up
+    let (r, out) = simulate_with_ctx(&scenario("child-workflows.yaml"), short());
+    assert!(
+        !r.hotspots.iter().any(|h| h.severity == Severity::Critical),
+        "{:#?}",
+        r.hotspots
+    );
+    let wf = |t: &str| r.workflows.iter().find(|w| w.workflow_type == t).unwrap();
+    let ratio = wf("ShipmentWorkflow").started_per_s / wf("OrderWorkflow").started_per_s;
+    assert!((ratio - 4.0).abs() < 0.2, "{ratio} shipments per order");
+    let shipment = out
+        .ctx
+        .p
+        .wf_types
+        .iter()
+        .position(|t| t.name == "ShipmentWorkflow")
+        .unwrap();
+    let m = out.ctx.m.borrow();
+    let scheduled = m.hist_total(HistApi::ScheduleWorkflowTask).count as f64;
+    let started = m.wf[shipment].started as f64;
+    assert!(
+        (scheduled / started - 1.0).abs() < 0.03,
+        "{scheduled} first workflow tasks for {started} children"
     );
 }

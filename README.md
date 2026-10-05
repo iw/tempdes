@@ -703,6 +703,7 @@ signal's input 256. Sizes cost time and room:
 | `cassandra-large.yaml` | 4,096 shards on Cassandra at 1,000 wf/s, with shard IO forced to 1. Useful for sweeps. |
 | `from-helm.yaml` | Deployment read from a `temporalio/helm-charts` values file. |
 | `frontend-lb.yaml` | 270 wf/s on 3 frontends with default limits. Pinned SDK connections overload one frontend; `round_robin` or `proxy` spreads the load evenly. |
+| `child-workflows.yaml` | Orders that each fan out to four shipment child workflows. Each start-child task holds the parent's lock through its child's start, so siblings start one after another, and each recorded start wakes the parent with a workflow task. |
 | `with-start.yaml` | Carts updated through update-with-start and inboxes fed through signal-with-start. The cart workers fall behind, so update calls wait out the 20s long poll and are sent again, and the waiting calls overflow `frontend.namespaceCount`. |
 | `frontend-scale-out.yaml` | Frontends scale from 3 to 6 mid-run. The new pods only get traffic once clients reconnect, re-resolve DNS or the proxy registers them. |
 

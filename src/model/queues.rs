@@ -809,100 +809,7 @@ async fn execute(ctx: &Ctx, pod: PodId, shard: ShardId, task: &HistTask) -> Outc
         }
         TaskType::TransferStartChildExecution => {
             cpu(ctx, pod, base_cost).await;
-            let lock = match lock_wf(ctx, wf, wgen, caller, deadline).await {
-                Ok(l) => l,
-                Err(e) => return Outcome::Retry(e),
-            };
-            if let Err(e) = load_ms(ctx, pod, shard, wf, wgen, caller).await {
-                return Outcome::Retry(e);
-            }
-            let (running, key, payload) =
-                ctx.wfs.borrow().get(wf, wgen).map_or((false, 0, 0.0), |w| {
-                    (
-                        w.status == WfStatus::Running,
-                        w.key,
-                        ctx.p.wf_types[w.wf_type].payload_bytes,
-                    )
-                });
-            if !running {
-                return Outcome::Noop;
-            }
-            // the initiated event, with the child's input, through the events cache
-            // (`GetChildExecutionInitiatedEvent`)
-            if let Err(e) = history::get_event(
-                ctx,
-                pod,
-                shard,
-                history::event_key(key, Cached::ChildInitiated, task.r2),
-                EVENT_BYTES + payload,
-                task.bytes,
-                caller,
-            )
-            .await
-            {
-                clear_ms(ctx, pod, shard, wf, wgen);
-                return Outcome::Retry(e);
-            }
-            drop(lock);
-            let child_type = task.r as usize;
-            let key = history::alloc_key(ctx);
-            let ns = ctx.p.wf_types[child_type].ns;
-            let cshard = history::shard_for(ctx, ns, child_type, key);
-            let r = history_call(ctx, cshard, |c, hp| {
-                let c = c.clone();
-                async move {
-                    start_workflow(
-                        &c,
-                        hp,
-                        cshard,
-                        key,
-                        child_type,
-                        StartOrigin::Child {
-                            parent: wf,
-                            parent_gen: wgen,
-                        },
-                        false,
-                        now() + 3_000_000,
-                    )
-                    .await
-                }
-            })
-            .await;
-            match r {
-                Ok(_) => {
-                    // ChildWorkflowExecutionStarted recorded on the parent
-                    // (`recordChildExecutionStarted`; Temporal keeps the parent locked from the
-                    // start of the task, tempdes takes the lock again). When the write fails,
-                    // Temporal retries the task, starting the child again under the same request
-                    // ID; here the event is dropped, and only the clear of the failed write kept
-                    let lock = match lock_wf(ctx, wf, wgen, caller, now() + 3_000_000).await {
-                        Ok(l) => l,
-                        Err(_) => return Outcome::Done,
-                    };
-                    if load_ms(ctx, pod, shard, wf, wgen, caller).await.is_err() {
-                        return Outcome::Done;
-                    }
-                    let started = Append::new(1, 0.0);
-                    let r = shard_write(
-                        ctx,
-                        pod,
-                        shard,
-                        PersistOp::UpdateWorkflowExecution,
-                        started.bytes(),
-                        caller,
-                        now() + 3_000_000,
-                    )
-                    .await;
-                    if r.is_err() {
-                        clear_ms(ctx, pod, shard, wf, wgen);
-                    } else if let Some(w) = ctx.wfs.borrow_mut().get_mut(wf, wgen) {
-                        w.grow(started);
-                    }
-                    drop(lock);
-                    Outcome::Done
-                }
-                Err(e) => Outcome::Retry(e),
-            }
+            start_child(ctx, pod, shard, task, caller, deadline).await
         }
         TaskType::TimerWorkflowTaskTimeout => {
             let lock = match lock_wf(ctx, wf, wgen, caller, deadline).await {
@@ -1214,6 +1121,176 @@ fn release_later(ctx: &Ctx, wf: WfId, wgen: u32) {
     });
 }
 
+/// A start-child task (`processStartChildExecution`). The parent stays locked from its load
+/// through the child's start and the write that records it, ChildWorkflowExecutionStarted, which
+/// wakes the parent with a workflow task unless one is pending. With the lock released, the
+/// child gets its first workflow task (`createFirstWorkflowTask`). A task retried after the
+/// child was created starts it again under the same request ID, which returns the same child,
+/// and one retried after the start was recorded only schedules the first workflow task.
+async fn start_child(
+    ctx: &Ctx,
+    pod: PodId,
+    shard: ShardId,
+    task: &HistTask,
+    caller: Caller,
+    deadline: Time,
+) -> Outcome {
+    let (wf, wgen, n) = (task.wf, task.wf_gen, task.r2);
+    let lock = match lock_wf(ctx, wf, wgen, caller, deadline).await {
+        Ok(l) => l,
+        Err(e) => return Outcome::Retry(e),
+    };
+    if let Err(e) = load_ms(ctx, pod, shard, wf, wgen, caller).await {
+        return Outcome::Retry(e);
+    }
+    let (running, key, payload, run) =
+        ctx.wfs
+            .borrow()
+            .get(wf, wgen)
+            .map_or((false, 0, 0.0, None), |w| {
+                (
+                    w.status == WfStatus::Running,
+                    w.key,
+                    ctx.p.wf_types[w.wf_type].payload_bytes,
+                    w.child_runs.iter().find(|c| c.n == n).copied(),
+                )
+            });
+    let child = match run {
+        // the start is recorded: only the first workflow task is left (a parent that closed
+        // since leaves the child running, as with PARENT_CLOSE_POLICY_ABANDON)
+        Some(c) if c.recorded => {
+            drop(lock);
+            (c.wf, c.wgen)
+        }
+        _ if !running => return Outcome::Noop,
+        _ => {
+            // the initiated event, with the child's input, through the events cache
+            // (`GetChildExecutionInitiatedEvent`)
+            if let Err(e) = history::get_event(
+                ctx,
+                pod,
+                shard,
+                history::event_key(key, Cached::ChildInitiated, n),
+                EVENT_BYTES + payload,
+                task.bytes,
+                caller,
+            )
+            .await
+            {
+                clear_ms(ctx, pod, shard, wf, wgen);
+                return Outcome::Retry(e);
+            }
+            let child_type = task.r as usize;
+            let started = match run {
+                Some(c) => match ctx.wf_shard(c.wf, c.wgen) {
+                    Some(cshard) => history_call(ctx, cshard, |cx, hp| {
+                        let cx = cx.clone();
+                        async move {
+                            history::start_child_again(&cx, hp, cshard, child_type, deadline).await
+                        }
+                    })
+                    .await
+                    .map(|()| (c.wf, c.wgen)),
+                    None => Err(Err::NotFound),
+                },
+                None => {
+                    let ckey = history::alloc_key(ctx);
+                    let ns = ctx.p.wf_types[child_type].ns;
+                    let cshard = history::shard_for(ctx, ns, child_type, ckey);
+                    history_call(ctx, cshard, |cx, hp| {
+                        let cx = cx.clone();
+                        async move {
+                            start_workflow(
+                                &cx,
+                                hp,
+                                cshard,
+                                ckey,
+                                child_type,
+                                StartOrigin::Child {
+                                    parent: wf,
+                                    parent_gen: wgen,
+                                },
+                                false,
+                                deadline,
+                            )
+                            .await
+                        }
+                    })
+                    .await
+                    .map(|(cw, cg, _)| (cw, cg))
+                }
+            };
+            let (cw, cg) = match started {
+                Ok(c) => c,
+                Err(e) => {
+                    clear_ms(ctx, pod, shard, wf, wgen);
+                    return Outcome::Retry(e);
+                }
+            };
+            if run.is_none()
+                && let Some(w) = ctx.wfs.borrow_mut().get_mut(wf, wgen)
+            {
+                w.child_runs.push(ChildRun {
+                    n,
+                    wf: cw,
+                    wgen: cg,
+                    recorded: false,
+                });
+            }
+            // ChildWorkflowExecutionStarted (`recordChildExecutionStarted`), still under the lock
+            let started = Append::new(1, 0.0);
+            let r = shard_write(
+                ctx,
+                pod,
+                shard,
+                PersistOp::UpdateWorkflowExecution,
+                started.bytes(),
+                caller,
+                deadline,
+            )
+            .await;
+            if let Err(e) = r {
+                clear_ms(ctx, pod, shard, wf, wgen);
+                return Outcome::Retry(e);
+            }
+            let t = now();
+            let mut tasks = Vec::new();
+            if let Some(w) = ctx.wfs.borrow_mut().get_mut(wf, wgen) {
+                w.grow(started);
+                if let Some(c) = w.child_runs.iter_mut().find(|c| c.n == n) {
+                    c.recorded = true;
+                }
+                history::deliver_event(ctx, w, t, &mut tasks);
+            }
+            commit_tasks(ctx, shard, wf, wgen, &tasks);
+            drop(lock);
+            (cw, cg)
+        }
+    };
+    // the child's first workflow task (`createFirstWorkflowTask`), outside the parent's lock
+    let r = match ctx.wf_shard(child.0, child.1) {
+        Some(cshard) => {
+            history_call(ctx, cshard, |cx, hp| {
+                let cx = cx.clone();
+                async move {
+                    history::schedule_first_wft(&cx, hp, child.0, child.1, caller, deadline).await
+                }
+            })
+            .await
+        }
+        None => Err(Err::NotFound),
+    };
+    match r {
+        Ok(()) | Err(Err::NotFound) => {
+            if let Some(w) = ctx.wfs.borrow_mut().get_mut(wf, wgen) {
+                w.child_runs.retain(|c| c.n != n);
+            }
+            Outcome::Done
+        }
+        Err(e) => Outcome::Retry(e),
+    }
+}
+
 /// `AddActivityTask` to matching for the activity attempt a transfer or retry timer task refers
 /// to (`r` is the activity, `r2` the attempt). A failure retries the history task.
 async fn push_activity(ctx: &Ctx, pod: PodId, task: &HistTask, tq: usize) -> Outcome {
@@ -1275,6 +1352,157 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::scenario::Scenario;
+    use crate::model::build;
+    use crate::run::{self, Overrides};
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::rc::Rc;
+
+    #[test]
+    fn start_child_holds_the_parent_and_reuses_its_child() {
+        // the baseline example's cluster, built without its workers or load
+        let sc = Scenario::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scenarios/baseline.yaml"),
+        )
+        .expect("scenario loads");
+        let p = run::prepare(&sc, &Overrides::default(), None).expect("parameters resolve");
+        let (ctx, mut ex) = build::build(p);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (c, s) = (ctx.clone(), seen.clone());
+        ex.spawn(async move {
+            let ctx = &c;
+            let deadline = || now() + 10_000_000;
+            let ns = ctx.p.wf_types[0].ns;
+            let key = history::alloc_key(ctx);
+            let shard = history::shard_for(ctx, ns, 0, key);
+            let pod = ctx.shard_owner(shard);
+            let (wf, wgen, _) = start_workflow(
+                ctx,
+                pod,
+                shard,
+                key,
+                0,
+                StartOrigin::Client,
+                false,
+                deadline(),
+            )
+            .await
+            .expect("parent started");
+            // as if its workflow task had completed with three children initiated
+            if let Some(w) = ctx.wfs.borrow_mut().get_mut(wf, wgen) {
+                w.wft = WftState::None;
+                w.children_initiated = 3;
+                w.children_pending = 3;
+            }
+            let task = |n: u32| HistTask {
+                kind: TaskType::TransferStartChildExecution,
+                wf,
+                wf_gen: wgen,
+                created: now(),
+                fire_at: now(),
+                r: 0,
+                r2: n,
+                bytes: 0.0,
+            };
+            let caller = caller_for(ctx, &task(0));
+            let created = || ctx.m.borrow().wf[0].started;
+            let children = |n: u32| {
+                ctx.wfs
+                    .borrow()
+                    .get(wf, wgen)
+                    .map_or(0, |w| w.child_runs.iter().filter(|c| c.n == n).count())
+            };
+            let first_wft = |cw: WfId, cg: u32| {
+                ctx.wfs
+                    .borrow()
+                    .get(cw, cg)
+                    .is_some_and(|w| matches!(w.wft, WftState::Scheduled { seq: 1, .. }))
+            };
+            // a call that wants the parent while the task runs waits until the child has been
+            // started and the start recorded
+            {
+                let (c, s) = (ctx.clone(), s.clone());
+                let before = created();
+                spawn(async move {
+                    sleep(100).await;
+                    let _lock = lock_wf(&c, wf, wgen, Caller::Api(2, ns), now() + 10_000_000)
+                        .await
+                        .expect("parent locked");
+                    let recorded = c
+                        .wfs
+                        .borrow()
+                        .get(wf, wgen)
+                        .is_some_and(|w| w.child_runs.iter().any(|r| r.n == 0 && r.recorded));
+                    s.borrow_mut().push((
+                        "probe: child started and recorded",
+                        c.m.borrow().wf[0].started == before + 1 && recorded,
+                    ));
+                });
+            }
+            assert!(matches!(
+                start_child(ctx, pod, shard, &task(0), caller, deadline()).await,
+                Outcome::Done
+            ));
+            let (woken, runs) = ctx.wfs.borrow().get(wf, wgen).map_or((false, 1), |w| {
+                (
+                    matches!(w.wft, WftState::Scheduled { .. }),
+                    w.child_runs.len(),
+                )
+            });
+            s.borrow_mut()
+                .push(("parent woken, run forgotten", woken && runs == 0));
+            // a retry after the start but before it was recorded starts the same child again,
+            // and so creates nothing new
+            let ckey = history::alloc_key(ctx);
+            let cshard = history::shard_for(ctx, ns, 0, ckey);
+            let child = StartOrigin::Child {
+                parent: wf,
+                parent_gen: wgen,
+            };
+            let (cw, cg, _) = start_workflow(
+                ctx,
+                ctx.shard_owner(cshard),
+                cshard,
+                ckey,
+                0,
+                child,
+                false,
+                deadline(),
+            )
+            .await
+            .expect("child started");
+            s.borrow_mut()
+                .push(("a child starts without a workflow task", !first_wft(cw, cg)));
+            if let Some(w) = ctx.wfs.borrow_mut().get_mut(wf, wgen) {
+                w.child_runs.push(ChildRun {
+                    n: 1,
+                    wf: cw,
+                    wgen: cg,
+                    recorded: false,
+                });
+            }
+            let n = created();
+            assert!(matches!(
+                start_child(ctx, pod, shard, &task(1), caller, deadline()).await,
+                Outcome::Done
+            ));
+            s.borrow_mut().push((
+                "retry reuses the child, which gets its first task",
+                created() == n && children(1) == 0 && first_wft(cw, cg),
+            ));
+        });
+        ex.run_until(30_000_000);
+        assert_eq!(
+            *seen.borrow(),
+            [
+                ("probe: child started and recorded", true),
+                ("parent woken, run forgotten", true),
+                ("a child starts without a workflow task", true),
+                ("retry reuses the child, which gets its first task", true),
+            ]
+        );
+    }
 
     #[test]
     fn resubmit_follows_executable_go() {

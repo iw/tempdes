@@ -735,9 +735,14 @@ impl Sampler {
             HistApi::RecordWorkflowTaskStarted,
             HistApi::RecordActivityTaskStarted,
         ];
+        // history's own calls, from its queue tasks
+        let from_history = [
+            HistApi::RecordChildExecutionCompleted,
+            HistApi::ScheduleWorkflowTask,
+        ];
         let hist_from_frontend: u64 = HistApi::ALL
             .iter()
-            .filter(|a| !started_by_matching.contains(a))
+            .filter(|a| !started_by_matching.contains(a) && !from_history.contains(a))
             .map(|a| hist_api[a.idx()])
             .sum();
         let flow = |id: &'static str,

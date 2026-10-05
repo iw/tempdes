@@ -235,13 +235,15 @@ pub enum HistApi {
     RespondActivityTaskFailed,
     RecordActivityTaskHeartbeat,
     RecordChildExecutionCompleted,
+    /// a child's first workflow task, scheduled by its parent's start-child task
+    ScheduleWorkflowTask,
     DescribeWorkflowExecution,
     GetWorkflowExecutionHistory,
     QueryWorkflow,
 }
 
 impl HistApi {
-    pub const ALL: [HistApi; 14] = [
+    pub const ALL: [HistApi; 15] = [
         HistApi::StartWorkflowExecution,
         HistApi::SignalWorkflowExecution,
         HistApi::SignalWithStartWorkflowExecution,
@@ -253,6 +255,7 @@ impl HistApi {
         HistApi::RespondActivityTaskFailed,
         HistApi::RecordActivityTaskHeartbeat,
         HistApi::RecordChildExecutionCompleted,
+        HistApi::ScheduleWorkflowTask,
         HistApi::DescribeWorkflowExecution,
         HistApi::GetWorkflowExecutionHistory,
         HistApi::QueryWorkflow,
@@ -271,6 +274,7 @@ impl HistApi {
             HistApi::RespondActivityTaskFailed => "RespondActivityTaskFailed",
             HistApi::RecordActivityTaskHeartbeat => "RecordActivityTaskHeartbeat",
             HistApi::RecordChildExecutionCompleted => "RecordChildExecutionCompleted",
+            HistApi::ScheduleWorkflowTask => "ScheduleWorkflowTask",
             HistApi::DescribeWorkflowExecution => "DescribeWorkflowExecution",
             HistApi::GetWorkflowExecutionHistory => "GetWorkflowExecutionHistory",
             HistApi::QueryWorkflow => "QueryWorkflow",
