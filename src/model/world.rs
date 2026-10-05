@@ -4,7 +4,7 @@
 //! while recording metrics. Rule: never hold a `RefCell` borrow across an `.await`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use crate::sim::executor::{Sender, Time, now};
@@ -67,6 +67,10 @@ pub struct FrontendState {
 
 pub struct HistoryHostState {
     pub cache: Lru,
+    /// cached workflows without their mutable state: cleared after an error
+    /// (`ContextImpl.Clear`) or never loaded because the load failed. The entry stays in the
+    /// cache, so the next access counts a hit but loads it with GetWorkflowExecution.
+    pub unloaded: HashSet<u64>,
     /// the host task schedulers (transfer, timer, visibility): IWRR over (namespace, priority)
     /// channels in front of `history.*ProcessorSchedulerWorkerCount` workers
     pub schedulers: [WeightedSemaphore; 3],

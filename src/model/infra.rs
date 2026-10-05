@@ -508,7 +508,17 @@ pub async fn lock_wf(
     }
 }
 
-/// Load mutable state through the host-level cache; a miss costs GetWorkflowExecution.
+/// A workflow's key in the host-level cache: its own, with the shard's epoch, so a shard that
+/// moves starts cold on its new owner.
+pub fn ms_key(ctx: &Ctx, shard: ShardId, wf: WfId, wgen: u32) -> Option<u64> {
+    let key = ctx.wfs.borrow().get(wf, wgen)?.key;
+    let epoch = ctx.shards.borrow()[(shard - 1) as usize].epoch;
+    Some(key ^ (u64::from(epoch) << 48))
+}
+
+/// Load mutable state through the host-level cache. A miss, or a cached workflow whose mutable
+/// state was cleared, costs GetWorkflowExecution (`LoadMutableState` in
+/// `service/history/workflow/context.go`).
 pub async fn load_ms(
     ctx: &Ctx,
     pod: PodId,
@@ -517,45 +527,74 @@ pub async fn load_ms(
     wgen: u32,
     caller: Caller,
 ) -> Res<()> {
-    let key = {
-        let wfs = ctx.wfs.borrow();
-        let Some(w) = wfs.get(wf, wgen) else {
-            return Err(Err::NotFound);
-        };
-        let epoch = ctx.shards.borrow()[(shard - 1) as usize].epoch;
-        w.key ^ (u64::from(epoch) << 48)
+    let Some(key) = ms_key(ctx, shard, wf, wgen) else {
+        return Err(Err::NotFound);
     };
-    let hit = {
+    let loaded = {
         let mut pods = ctx.pods.borrow_mut();
         let h = pods[pod].hist.as_mut().expect("history pod");
-        h.cache.access(key).0
+        let (hit, evicted) = h.cache.access(key);
+        if let Some(k) = evicted {
+            h.unloaded.remove(&k);
+        }
+        hit && !h.unloaded.contains(&key)
     };
-    if !hit {
-        persist(
+    if !loaded {
+        let r = persist(
             ctx,
             pod,
             PersistOp::GetWorkflowExecution,
             caller,
             Some(shard),
         )
-        .await?;
+        .await;
+        {
+            // a failed load leaves the cached workflow without mutable state, for the next access
+            // to load
+            let mut pods = ctx.pods.borrow_mut();
+            let h = pods[pod].hist.as_mut().expect("history pod");
+            if r.is_ok() {
+                h.unloaded.remove(&key);
+            } else if h.cache.contains(key) {
+                h.unloaded.insert(key);
+            }
+        }
+        r?;
         cpu(ctx, pod, ctx.p.costs.history_cache_miss).await;
     }
     Ok(())
 }
 
-/// Drop a workflow from the host cache (e.g. after a failed write, like Temporal's
-/// `clearMutableState`).
-pub fn evict_ms(ctx: &Ctx, pod: PodId, shard: ShardId, wf: WfId, wgen: u32) {
-    let key = {
-        let wfs = ctx.wfs.borrow();
-        let Some(w) = wfs.get(wf, wgen) else { return };
-        let epoch = ctx.shards.borrow()[(shard - 1) as usize].epoch;
-        w.key ^ (u64::from(epoch) << 48)
+/// Clear a workflow's cached mutable state, as Temporal does when a call or task holding the
+/// workflow fails: the write methods of `service/history/workflow/context.go` call
+/// `ContextImpl.Clear` on any error, and so does the workflow cache's release function
+/// (`service/history/workflow/cache/cache.go`) for any error it is released with. The workflow
+/// stays in the cache; its next access loads the mutable state again.
+pub fn clear_ms(ctx: &Ctx, pod: PodId, shard: ShardId, wf: WfId, wgen: u32) {
+    let Some(key) = ms_key(ctx, shard, wf, wgen) else {
+        return;
     };
-    if let Some(h) = ctx.pods.borrow_mut()[pod].hist.as_mut() {
-        h.cache.remove(key);
+    if let Some(h) = ctx.pods.borrow_mut()[pod].hist.as_mut()
+        && h.cache.contains(key)
+    {
+        h.unloaded.insert(key);
     }
+}
+
+/// Pass `r` on, clearing the workflow's mutable state if it is an error: a call that fails while
+/// holding the workflow releases it with the error.
+pub fn clear_on_err<T>(
+    ctx: &Ctx,
+    pod: PodId,
+    shard: ShardId,
+    wf: WfId,
+    wgen: u32,
+    r: Res<T>,
+) -> Res<T> {
+    if r.is_err() {
+        clear_ms(ctx, pod, shard, wf, wgen);
+    }
+    r
 }
 
 /// Run `fut` as an independent task and wait for its result with a deadline. The callee keeps

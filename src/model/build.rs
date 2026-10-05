@@ -2,7 +2,7 @@
 //! (replica changes → ring changes → shard / partition movement, dynamic config changes).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::sim::executor::{Executor, Time, now, sleep, sleep_until, spawn};
@@ -228,6 +228,7 @@ pub fn make_pod(
     };
     let hist = (svc == Service::History).then(|| HistoryHostState {
         cache: Lru::new(k.cache_max_size),
+        unloaded: HashSet::new(),
         schedulers: [
             WeightedSemaphore::new(k.scheduler_workers[0]),
             WeightedSemaphore::new(k.scheduler_workers[1]),

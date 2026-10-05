@@ -7,7 +7,9 @@
 //! post-lock reads (e.g. ReadHistoryBranch for workflow task history).
 //!
 //! State changes are computed first, persisted, and applied only on success, so a throttled or
-//! timed-out write leaves the workflow unchanged (Temporal clears the mutable state instead).
+//! timed-out write leaves the workflow unchanged. A call or task that fails while holding the
+//! workflow also clears its cached mutable state, as Temporal does for any error the workflow is
+//! released with (`clear_ms`): the next access loads it again with GetWorkflowExecution.
 
 use crate::config::scenario::StartWith;
 use crate::sim::executor::{Receiver, Time, now, oneshot, spawn};
@@ -466,8 +468,8 @@ async fn record_wft_started_inner(
     shard_ready(ctx, pod, shard, deadline).await?;
     let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
     load_ms(ctx, pod, shard, wf, wgen, caller).await?;
-    // validate
-    let (attempt, sticky, scheduled_at, speculative) = {
+    // validate: a task already started or gone fails the call, which clears the mutable state
+    let task = {
         let wfs = ctx.wfs.borrow();
         let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
         match w.wft {
@@ -477,11 +479,13 @@ async fn record_wft_started_inner(
                 sticky,
                 at,
             } if s == seq && w.status == WfStatus::Running => {
-                (attempt, sticky, at, w.wft_speculative)
+                Ok((attempt, sticky, at, w.wft_speculative))
             }
-            _ => return Err(Err::NotFound),
+            _ => Err(Err::NotFound),
         }
     };
+    let (attempt, sticky, scheduled_at, speculative) =
+        clear_on_err(ctx, pod, shard, wf, wgen, task)?;
     // WorkflowTaskStarted; a transient workflow task (attempt > 1) is a mutable-state-only write,
     // and a speculative one starts in memory: its events are written when it completes
     let started = Append::new(1, 0.0);
@@ -497,7 +501,7 @@ async fn record_wft_started_inner(
         )
         .await;
         if let Err(e) = r {
-            evict_ms(ctx, pod, shard, wf, wgen);
+            clear_ms(ctx, pod, shard, wf, wgen);
             return Err(e);
         }
     }
@@ -654,7 +658,8 @@ async fn respond_wft_inner(
     shard_ready(ctx, pod, shard, deadline).await?;
     let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
     load_ms(ctx, pod, shard, wf, wgen, caller).await?;
-    // validate the task is still the started one
+    // validate the task is still the started one; a stale one leaves the mutable state cached
+    // (`respondworkflowtaskcompleted` releases the workflow without its "not found" error)
     let (buffered, history_bytes, ns, speculative, updates_waiting) = {
         let wfs = ctx.wfs.borrow();
         let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
@@ -677,7 +682,7 @@ async fn respond_wft_inner(
     if history_bytes > ctx.p.namespaces[ns].history_size_error {
         // `forceTerminateWorkflow` discards the pending changes and loads the mutable state
         // again before it terminates the workflow
-        evict_ms(ctx, pod, shard, wf, wgen);
+        clear_ms(ctx, pod, shard, wf, wgen);
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
         // WorkflowExecutionTerminated
         let terminated = Append::new(1, 0.0);
@@ -692,7 +697,7 @@ async fn respond_wft_inner(
         )
         .await;
         if let Err(e) = r {
-            evict_ms(ctx, pod, shard, wf, wgen);
+            clear_ms(ctx, pod, shard, wf, wgen);
             return Err(e);
         }
         let (wf_type, parent, key) = {
@@ -753,7 +758,7 @@ async fn respond_wft_inner(
     )
     .await;
     if let Err(e) = r {
-        evict_ms(ctx, pod, shard, wf, wgen);
+        clear_ms(ctx, pod, shard, wf, wgen);
         return Err(e);
     }
     let t = now();
@@ -1062,31 +1067,33 @@ pub async fn record_activity_started(
         shard_ready(ctx, pod, shard, deadline).await?;
         let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
-        let (step, member, scheduled_at, first_scheduled_at, plan, wf_type, batch_bytes, ev_key) = {
+        // an activity already started or gone fails the call, which clears the mutable state
+        let found = {
             let wfs = ctx.wfs.borrow();
             let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
-            if w.status != WfStatus::Running {
-                return Err(Err::NotFound);
-            }
-            let a = w
-                .activities
+            w.activities
                 .iter()
                 .find(|a| a.seq == seq && a.attempt == attempt && a.state == ActState::Scheduled)
-                .ok_or(Err::NotFound)?;
-            (
-                a.step,
-                a.member,
-                a.scheduled_at,
-                a.first_scheduled_at,
-                a.plan,
-                w.wf_type,
-                a.batch_bytes,
-                event_key(w.key, Cached::ActivityScheduled, seq),
-            )
+                .filter(|_| w.status == WfStatus::Running)
+                .map(|a| {
+                    (
+                        a.step,
+                        a.member,
+                        a.scheduled_at,
+                        a.first_scheduled_at,
+                        a.plan,
+                        w.wf_type,
+                        a.batch_bytes,
+                        event_key(w.key, Cached::ActivityScheduled, seq),
+                    )
+                })
+                .ok_or(Err::NotFound)
         };
+        let (step, member, scheduled_at, first_scheduled_at, plan, wf_type, batch_bytes, ev_key) =
+            clear_on_err(ctx, pod, shard, wf, wgen, found)?;
         // the scheduled event, with the activity's input (while holding the lock)
         let payload = ctx.p.wf_types[wf_type].payload_bytes;
-        get_event(
+        let ev = get_event(
             ctx,
             pod,
             shard,
@@ -1095,7 +1102,8 @@ pub async fn record_activity_started(
             batch_bytes,
             caller,
         )
-        .await?;
+        .await;
+        clear_on_err(ctx, pod, shard, wf, wgen, ev)?;
         let r = shard_write(
             ctx,
             pod,
@@ -1107,7 +1115,7 @@ pub async fn record_activity_started(
         )
         .await;
         if let Err(e) = r {
-            evict_ms(ctx, pod, shard, wf, wgen);
+            clear_ms(ctx, pod, shard, wf, wgen);
             return Err(e);
         }
         let t = now();
@@ -1174,33 +1182,34 @@ pub async fn respond_activity(
         let lock = lock_wf(ctx, wf, wgen, caller, deadline).await?;
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
         let t0w = now();
+        // a stale task token (the attempt is gone) fails the call, which clears the mutable state
         let retry = {
             let wfs = ctx.wfs.borrow();
             let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
-            if w.status != WfStatus::Running {
-                return Err(Err::NotFound);
-            }
-            let a = w
-                .activities
+            w.activities
                 .iter()
                 .find(|a| {
                     a.seq == info.seq && a.attempt == info.attempt && a.state == ActState::Started
                 })
-                .ok_or(Err::NotFound)?;
-            // RespondActivityTaskFailed: the retry policy decides between a new attempt and
-            // failing the activity, unless the failure is non-retryable (`RetryActivity` returns
-            // RETRY_STATE_NON_RETRYABLE_FAILURE, `service/history/workflow/
-            // mutable_state_impl.go`)
-            if !failed || non_retryable {
-                None
-            } else if let activity::Next::Retry(d) =
-                activity::retry_decision(ctx, w.wf_type, a, None, t0w)
-            {
-                Some(d)
-            } else {
-                None
-            }
+                .filter(|_| w.status == WfStatus::Running)
+                .map(|a| {
+                    // RespondActivityTaskFailed: the retry policy decides between a new attempt
+                    // and failing the activity, unless the failure is non-retryable
+                    // (`RetryActivity` returns RETRY_STATE_NON_RETRYABLE_FAILURE,
+                    // `service/history/workflow/mutable_state_impl.go`)
+                    if !failed || non_retryable {
+                        None
+                    } else if let activity::Next::Retry(d) =
+                        activity::retry_decision(ctx, w.wf_type, a, None, t0w)
+                    {
+                        Some(d)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or(Err::NotFound)
         };
+        let retry = clear_on_err(ctx, pod, shard, wf, wgen, retry)?;
         let gave_up = failed && retry.is_none();
         // ActivityTaskStarted and the close event, with the result when it completed; a failure
         // with retry is a mutable-state-only write (server-side retry)
@@ -1223,7 +1232,7 @@ pub async fn respond_activity(
         )
         .await;
         if let Err(e) = r {
-            evict_ms(ctx, pod, shard, wf, wgen);
+            clear_ms(ctx, pod, shard, wf, wgen);
             return Err(e);
         }
         let t = now();
@@ -1306,17 +1315,19 @@ pub async fn heartbeat(ctx: &Ctx, pod: PodId, info: ActTaskInfo, deadline: Time)
         shard_ready(ctx, pod, shard, deadline).await?;
         let lock = lock_wf(ctx, info.wf, info.wgen, caller, deadline).await?;
         load_ms(ctx, pod, shard, info.wf, info.wgen, caller).await?;
-        {
-            // only the running attempt may heartbeat
+        // only the running attempt may heartbeat; a stale one fails the call, which clears the
+        // mutable state
+        let running = {
             let wfs = ctx.wfs.borrow();
             let w = wfs.get(info.wf, info.wgen).ok_or(Err::NotFound)?;
-            let running = w.status == WfStatus::Running
+            w.status == WfStatus::Running
                 && w.activities.iter().any(|a| {
                     a.seq == info.seq && a.attempt == info.attempt && a.state == ActState::Started
-                });
-            if !running {
-                return Err(Err::NotFound);
-            }
+                })
+        };
+        if !running {
+            clear_ms(ctx, pod, shard, info.wf, info.wgen);
+            return Err(Err::NotFound);
         }
         let r = shard_write(
             ctx,
@@ -1342,7 +1353,7 @@ pub async fn heartbeat(ctx: &Ctx, pod: PodId, info: ActTaskInfo, deadline: Time)
             }
             commit_tasks(ctx, shard, info.wf, info.wgen, &tasks);
         } else {
-            evict_ms(ctx, pod, shard, info.wf, info.wgen);
+            clear_ms(ctx, pod, shard, info.wf, info.wgen);
         }
         drop(lock);
         r
@@ -1424,7 +1435,7 @@ async fn signal_running(
     )
     .await;
     if let Err(e) = r {
-        evict_ms(ctx, pod, shard, wf, wgen);
+        clear_ms(ctx, pod, shard, wf, wgen);
         return Err(e);
     }
     let t = now();
@@ -1736,8 +1747,12 @@ async fn admit_update(
         if w.status != WfStatus::Running {
             return Ok(None);
         }
-        // `history.maxInFlightUpdates`: admitted updates not yet completed
+        // `history.maxInFlightUpdates`: admitted updates not yet completed. The refusal fails the
+        // call, which clears the mutable state; a closed workflow, above, is released without
+        // an error to start a new run
         if w.updates_admitted - w.updates_done >= ctx.p.namespaces[w.ns].max_in_flight_updates {
+            drop(wfs);
+            clear_ms(ctx, pod, shard, wf, wgen);
             return Err(Err::ResourceExhausted(
                 ReCause::ConcurrentLimit,
                 Scope::Namespace,
@@ -1885,12 +1900,11 @@ pub async fn record_child_completed(
         shard_ready(ctx, pod, shard, deadline).await?;
         let lock = lock_wf(ctx, wf, wgen, Caller::Api(2, ns), deadline).await?;
         load_ms(ctx, pod, shard, wf, wgen, caller).await?;
-        {
-            let wfs = ctx.wfs.borrow();
-            let w = wfs.get(wf, wgen).ok_or(Err::NotFound)?;
-            if w.status != WfStatus::Running {
-                return Err(Err::NotFound);
-            }
+        // a closed parent fails the call (`ErrWorkflowCompleted`), which clears its mutable state
+        let status = ctx.wfs.borrow().get(wf, wgen).ok_or(Err::NotFound)?.status;
+        if status != WfStatus::Running {
+            clear_ms(ctx, pod, shard, wf, wgen);
+            return Err(Err::NotFound);
         }
         // ChildWorkflowExecutionCompleted, with the child's `result`
         let completed = Append::new(1, result);
@@ -1905,7 +1919,7 @@ pub async fn record_child_completed(
         )
         .await;
         if let Err(e) = r {
-            evict_ms(ctx, pod, shard, wf, wgen);
+            clear_ms(ctx, pod, shard, wf, wgen);
             return Err(e);
         }
         let t = now();
@@ -2029,4 +2043,172 @@ pub async fn get_history(
 
 pub fn api_deadline(d: Time) -> Time {
     deadline_after(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::dynamic::DcValue;
+    use crate::config::scenario::Scenario;
+    use crate::model::build;
+    use crate::run::{self, Overrides};
+    use crate::sim::executor::sleep;
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::rc::Rc;
+
+    /// Where `wf`'s mutable state is: in `pod`'s host cache and loaded, cached but cleared, or
+    /// absent.
+    fn state(ctx: &Ctx, pod: PodId, shard: ShardId, wf: WfId, wgen: u32) -> &'static str {
+        let key = ms_key(ctx, shard, wf, wgen).expect("workflow");
+        let pods = ctx.pods.borrow();
+        let h = pods[pod].hist.as_ref().expect("history pod");
+        match (h.cache.contains(key), h.unloaded.contains(&key)) {
+            (true, false) => "loaded",
+            (true, true) => "cleared",
+            _ => "absent",
+        }
+    }
+
+    /// Load `wf`'s mutable state under its lock. Returns the result, and the GetWorkflowExecution
+    /// calls and cache misses the load counted.
+    async fn load(
+        ctx: &Ctx,
+        pod: PodId,
+        shard: ShardId,
+        wf: WfId,
+        wgen: u32,
+        caller: Caller,
+    ) -> (Res<()>, u64, u64) {
+        let counts = || {
+            let gets = ctx.m.borrow().persist[PersistOp::GetWorkflowExecution.idx()].count;
+            (
+                gets,
+                ctx.pods.borrow()[pod].hist.as_ref().unwrap().cache.misses,
+            )
+        };
+        let lock = lock_wf(ctx, wf, wgen, caller, now() + 10_000_000)
+            .await
+            .expect("locked");
+        let (gets, misses) = counts();
+        let r = load_ms(ctx, pod, shard, wf, wgen, caller).await;
+        let after = counts();
+        drop(lock);
+        (r, after.0 - gets, after.1 - misses)
+    }
+
+    /// Take `pod`'s persistence tokens as `caller` until a call is refused.
+    async fn exhaust(ctx: &Ctx, pod: PodId, shard: ShardId, caller: Caller) {
+        for _ in 0..100 {
+            let r = persist(
+                ctx,
+                pod,
+                PersistOp::GetCurrentExecution,
+                caller,
+                Some(shard),
+            )
+            .await;
+            if r.is_err() {
+                return;
+            }
+        }
+        panic!("history persistence never refused a call");
+    }
+
+    #[test]
+    fn failed_calls_clear_cached_mutable_state() {
+        // the baseline example's cluster, built without its workers or load
+        let sc = Scenario::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scenarios/baseline.yaml"),
+        )
+        .expect("scenario loads");
+        let p = run::prepare(&sc, &Overrides::default(), None).expect("parameters resolve");
+        let (ctx, mut ex) = build::build(p);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (c, s) = (ctx.clone(), seen.clone());
+        ex.spawn(async move {
+            let ctx = &c;
+            let key = alloc_key(ctx);
+            let shard = shard_for(ctx, ctx.p.wf_types[0].ns, 0, key);
+            let pod = ctx.shard_owner(shard);
+            let deadline = || now() + 10_000_000;
+            let (wf, wgen, _) = start_workflow(
+                ctx,
+                pod,
+                shard,
+                key,
+                0,
+                StartOrigin::Client,
+                false,
+                deadline(),
+            )
+            .await
+            .expect("workflow started");
+            let caller = Caller::Api(2, ctx.wf_ns(wf, wgen));
+            let note = |what: &'static str| {
+                s.borrow_mut()
+                    .push((what, state(ctx, pod, shard, wf, wgen)))
+            };
+            let (r, _, _) = load(ctx, pod, shard, wf, wgen, caller).await;
+            r.expect("loaded");
+            note("load");
+            // throttled history persistence refuses the first workflow task's started write
+            assert!(build::apply_dc(
+                ctx,
+                "history.persistenceMaxQPS",
+                &DcValue::Int(1)
+            ));
+            exhaust(ctx, pod, shard, caller).await;
+            let r = record_wft_started(ctx, pod, wf, wgen, 1, deadline()).await;
+            assert!(
+                matches!(r, Err(Err::ResourceExhausted(ReCause::PersistenceLimit, _))),
+                "{r:?}"
+            );
+            note("refused write");
+            // the next access loads it; a refused load leaves it cleared
+            let (r, gets, _) = load(ctx, pod, shard, wf, wgen, caller).await;
+            assert!(r.is_err() && gets == 1, "{r:?} {gets}");
+            note("refused load");
+            // once persistence has room again, it loads with GetWorkflowExecution, though the
+            // cache counts a hit: the workflow never left it (Temporal's `cache_miss`)
+            assert!(build::apply_dc(
+                ctx,
+                "history.persistenceMaxQPS",
+                &DcValue::Int(9000)
+            ));
+            sleep(1_000_000).await;
+            let (r, gets, misses) = load(ctx, pod, shard, wf, wgen, caller).await;
+            assert!(
+                r.is_ok() && gets == 1 && misses == 0,
+                "{r:?} {gets} {misses}"
+            );
+            note("reload");
+            // a stale task fails RecordWorkflowTaskStarted, which clears it too
+            let r = record_wft_started(ctx, pod, wf, wgen, 99, deadline()).await;
+            assert!(matches!(r, Err(Err::NotFound)), "{r:?}");
+            note("stale start");
+            // but a stale completion is released without its error
+            let info = record_wft_started(ctx, pod, wf, wgen, 1, deadline())
+                .await
+                .expect("workflow task started");
+            let done = respond_wft_completed(ctx, pod, info, Commands::default(), deadline()).await;
+            assert!(done.is_ok());
+            let again =
+                respond_wft_completed(ctx, pod, info, Commands::default(), deadline()).await;
+            assert!(matches!(again, Err(Err::NotFound)));
+            note("stale completion");
+        });
+        ex.run_until(30_000_000);
+        assert_eq!(
+            *seen.borrow(),
+            [
+                ("load", "loaded"),
+                ("refused write", "cleared"),
+                ("refused load", "cleared"),
+                ("reload", "loaded"),
+                ("stale start", "cleared"),
+                ("stale completion", "loaded"),
+            ]
+        );
+    }
 }
