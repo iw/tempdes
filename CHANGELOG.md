@@ -9,6 +9,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`tempdes metrics fetch` and `scan`.** Both read from a Prometheus HTTP API.
+  - **`fetch`:** runs the queries of `metrics queries` as instant queries at the end of a window
+    and writes an observations file. With `--baseline-end` it also writes a second file for the
+    window before the run.
+  - **`scan`:** prints the rate of workflow-starting calls, minute by minute, and suggests the
+    steadiest windows.
+  - **Metric names:** whichever names the exporter uses (tally or OpenTelemetry, with or without
+    a `temporal_` prefix) are recognised. Histogram bounds in seconds or milliseconds are both
+    written as milliseconds.
+  - **Renaming:** `--rename OLD=NEW` keeps private label values out of the files.
+  - **Access:** a bearer token, basic auth or extra headers, and `--ca-file` or `--insecure`
+    for TLS.
+
+  The `fetch` feature, on by default, adds `ureq` over rustls with the system's certificates,
+  so no OpenSSL is needed. `deny.toml` now allows the ISC license (ring, rustls-webpki,
+  untrusted), and has an exception for `webpki-root-certs`, used only on wasm32.
+  `metrics queries` now prints the same queries `fetch` runs:
+  - start rates per namespace;
+  - `cache_requests` and `cache_miss` separately, and likewise `poll_success` and
+    `poll_success_sync`;
+  - the backlog by namespace;
+  - completions and mutable-state clears, for notes.
+
 - **Signal-with-start and update-with-start.** A workflow type's `start_with: signal` or
   `start_with: update` starts it with SignalWithStartWorkflowExecution or update-with-start
   (`ExecuteMultiOperation`), and `existing` sends a share of the calls to the type's running

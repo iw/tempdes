@@ -79,9 +79,13 @@ cargo build --release
 ```
 
 The binary is `target/release/tempdes`. The simulator itself depends only on `serde`,
-`serde-saphyr` (YAML), `serde_json`, `clap` and `anyhow`; the live view (`tempdes ui`) adds
-the [Topcoat](https://github.com/tokio-rs/topcoat) web framework and tokio behind the default
-`ui` feature (`--no-default-features` builds the lean command-line tool). The simulation runs
+`serde-saphyr` (YAML), `serde_json`, `clap` and `anyhow`. Two default features add more:
+* `ui` (`tempdes ui`, the live view) adds the [Topcoat](https://github.com/tokio-rs/topcoat)
+  web framework and tokio;
+* `fetch` (`tempdes metrics fetch` and `scan`) adds the `ureq` HTTP client over rustls. It
+  trusts the system's certificates, so it needs no OpenSSL.
+
+`--no-default-features` builds the lean command-line tool. The simulation runs
 on a single thread per run. A 60-second simulation at 150 workflows/s takes one to two
 seconds. Sweeps run their cells in parallel.
 
@@ -318,6 +322,36 @@ tempdes metrics queries --window 15m   # the PromQL to run
 tempdes metrics template               # an annotated observations file
 tempdes run scenario.yaml -o observed.yaml
 ```
+
+With access to the Prometheus HTTP API, `tempdes metrics fetch` runs those queries itself:
+
+```bash
+# the rate of workflow-starting calls, minute by minute, and the steadiest windows
+tempdes metrics scan --url https://prometheus.example \
+    --from 2026-10-01T21:40Z --to 2026-10-01T23:00Z
+# the observations for the 15 minutes ending at --end, and for the 15 minutes before the run
+tempdes metrics fetch --url https://prometheus.example --end 2026-10-01T22:17Z --window 15m \
+    -o observed.yaml --baseline-end 2026-10-01T21:55Z --rename orders-prod=orders
+```
+
+These commands work as follows:
+
+* **Queries.** `fetch` runs the queries as instant queries at the end of the window. It then
+  writes an observations file that is readable only by you.
+* **Metric names.** It finds the names the cluster's exporter uses. Tally gives
+  `service_requests`, with histogram bounds in seconds. OpenTelemetry gives
+  `temporal_service_requests_total` and `..._milliseconds_bucket`. Latencies are written in
+  milliseconds.
+* **Gaps.** The file's header lists metrics that are missing or had no data.
+* **Renaming.** `--rename OLD=NEW` rewrites label values, such as namespaces, before anything is
+  written or printed. The files can then use the scenario's names.
+* **Authentication.** `PROMETHEUS_BEARER_TOKEN` in the environment sends a bearer token, and
+  `--user` sends basic auth, with the password in `PROMETHEUS_PASSWORD`. `--header` adds other
+  headers, such as `X-Scope-OrgID` for Mimir. A Grafana data source proxy URL works too.
+* **TLS.** `--ca-file` trusts a private CA instead of the system's, and `--insecure` skips
+  verification.
+* **CPU and the database.** `--cpu-selector` picks Temporal's containers in cAdvisor's metrics.
+  `--db-utilization` or `--db-utilization-query` adds the database's busy fraction.
 
 An observations file lists Temporal metric names with labels. Each entry gives a `rate`,
 `increase` (with `window`), `value`, quantiles (`p50`/`p90`/`p99` or a `quantiles` map) or raw
