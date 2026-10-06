@@ -370,6 +370,18 @@ async fn create_execution(
         let wgen = wfs.slots[id as usize].as_ref().map(|w| w.wgen).unwrap_or(0);
         (id, wgen)
     };
+    // update-with-start keeps the new run in the cache with its mutable state, which holds the
+    // update registry (`workflowLeaseCallback` in `service/history/api/multioperation/api.go`);
+    // other starts leave the first access to load it
+    if with == StartWith::Update
+        && let Some(k) = ms_key(ctx, shard, id, wgen)
+        && let Some(h) = ctx.pods.borrow_mut()[pod].hist.as_mut()
+    {
+        if let (_, Some(e)) = h.cache.access_at(k, t) {
+            h.unloaded.remove(&e);
+        }
+        h.unloaded.remove(&k);
+    }
     {
         let mut m = ctx.m.borrow_mut();
         m.wf[wf_type].started += 1;
@@ -2231,6 +2243,16 @@ mod tests {
         (r, after.0 - gets, after.1 - misses)
     }
 
+    /// The baseline example's cluster, built without its workers or load.
+    fn cluster() -> (Ctx, crate::sim::executor::Executor) {
+        let sc = Scenario::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scenarios/baseline.yaml"),
+        )
+        .expect("scenario loads");
+        let p = run::prepare(&sc, &Overrides::default(), None).expect("parameters resolve");
+        build::build(p)
+    }
+
     /// Take `pod`'s persistence tokens as `caller` until a call is refused.
     async fn exhaust(ctx: &Ctx, pod: PodId, shard: ShardId, caller: Caller) {
         for _ in 0..100 {
@@ -2251,13 +2273,7 @@ mod tests {
 
     #[test]
     fn failed_calls_clear_cached_mutable_state() {
-        // the baseline example's cluster, built without its workers or load
-        let sc = Scenario::load(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scenarios/baseline.yaml"),
-        )
-        .expect("scenario loads");
-        let p = run::prepare(&sc, &Overrides::default(), None).expect("parameters resolve");
-        let (ctx, mut ex) = build::build(p);
+        let (ctx, mut ex) = cluster();
         let seen = Rc::new(RefCell::new(Vec::new()));
         let (c, s) = (ctx.clone(), seen.clone());
         ex.spawn(async move {
@@ -2342,6 +2358,53 @@ mod tests {
                 ("reload", "loaded"),
                 ("stale start", "cleared"),
                 ("stale completion", "loaded"),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_update_with_start_caches_its_new_run() {
+        let (ctx, mut ex) = cluster();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (c, s) = (ctx.clone(), seen.clone());
+        ex.spawn(async move {
+            let ctx = &c;
+            for (name, with) in [
+                ("start", StartWith::Start),
+                ("signal-with-start", StartWith::Signal),
+                ("update-with-start", StartWith::Update),
+            ] {
+                let key = alloc_key(ctx);
+                let shard = shard_for(ctx, ctx.p.wf_types[0].ns, 0, key);
+                let pod = ctx.shard_owner(shard);
+                let deadline = now() + 10_000_000;
+                shard_ready(ctx, pod, shard, deadline)
+                    .await
+                    .expect("shard ready");
+                let (wf, wgen, _) = create_execution(
+                    ctx,
+                    pod,
+                    shard,
+                    key,
+                    0,
+                    StartOrigin::Client,
+                    false,
+                    with,
+                    deadline,
+                )
+                .await
+                .expect("created");
+                s.borrow_mut()
+                    .push((name, state(ctx, pod, shard, wf, wgen)));
+            }
+        });
+        ex.run_until(30_000_000);
+        assert_eq!(
+            *seen.borrow(),
+            [
+                ("start", "absent"),
+                ("signal-with-start", "absent"),
+                ("update-with-start", "loaded"),
             ]
         );
     }

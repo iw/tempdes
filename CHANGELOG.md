@@ -9,6 +9,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`history.cacheTTL`.** A cached workflow expires an hour after it was cached (the setting's
+  default), however often it is read, as in Temporal's cache. The access that finds it expired
+  is a cache miss and loads the mutable state again with `GetWorkflowExecution`. Runs shorter
+  than the TTL are unchanged. With `-d history.cacheTTL=10s`, `GetWorkflowExecution` calls
+  roughly double in `baseline.yaml` (152/s to 297/s) and in `child-workflows.yaml`, and
+  `hot-entity.yaml`'s entities reload every 10 s.
+
 - **`tempdes metrics fetch` and `scan`.** Both read from a Prometheus HTTP API.
   - **`fetch`:** runs the queries of `metrics queries` as instant queries at the end of a window
     and writes an observations file. With `--baseline-end` it also writes a second file for the
@@ -222,6 +229,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hosts, are counted but never written.
 
 ### Fixed
+
+- **Update-with-start caches its new run.** As in Temporal, the run it creates goes into the
+  host cache with its mutable state, so its first workflow task makes no `GetWorkflowExecution`
+  call. In `with-start.yaml`, `GetWorkflowExecution` calls fall from 76.5/s to 52.5/s, one fewer
+  for each of the ~24 carts created per second.
 
 - **Child workflows start the way Temporal starts them.** Behaviour follows
   `processStartChildExecution`:

@@ -117,8 +117,13 @@ Each API follows the real handler sequence (`service/history/api/*`):
      `history.cacheNonUserContextLockTimeout` (500 ms).
    * A timeout returns `BUSY_WORKFLOW` (`service/history/consts/const.go`).
 5. **Mutable state** through the host-level LRU (`history.hostLevelCacheMaxSize`, keyed with the
-   shard epoch). A miss costs `GetWorkflowExecution`. `StartWorkflowExecution` doesn't populate
-   the cache.
+   shard epoch). A miss costs `GetWorkflowExecution`.
+   * **Expiry.** An entry expires `history.cacheTTL` (1 h) after it was cached, however often it
+     is read (`common/cache/lru.go`). The access that finds it expired is a miss and loads it
+     again. Temporal spares an entry that another call holds at that moment; tempdes doesn't.
+   * **New runs.** Update-with-start caches its new run with the mutable state, which holds the
+     update registry (`workflowLeaseCallback` in `service/history/api/multioperation/api.go`).
+     Other starts don't populate the cache.
 6. **Persistence under the shard IO semaphore** (`service/history/shard/context_impl.go`,
    `history.shardIOConcurrency`; forced to 1 on Cassandra, with a warning):
    `UpdateWorkflowExecution` / `CreateWorkflowExecution`. The store appends the new history
@@ -667,8 +672,6 @@ knobs.
 * Kubernetes scheduling and pod restarts other than scaling events.
 * Parent close policies. A parent's children run on after it closes, as with
   `PARENT_CLOSE_POLICY_ABANDON`.
-* The mutable-state cache's `history.cacheTTL` (1 h). Temporal drops a cached workflow at its
-  first access an hour after it was cached, even one in constant use, and loads it again.
 
 Dynamic config keys that aren't simulated are still validated, and they appear in reports as
 *(not simulated)* when relevant.

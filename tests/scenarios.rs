@@ -1930,3 +1930,22 @@ fn children_get_their_first_workflow_task_from_the_parent() {
         "{scheduled} first workflow tasks for {started} children"
     );
 }
+
+#[test]
+fn cached_workflows_expire_after_the_cache_ttl() {
+    // entity workflows live for the whole run: with the default `history.cacheTTL` (1h) they
+    // stay cached, and with a 10s TTL they are loaded again every 10s however busy they are
+    let get_workflow = |r: &RunResult| {
+        r.persistence
+            .ops
+            .iter()
+            .find(|o| o.op == "GetWorkflowExecution")
+            .map_or(0.0, |o| o.per_s)
+    };
+    let default = get_workflow(&simulate("hot-entity.yaml", short()));
+    let short_ttl = get_workflow(&simulate(
+        "hot-entity.yaml",
+        with_dc(short(), "history.cacheTTL", DcValue::Str("10s".into())),
+    ));
+    assert!(short_ttl > 1.5 * default, "{short_ttl} vs {default}");
+}

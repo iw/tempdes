@@ -1,8 +1,9 @@
 //! Fixed-capacity LRU set keyed by `u64` (intrusive doubly linked list over a slab).
 //!
-//! Used for the history host-level mutable state cache (`history.hostLevelCacheMaxSize`) and
-//! the SDK sticky workflow cache, whose entries count one each, and for the shard events cache,
-//! whose entries weigh their size in bytes (`history.eventsCacheMaxSizeBytes`).
+//! Used for the history host-level mutable state cache (`history.hostLevelCacheMaxSize`, with
+//! `history.cacheTTL`) and the SDK sticky workflow cache, whose entries count one each, and for
+//! the shard events cache, whose entries weigh their size in bytes
+//! (`history.eventsCacheMaxSizeBytes`).
 
 use std::collections::HashMap;
 
@@ -12,6 +13,8 @@ const NIL: u32 = u32::MAX;
 struct Node {
     key: u64,
     size: u64,
+    /// when the entry was inserted, for the TTL
+    at: u64,
     prev: u32,
     next: u32,
 }
@@ -25,6 +28,8 @@ pub struct Lru {
     free: Vec<u32>,
     head: u32, // most recent
     tail: u32, // least recent
+    /// entries expire this long after they were inserted (0: never)
+    ttl: u64,
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
@@ -50,10 +55,18 @@ impl Lru {
             free: Vec::new(),
             head: NIL,
             tail: NIL,
+            ttl: 0,
             hits: 0,
             misses: 0,
             evictions: 0,
         }
+    }
+
+    /// Expire entries `ttl` after they were inserted, however often they are read since
+    /// (`common/cache/lru.go`: only a put that replaces an entry's value renews it).
+    pub fn with_ttl(mut self, ttl: u64) -> Self {
+        self.ttl = ttl;
+        self
     }
 
     pub fn len(&self) -> usize {
@@ -101,23 +114,35 @@ impl Lru {
     /// Access `key`: returns true on hit. On miss the key is inserted (evicting the LRU entry
     /// when full) and the evicted key, if any, is returned via `evicted`.
     pub fn access(&mut self, key: u64) -> (bool, Option<u64>) {
+        self.access_at(key, 0)
+    }
+
+    /// `access` at time `now`. An entry older than the TTL is a miss and starts over, as the
+    /// lookup that finds it expired deletes it and the caller puts a new one.
+    pub fn access_at(&mut self, key: u64, now: u64) -> (bool, Option<u64>) {
         if let Some(&i) = self.map.get(&key) {
-            self.hits += 1;
+            let expired = self.ttl > 0 && now.saturating_sub(self.nodes[i as usize].at) > self.ttl;
+            if expired {
+                self.misses += 1;
+                self.nodes[i as usize].at = now;
+            } else {
+                self.hits += 1;
+            }
             if self.head != i {
                 self.unlink(i);
                 self.push_front(i);
             }
-            return (true, None);
+            return (!expired, None);
         }
         self.misses += 1;
-        let evicted = self.insert_new(key, 1);
+        let evicted = self.insert_new(key, 1, now);
         (false, evicted)
     }
 
     /// Insert without counting a hit/miss (pre-warming).
     pub fn warm(&mut self, key: u64) {
         if !self.map.contains_key(&key) {
-            self.insert_new(key, 1);
+            self.insert_new(key, 1, 0);
         }
     }
 
@@ -140,11 +165,11 @@ impl Lru {
     pub fn put(&mut self, key: u64, size: u64) {
         self.remove(key);
         if size <= self.cap {
-            self.insert_new(key, size);
+            self.insert_new(key, size, 0);
         }
     }
 
-    fn insert_new(&mut self, key: u64, size: u64) -> Option<u64> {
+    fn insert_new(&mut self, key: u64, size: u64, at: u64) -> Option<u64> {
         let mut evicted = None;
         while self.used + size > self.cap && self.tail != NIL {
             let t = self.tail;
@@ -159,6 +184,7 @@ impl Lru {
         let node = Node {
             key,
             size,
+            at,
             prev: NIL,
             next: NIL,
         };
@@ -214,6 +240,23 @@ impl Lru {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entries_expire_from_insertion_however_often_read() {
+        let mut c = Lru::new(4).with_ttl(10);
+        assert_eq!(c.access_at(1, 0), (false, None));
+        assert_eq!(c.access_at(1, 5), (true, None));
+        assert_eq!(c.access_at(1, 10), (true, None));
+        // read at 5 and 10, but inserted at 0: expired at 11, and inserted afresh
+        assert_eq!(c.access_at(1, 11), (false, None));
+        assert_eq!(c.access_at(1, 21), (true, None));
+        assert_eq!(c.access_at(1, 22), (false, None));
+        assert_eq!((c.hits, c.misses, c.len()), (3, 3, 1));
+        // without a TTL nothing expires
+        let mut c = Lru::new(4);
+        c.access_at(1, 0);
+        assert_eq!(c.access_at(1, u64::MAX), (true, None));
+    }
 
     #[test]
     fn lru_evicts_least_recent() {

@@ -227,7 +227,7 @@ pub fn make_pod(
         Service::Worker => (PriorityLimiter::unlimited(2), None),
     };
     let hist = (svc == Service::History).then(|| HistoryHostState {
-        cache: Lru::new(k.cache_max_size),
+        cache: Lru::new(k.cache_max_size).with_ttl(k.cache_ttl),
         unloaded: HashSet::new(),
         schedulers: [
             WeightedSemaphore::new(k.scheduler_workers[0]),
