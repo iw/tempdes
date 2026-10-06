@@ -340,6 +340,9 @@ struct ScanArgs {
     /// Resolution.
     #[arg(long, default_value = "1m")]
     step: String,
+    /// Window of each rate [default: four scrape intervals, or the step if longer].
+    #[arg(long)]
+    rate_window: Option<String>,
 }
 
 #[cfg(feature = "fetch")]
@@ -475,6 +478,7 @@ pub fn main() -> anyhow::Result<ExitCode> {
                     to: a.to,
                     window: a.window,
                     step: a.step,
+                    rate_window: a.rate_window,
                     rename: a.prom.rename,
                 })?;
                 print!("{report}");

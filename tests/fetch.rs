@@ -107,6 +107,22 @@ fn answer(e: Exporter, q: &str) -> Series {
     let labels = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
         pairs.iter().map(|(k, v)| (*k, v.to_string())).collect()
     };
+    // samples per series over 10 minutes: one scrape every 60 s
+    if q.starts_with("max(count_over_time(") {
+        return one(10.0);
+    }
+    if q.starts_with("count by (service_name) (") {
+        return ["frontend", "history", "matching"]
+            .iter()
+            .map(|s| (labels(&[("service_name", s)]), 4.0))
+            .collect();
+    }
+    if q.starts_with("count by (operation) (") {
+        return [START_PATH, "PollWorkflowTaskQueue"]
+            .iter()
+            .map(|o| (labels(&[("operation", o)]), 4.0))
+            .collect();
+    }
     if q.starts_with("histogram_quantile(") {
         let p = |q50: f64, q90: f64, q99: f64| {
             if q.starts_with("histogram_quantile(0.5,") {
@@ -206,13 +222,28 @@ fn answer(e: Exporter, q: &str) -> Series {
 
 /// The minute-by-minute start rate of a load test from `--from`: a ramp, ten noisy minutes,
 /// twenty steady ones at 125/s, then the ramp down. Split 80/20 over two namespaces.
+/// An `operation` value given as a gRPC method path.
+const START_PATH: &str = "/temporal.api.workflowservice.v1.WorkflowService/StartWorkflowExecution";
+
+/// The stand-in scrapes every 60 s: a rate over less than two minutes has no data, nor has
+/// anything before 2026.
 fn range(params: &BTreeMap<String, String>) -> serde_json::Value {
-    assert!(
-        params["query"].contains("operation=~"),
-        "{}",
-        params["query"]
-    );
+    let q = &params["query"];
+    assert!(q.contains("operation=~\"(.*/)?("), "{q}");
+    let window = q
+        .rsplit('[')
+        .next()
+        .and_then(|w| w.split(']').next())
+        .unwrap();
+    let secs: u64 = match window.split_at(window.len() - 1) {
+        (n, "m") => n.parse::<u64>().unwrap() * 60,
+        (n, "s") => n.parse().unwrap(),
+        _ => panic!("{q}"),
+    };
     let start: f64 = params["start"].parse().unwrap();
+    if secs < 120 || start < 1_767_225_600.0 {
+        return serde_json::json!({ "resultType": "matrix", "result": [] });
+    }
     let end: f64 = params["end"].parse().unwrap();
     let step: f64 = params["step"].parse().unwrap();
     let rate = |minute: usize| match minute {
@@ -223,7 +254,7 @@ fn range(params: &BTreeMap<String, String>) -> serde_json::Value {
     };
     let n = ((end - start) / step).round() as usize;
     let result: Vec<serde_json::Value> = [
-        ("orders-prod", "StartWorkflowExecution", 0.8),
+        ("orders-prod", START_PATH, 0.8),
         ("payments", "ExecuteMultiOperation", 0.2),
     ]
     .iter()
@@ -386,9 +417,15 @@ fn scan_suggests_the_steadiest_window_near_the_peak() {
         to: "2026-10-01T22:40:00Z".into(),
         window: "15m".into(),
         step: "1m".into(),
+        rate_window: None,
         rename: vec!["orders-prod=orders".into()],
     })
     .unwrap();
+    // a 1m rate would have no data at 60 s scrapes: four intervals do
+    assert!(
+        report.starts_with("rates over 4m (samples every 60s)"),
+        "{report}"
+    );
     assert!(
         report.contains("orders/Start") && !report.contains("orders-prod"),
         "{report}"
@@ -402,4 +439,47 @@ fn scan_suggests_the_steadiest_window_near_the_peak() {
         best.contains("--end 2026-10-01T22:14:00Z") && best.contains("mean 125.0/s"),
         "{report}"
     );
+}
+
+fn scan_args(from: &str, to: &str, rate_window: Option<&str>) -> ScanArgs {
+    ScanArgs {
+        conn: Conn {
+            url: prometheus(Exporter::Tally),
+            headers: vec![],
+            user: None,
+            ca_file: None,
+            insecure: false,
+            timeout_s: 10.0,
+        },
+        from: from.into(),
+        to: to.into(),
+        window: "15m".into(),
+        step: "1m".into(),
+        rate_window: rate_window.map(String::from),
+        rename: vec![],
+    }
+}
+
+#[test]
+fn scan_takes_the_rate_window_it_is_given() {
+    let a = scan_args("2026-10-01T21:40Z", "2026-10-01T22:40Z", Some("5m"));
+    let report = scan(&a).unwrap();
+    assert!(report.starts_with("rates over 5m"), "{report}");
+    // shorter than the samples allow: nothing to show
+    let a = scan_args("2026-10-01T21:40Z", "2026-10-01T22:40Z", Some("1m"));
+    assert!(scan(&a).is_err());
+}
+
+#[test]
+fn scan_says_what_there_is_when_the_range_is_empty() {
+    let a = scan_args("2025-10-01T21:40Z", "2025-10-01T22:40Z", None);
+    let e = scan(&a).unwrap_err().to_string();
+    for part in [
+        "between 2025-10-01T21:40:00Z and 2025-10-01T22:40:00Z",
+        "UTC",
+        "service_name frontend, history, matching",
+        "StartWorkflowExecution",
+    ] {
+        assert!(e.contains(part), "{part}: {e}");
+    }
 }
