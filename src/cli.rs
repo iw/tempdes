@@ -249,6 +249,109 @@ enum MetricsCmd {
     Template,
     /// Parse an observations / Prometheus file and show what the simulator will use.
     Show { file: PathBuf },
+    /// Run those queries against a Prometheus HTTP API and write an observations file for the
+    /// window ending at `--end`.
+    #[cfg(feature = "fetch")]
+    Fetch(FetchArgs),
+    /// Print the rate of workflow-starting calls, minute by minute, from a Prometheus HTTP API,
+    /// and suggest steady windows for `fetch`.
+    #[cfg(feature = "fetch")]
+    Scan(ScanArgs),
+}
+
+/// Reaching a Prometheus HTTP API.
+#[cfg(feature = "fetch")]
+#[derive(clap::Args)]
+struct PromArgs {
+    /// Prometheus base URL, or a Grafana data source proxy URL. A bearer token is read from
+    /// PROMETHEUS_BEARER_TOKEN.
+    #[arg(long)]
+    url: String,
+    /// Extra request header (repeatable), e.g. `X-Scope-OrgID: tenant`.
+    #[arg(long = "header", value_name = "NAME: VALUE")]
+    headers: Vec<String>,
+    /// Basic auth user; the password is read from PROMETHEUS_PASSWORD.
+    #[arg(long)]
+    user: Option<String>,
+    /// Trust these CA certificates (PEM) instead of the system's.
+    #[arg(long)]
+    ca_file: Option<PathBuf>,
+    /// Skip TLS certificate verification.
+    #[arg(long)]
+    insecure: bool,
+    /// Seconds allowed per request.
+    #[arg(long, default_value_t = 60.0)]
+    timeout: f64,
+    /// Rewrite a label value, such as a namespace, before anything is written or printed
+    /// (repeatable).
+    #[arg(long, value_name = "OLD=NEW")]
+    rename: Vec<String>,
+}
+
+#[cfg(feature = "fetch")]
+#[derive(clap::Args)]
+struct FetchArgs {
+    #[command(flatten)]
+    prom: PromArgs,
+    /// End of the window: RFC 3339 (`2026-10-01T22:17:00Z`), `YYYY-MM-DD HH:MM` (UTC) or Unix
+    /// seconds.
+    #[arg(long)]
+    end: String,
+    /// Window length.
+    #[arg(long, default_value = "15m")]
+    window: String,
+    /// The observations file to write.
+    #[arg(short, long, default_value = "observed.yaml")]
+    output: PathBuf,
+    /// Also write the window ending here, such as the run's start.
+    #[arg(long)]
+    baseline_end: Option<String>,
+    /// File for the window ending at --baseline-end [default: baseline.yaml beside --output].
+    #[arg(long)]
+    baseline_out: Option<PathBuf>,
+    /// The file's description [default: the window].
+    #[arg(long)]
+    description: Option<String>,
+    /// Label matchers for Temporal's containers in cAdvisor's CPU metrics.
+    #[arg(long, default_value = crate::metrics::cmd::CPU_SELECTOR)]
+    cpu_selector: String,
+    /// The database's busy fraction, 0..1, over the window (e.g. from CloudWatch).
+    #[arg(long, conflicts_with = "db_utilization_query")]
+    db_utilization: Option<f64>,
+    /// PromQL for the database's busy fraction (0..1, or a percentage).
+    #[arg(long)]
+    db_utilization_query: Option<String>,
+}
+
+#[cfg(feature = "fetch")]
+#[derive(clap::Args)]
+struct ScanArgs {
+    #[command(flatten)]
+    prom: PromArgs,
+    /// Start of the range (times as for `fetch --end`).
+    #[arg(long)]
+    from: String,
+    /// End of the range.
+    #[arg(long)]
+    to: String,
+    /// Window length to suggest.
+    #[arg(long, default_value = "15m")]
+    window: String,
+    /// Resolution.
+    #[arg(long, default_value = "1m")]
+    step: String,
+}
+
+#[cfg(feature = "fetch")]
+fn conn(p: &PromArgs) -> crate::metrics::fetch::Conn {
+    crate::metrics::fetch::Conn {
+        url: p.url.clone(),
+        headers: p.headers.clone(),
+        user: p.user.clone(),
+        ca_file: p.ca_file.clone(),
+        insecure: p.insecure,
+        timeout_s: p.timeout,
+    }
 }
 
 pub fn parse_overrides(c: &CommonArgs) -> anyhow::Result<Overrides> {
@@ -339,11 +442,45 @@ pub fn main() -> anyhow::Result<ExitCode> {
         }
         Cmd::Profile { cmd } => cmd_profile(cmd),
         Cmd::Dc { cmd } => crate::dccmd::run(cmd_dc(cmd)),
-        Cmd::Metrics { cmd } => crate::metrics::cmd::run(match cmd {
-            MetricsCmd::Queries { window } => crate::metrics::cmd::Cmd::Queries { window },
-            MetricsCmd::Template => crate::metrics::cmd::Cmd::Template,
-            MetricsCmd::Show { file } => crate::metrics::cmd::Cmd::Show { file },
-        }),
+        Cmd::Metrics { cmd } => match cmd {
+            MetricsCmd::Queries { window } => {
+                crate::metrics::cmd::run(crate::metrics::cmd::Cmd::Queries { window })
+            }
+            MetricsCmd::Template => crate::metrics::cmd::run(crate::metrics::cmd::Cmd::Template),
+            MetricsCmd::Show { file } => {
+                crate::metrics::cmd::run(crate::metrics::cmd::Cmd::Show { file })
+            }
+            #[cfg(feature = "fetch")]
+            MetricsCmd::Fetch(a) => {
+                crate::metrics::fetch::fetch(&crate::metrics::fetch::FetchArgs {
+                    conn: conn(&a.prom),
+                    end: a.end,
+                    window: a.window,
+                    output: a.output,
+                    baseline_end: a.baseline_end,
+                    baseline_out: a.baseline_out,
+                    description: a.description,
+                    rename: a.prom.rename,
+                    cpu_selector: a.cpu_selector,
+                    db_utilization: a.db_utilization,
+                    db_utilization_query: a.db_utilization_query,
+                })?;
+                Ok(ExitCode::SUCCESS)
+            }
+            #[cfg(feature = "fetch")]
+            MetricsCmd::Scan(a) => {
+                let report = crate::metrics::fetch::scan(&crate::metrics::fetch::ScanArgs {
+                    conn: conn(&a.prom),
+                    from: a.from,
+                    to: a.to,
+                    window: a.window,
+                    step: a.step,
+                    rename: a.prom.rename,
+                })?;
+                print!("{report}");
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         #[cfg(feature = "ui")]
         Cmd::Ui(a) => cmd_ui(a),
         Cmd::Workload {

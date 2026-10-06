@@ -17,10 +17,16 @@ ignore = []
 allow = [
     "Apache-2.0",
     "BSD-3-Clause",
+    # permissive, like MIT: rustls's certificate verification and ring (`fetch` feature)
+    "ISC",
     "MIT",
     "Unicode-3.0",
 ]
 confidence-threshold = 0.93
+# rustls-platform-verifier's root certificates on wasm32 only, which tempdes doesn't build for
+exceptions = [
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
+]
 
 [bans]
 multiple-versions = "warn"
