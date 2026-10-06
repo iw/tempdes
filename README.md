@@ -336,6 +336,10 @@ tempdes metrics fetch --url https://prometheus.example --end 2026-10-01T22:17Z -
 
 These commands work as follows:
 
+* **Rate window.** `scan` computes each rate over four scrape intervals, measured from the
+  data, as Grafana's `$__rate_interval` does, or over `--rate-window`. A 1-minute rate has no
+  data when Prometheus scrapes once a minute. If the range has no workflow-starting calls,
+  `scan` lists the `service_name` and `operation` values it finds instead.
 * **Queries.** `fetch` runs the queries as instant queries at the end of the window. It then
   writes an observations file that is readable only by you.
 * **Metric names.** It finds the names the cluster's exporter uses. Tally gives

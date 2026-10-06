@@ -13,9 +13,10 @@ use anyhow::{Context, anyhow, bail};
 
 use super::cmd::{Kind, SPECS, Spec};
 
-/// The frontend calls that start (or may start) workflows.
-const START_CALLS: &str = "StartWorkflowExecution|SignalWithStartWorkflowExecution|\
-                           ExecuteMultiOperation|SignalWorkflowExecution";
+/// The frontend calls that start (or may start) workflows, as `operation` values: the call's
+/// name, or a path ending in it.
+const START_CALLS: &str = "(.*/)?(StartWorkflowExecution|SignalWithStartWorkflowExecution|\
+                           ExecuteMultiOperation|SignalWorkflowExecution)";
 
 /// Temporal's names for a metric under the tally (default) and OpenTelemetry Prometheus
 /// exporters, with or without a `temporal_` prefix.
@@ -77,6 +78,8 @@ pub struct ScanArgs {
     pub window: String,
     /// resolution
     pub step: String,
+    /// `rate` window; four scrape intervals (or the step, if longer) when not given
+    pub rate_window: Option<String>,
     pub rename: Vec<String>,
 }
 
@@ -643,13 +646,45 @@ pub fn scan(a: &ScanArgs) -> anyhow::Result<String> {
     let metric = Names::new(&prom, to)
         .resolve(spec)?
         .ok_or_else(|| anyhow!("no service_requests metric in this Prometheus"))?;
+    // `rate` needs two samples in its window: four scrape intervals, or the step if longer,
+    // like Grafana's `$__rate_interval`
+    let mid = (from + to) / 2.0;
+    let scrape = scrape_interval(&prom, &metric, spec.filter, mid)?;
+    let rate_window = match &a.rate_window {
+        Some(w) => prom_duration(window_secs(w)?),
+        None => prom_duration(ssecs.max((4.0 * scrape).ceil() as u64)),
+    };
     let q = format!(
-        "sum by (namespace, operation) (rate({metric}{{{}, operation=~\"{START_CALLS}\"}}[{}]))",
-        spec.filter, a.step
+        "sum by (namespace, operation) (rate({metric}{{{}, operation=~\"{START_CALLS}\"}}[{rate_window}]))",
+        spec.filter
     );
     let series = prom.query_range(&q, from, to, ssecs)?;
     if series.is_empty() {
-        bail!("no workflow-starting calls between --from and --to");
+        // say what there is instead, halfway through the range
+        let seen = |by: &str, filter: &str| -> anyhow::Result<String> {
+            let q = format!("count by ({by}) ({metric}{{{filter}}})");
+            let mut v: Vec<String> = prom
+                .query(&q, mid)?
+                .into_iter()
+                .filter_map(|(l, _)| l.get(by).cloned())
+                .collect();
+            v.sort();
+            v.truncate(12);
+            Ok(if v.is_empty() {
+                "none".into()
+            } else {
+                v.join(", ")
+            })
+        };
+        let services = seen("service_name", r#"service_name!="""#)?;
+        let operations = seen("operation", spec.filter)?;
+        bail!(
+            "no workflow-starting calls between {} and {} (times without a zone are UTC). At {}, \
+             {metric} has service_name {services}; the frontend's operations are {operations}",
+            iso(from),
+            iso(to),
+            iso(mid)
+        );
     }
     let mut cols: Vec<(String, BTreeMap<i64, f64>)> = series
         .into_iter()
@@ -659,12 +694,14 @@ pub fn scan(a: &ScanArgs) -> anyhow::Result<String> {
                 .iter()
                 .find(|(old, _)| *old == ns)
                 .map_or(ns, |(_, new)| new.clone());
-            let op = match l.get("operation").map(String::as_str) {
-                Some("StartWorkflowExecution") => "Start",
-                Some("SignalWorkflowExecution") => "Signal",
-                Some("SignalWithStartWorkflowExecution") => "SignalWithStart",
-                Some(op) => op,
-                None => "",
+            let op = l
+                .get("operation")
+                .map_or("", |o| o.rsplit('/').next().unwrap_or(o));
+            let op = match op {
+                "StartWorkflowExecution" => "Start",
+                "SignalWorkflowExecution" => "Signal",
+                "SignalWithStartWorkflowExecution" => "SignalWithStart",
+                op => op,
             };
             let vals = vals
                 .into_iter()
@@ -693,7 +730,10 @@ pub fn scan(a: &ScanArgs) -> anyhow::Result<String> {
         .max()
         .unwrap_or(0)
         .clamp(8, 40);
-    let mut out = format!("{:17} {:>8}", "time (UTC)", "all/s");
+    let mut out = format!(
+        "rates over {rate_window} (samples every {scrape:.0}s), by namespace and call\n\n{:17} {:>8}",
+        "time (UTC)", "all/s"
+    );
     for c in shown {
         let _ = write!(out, "  {:>width$}", truncate(&c.0, width));
     }
@@ -732,6 +772,23 @@ pub fn scan(a: &ScanArgs) -> anyhow::Result<String> {
         );
     }
     Ok(out)
+}
+
+/// Seconds between scrapes of `metric`'s series, from the most sampled one over the 10 minutes
+/// before `t`; 60 when there are too few samples to tell.
+fn scrape_interval(prom: &Prometheus, metric: &str, filter: &str, t: f64) -> anyhow::Result<f64> {
+    let q = format!("max(count_over_time({metric}{{{filter}}}[10m]))");
+    let n = prom.query(&q, t)?.first().map_or(0.0, |s| s.1);
+    Ok(if n >= 2.0 { 600.0 / n } else { 60.0 })
+}
+
+/// Seconds as a Prometheus duration: `4m`, `90s`.
+fn prom_duration(secs: u64) -> String {
+    if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -935,6 +992,12 @@ mod tests {
         assert_eq!(num(0.0012), "0.0012");
         assert_eq!(base64(b"user:pa ss"), "dXNlcjpwYSBzcw==");
         assert_eq!(base64(b"ab"), "YWI=");
+    }
+
+    #[test]
+    fn durations_print_as_prometheus_reads_them() {
+        assert_eq!(prom_duration(240), "4m");
+        assert_eq!(prom_duration(90), "90s");
     }
 
     #[test]

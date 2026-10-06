@@ -14,7 +14,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     and writes an observations file. With `--baseline-end` it also writes a second file for the
     window before the run.
   - **`scan`:** prints the rate of workflow-starting calls, minute by minute, and suggests the
-    steadiest windows.
+    steadiest windows. Each rate spans four scrape intervals, measured from the data, or the
+    window `--rate-window` gives, so sparse scrapes still give rates. When the range has no
+    such calls, it lists the `service_name` and `operation` values there are.
   - **Metric names:** whichever names the exporter uses (tally or OpenTelemetry, with or without
     a `temporal_` prefix) are recognised. Histogram bounds in seconds or milliseconds are both
     written as milliseconds.
