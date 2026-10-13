@@ -20,10 +20,13 @@ use super::trace::{
 pub struct Options {
     /// namespace of the imported workflow types
     pub namespace: String,
-    /// start rate of each top-level workflow type; `None` estimates it from the start times
+    /// start rate of each top-level workflow type; `None` takes it from `counted`, else
+    /// estimates it from the start times
     pub rate: Option<f64>,
     /// paths followed by at least this share of a type's executions become types of their own
     pub min_path_share: f64,
+    /// each type's executions as `workload fetch` counted them, by type name
+    pub counted: BTreeMap<String, Counted>,
 }
 
 impl Default for Options {
@@ -32,8 +35,19 @@ impl Default for Options {
             namespace: "default".into(),
             rate: None,
             min_path_share: 0.05,
+            counted: BTreeMap::new(),
         }
     }
+}
+
+/// A type's executions started in the windows `workload fetch` listed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Counted {
+    pub started: u64,
+    /// of them, started by another workflow
+    pub children: u64,
+    /// the windows' total length
+    pub window_s: f64,
 }
 
 /// An import's result: the `workflows:` YAML and a readable summary.
@@ -285,9 +299,26 @@ fn workflow_type(
 
     // start rate
     let top: Vec<&&Trace> = runs.iter().filter(|t| !t.is_child).collect();
-    let (rate, rate_note) = match opts.rate {
-        Some(r) => (r, format!("{} (--rate)", fmt_rate(r))),
-        None if top.len() >= 3 && start_span_s(&top) >= 1.0 => {
+    // the executions `workload fetch` counted that no other workflow started
+    let counted = opts
+        .counted
+        .get(name)
+        .map(|c| (c.started - c.children.min(c.started), c.window_s))
+        .filter(|&(own, window_s)| own > 0 && window_s > 0.0);
+    let (rate, rate_note) = match (opts.rate, counted) {
+        (Some(r), _) => (r, format!("{} (--rate)", fmt_rate(r))),
+        (None, Some((own, window_s))) => {
+            let r = own as f64 / window_s;
+            (
+                r,
+                format!(
+                    "{} from the {own} starts `workload fetch` counted over {}",
+                    fmt_rate(r),
+                    fmt_us(window_s * 1e6)
+                ),
+            )
+        }
+        (None, None) if top.len() >= 3 && start_span_s(&top) >= 1.0 => {
             let span_s = start_span_s(&top);
             let r = (top.len() - 1) as f64 / span_s;
             (
@@ -300,7 +331,7 @@ fn workflow_type(
                 ),
             )
         }
-        None => (
+        (None, None) => (
             1.0,
             "1/s placeholder (too few histories to estimate it): set --rate".into(),
         ),

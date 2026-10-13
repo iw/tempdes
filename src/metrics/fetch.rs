@@ -821,7 +821,7 @@ fn steady_windows(grid: &[i64], total: &[f64], n: usize) -> Vec<(i64, f64, f64)>
 // --- times ------------------------------------------------------------------------------------------
 
 /// A Prometheus duration (`15m`, `1h30m`) in seconds.
-fn window_secs(s: &str) -> anyhow::Result<u64> {
+pub fn window_secs(s: &str) -> anyhow::Result<u64> {
     let bad = || anyhow!("not a Prometheus duration: {s:?} (use e.g. 15m)");
     let mut total = 0u64;
     let mut digits = String::new();

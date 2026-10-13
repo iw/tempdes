@@ -4,6 +4,8 @@ pub mod calibrate;
 pub mod cli;
 pub mod config;
 pub mod dccmd;
+#[cfg(feature = "fetch")]
+pub mod envconfig;
 pub mod histories;
 pub mod metrics;
 pub mod model;
