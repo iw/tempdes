@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use tempdes::config::dynamic::{Constraints, DcValue};
 use tempdes::config::scenario::Scenario;
 use tempdes::model::build;
 use tempdes::report::prom::{self, Reading};
@@ -22,11 +23,34 @@ fn short() -> Overrides {
 
 /// Run `sc` for `seconds` of simulated time and scrape it then.
 fn scrape_at(sc: &Scenario, seconds: u64) -> String {
-    let p = run::prepare(sc, &short(), None).expect("parameters resolve");
+    scrapes(sc, &short(), &[seconds]).remove(0)
+}
+
+/// Run `sc` with `ov`, scraping it at each of `seconds` of simulated time.
+fn scrapes(sc: &Scenario, ov: &Overrides, seconds: &[u64]) -> Vec<String> {
+    let p = run::prepare(sc, ov, None).expect("parameters resolve");
     let (ctx, mut ex) = build::build(p);
     let _rates = build::start(&ctx, &mut ex);
-    ex.run_until(seconds * 1_000_000);
-    prom::render_as(&ctx, Reading::Scrape)
+    seconds
+        .iter()
+        .map(|s| {
+            ex.run_until(s * 1_000_000);
+            prom::render_as(&ctx, Reading::Scrape)
+        })
+        .collect()
+}
+
+/// The increase per second of the samples of `metric` matching every one of `labels`,
+/// between two scrapes `seconds` apart.
+fn rate(before: &str, after: &str, seconds: f64, metric: &str, labels: &[&str]) -> f64 {
+    let total = |text: &str| -> f64 {
+        samples(text, metric)
+            .iter()
+            .filter(|(l, _)| labels.iter().all(|want| l.contains(want)))
+            .map(|(_, v)| v)
+            .sum()
+    };
+    (total(after) - total(before)) / seconds
 }
 
 /// `(labels, value)` of every sample of `metric`.
@@ -75,6 +99,23 @@ fn a_scrape_reads_a_run_in_progress() {
     assert!(polling("workflow_task") + polling("workflow_sticky_task") <= 60.0);
     assert!(polling("workflow_task") > 0.0);
     assert!(polling("activity_task") > 0.0);
+
+    // The frontend's requests carry their namespace, as Temporal's do.
+    let starts = samples(&text, "service_requests");
+    assert!(
+        starts
+            .iter()
+            .any(|(l, v)| l.contains("service_name=\"frontend\"")
+                && l.contains("operation=\"StartWorkflowExecution\"")
+                && l.contains("namespace=\"orders\"")
+                && *v > 0.0)
+    );
+    assert!(
+        starts
+            .iter()
+            .filter(|(l, _)| l.contains("service_name=\"frontend\""))
+            .all(|(l, _)| l.contains("namespace="))
+    );
 
     let succeeded = samples(&text, "temporal_workflow_task_queue_poll_succeed");
     assert!(
@@ -146,4 +187,90 @@ fn a_finished_run_still_reads_its_window() {
     assert!(text.contains("window_seconds=20"));
     assert_eq!(text, prom::render_as(&out.ctx, Reading::Window));
     assert!(!samples(&text, "temporal_worker_task_slots_available").is_empty());
+}
+
+#[test]
+fn a_partition_dispatch_limit_holds_without_stalling() {
+    // Four partitions at 25 tasks/s each, far below the Workflow Tasks baseline.yaml adds.
+    let ov = Overrides {
+        dc: vec![(
+            "admin.matchingNamespaceTaskqueueToPartitionDispatchRate".into(),
+            DcValue::Float(25.0),
+            Constraints::default(),
+        )],
+        warmup_s: Some(8.0),
+        duration_s: Some(120.0),
+        ..Default::default()
+    };
+    let s = scrapes(&baseline(), &ov, &[68, 128]);
+    let queue = ["taskqueue=\"orders\"", "task_type=\"Workflow\""];
+    let total = rate(&s[0], &s[1], 60.0, "poll_success", &queue);
+    assert!((90.0..=110.0).contains(&total), "{total} tasks/s");
+    // Every partition keeps dispatching at its own limit: a refused dispatch is retried
+    // without putting the limiter in debt.
+    for partition in 0..4 {
+        let label = format!("partition=\"{partition}\"");
+        let mut labels = queue.to_vec();
+        labels.push(&label);
+        let each = rate(&s[0], &s[1], 60.0, "poll_success", &labels);
+        assert!(
+            (20.0..=30.0).contains(&each),
+            "partition {partition}: {each} tasks/s"
+        );
+    }
+    let backlog: f64 = samples(&s[1], "approximate_backlog_count")
+        .iter()
+        .filter(|(l, _)| queue.iter().all(|q| l.contains(q)))
+        .map(|(_, v)| v)
+        .sum();
+    assert!(backlog > 1_000.0, "{backlog}");
+}
+
+const SIGNALLED: &str = r#"
+name: signalled
+seed: 3
+warmup: 8s
+duration: 80s
+cluster:
+  num_history_shards: 64
+  replicas: { frontend: 1, history: 1, matching: 1, worker: 1 }
+  persistence: { store: postgresql, capacity: 80 }
+namespaces:
+  - name: orders
+workers:
+  - { name: order-workers, namespace: orders, task_queue: orders, processes: 2 }
+workflows:
+  - type: OrderWorkflow
+    namespace: orders
+    task_queue: orders
+    start_rate: 20/s
+    steps:
+      - activity: { count: 1, duration: { p50: 30ms, p99: 250ms } }
+      - timer: 5s
+load:
+  signals: [ { workflow_type: OrderWorkflow, rate: 0/s } ]
+events:
+  - { at: 40s, signal_rate: { workflow_type: OrderWorkflow, rate: 50/s }, label: batch job }
+"#;
+
+#[test]
+fn a_signal_rate_event_changes_the_rate() {
+    let sc = Scenario::parse_str(SIGNALLED).expect("scenario");
+    let ov = Overrides::default();
+    let s = scrapes(&sc, &ov, &[20, 38, 58, 78]);
+    let signals = [
+        "operation=\"SignalWorkflowExecution\"",
+        "namespace=\"orders\"",
+    ];
+    let before = rate(&s[0], &s[1], 18.0, "service_requests", &signals);
+    let after = rate(&s[2], &s[3], 20.0, "service_requests", &signals);
+    assert_eq!(before, 0.0, "a load at 0/s sends nothing");
+    assert!((40.0..=60.0).contains(&after), "{after} signals/s");
+
+    // An event for a type no signal load sends to is refused.
+    let bad = SIGNALLED.replace(
+        "signal_rate: { workflow_type: OrderWorkflow",
+        "signal_rate: { workflow_type: OrderWorkflow2",
+    );
+    assert!(run::prepare(&Scenario::parse_str(&bad).expect("scenario"), &ov, None).is_err());
 }

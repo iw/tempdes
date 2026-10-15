@@ -624,6 +624,8 @@ pub struct Partition {
     pub fwd_limiter: TokenBucket,
     pub last_poll: Time,
     pub dispatch_limiter: Option<TokenBucket>,
+    /// a dispatch the limiter refused is waiting to be tried again
+    pub dispatch_retry: bool,
     pub acked_since_delete: u32,
     pub last_delete: Time,
     pub range_left: u32,

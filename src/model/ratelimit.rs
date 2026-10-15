@@ -91,6 +91,19 @@ impl TokenBucket {
         }
     }
 
+    /// How long until `allow()` can take a token, without taking one.
+    pub fn delay(&mut self) -> Time {
+        if self.rate <= 0.0 {
+            return 0;
+        }
+        self.refill();
+        if self.tokens >= 1.0 {
+            0
+        } else {
+            ((1.0 - self.tokens) / self.rate * 1e6).ceil() as Time
+        }
+    }
+
     /// `Reserve()` without waiting: always takes the token (may go negative).
     pub fn reserve(&mut self) {
         if self.rate <= 0.0 {

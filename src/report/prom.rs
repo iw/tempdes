@@ -142,19 +142,23 @@ pub fn render_as(ctx: &Ctx, reading: Reading) -> String {
     for (id, pod) in pods.iter().enumerate() {
         let inst = pod.addr.clone();
         let svc = pod.svc.as_str().to_string();
-        let ops: Vec<(String, crate::model::metrics::OpStats)> = match pod.svc {
+        // (operation, namespace, stats): the frontend's requests carry their namespace
+        let ops: Vec<(String, Option<String>, crate::model::metrics::OpStats)> = match pod.svc {
             Service::Frontend => {
                 // a history long poll is a GetWorkflowExecutionHistory call in Temporal's metrics
-                let mut by_op: std::collections::BTreeMap<&str, crate::model::metrics::OpStats> =
-                    std::collections::BTreeMap::new();
-                if let Some(v) = m.fe.get(id) {
-                    for (a, o) in Api::ALL.iter().zip(v.iter()) {
-                        by_op.entry(a.metric_operation()).or_default().merge(o);
+                let mut by_op: BTreeMap<(&str, usize), crate::model::metrics::OpStats> =
+                    BTreeMap::new();
+                for ((pod_id, ns, api), o) in &m.fe_by_ns {
+                    if *pod_id == id {
+                        by_op
+                            .entry((api.metric_operation(), *ns))
+                            .or_default()
+                            .merge(o);
                     }
                 }
                 by_op
                     .into_iter()
-                    .map(|(op, o)| (op.to_string(), o))
+                    .map(|((op, ns), o)| (op.to_string(), Some(p.namespaces[ns].name.clone()), o))
                     .collect()
             }
             Service::History => m
@@ -164,7 +168,7 @@ pub fn render_as(ctx: &Ctx, reading: Reading) -> String {
                     HistApi::ALL
                         .iter()
                         .zip(v.iter())
-                        .map(|(a, o)| (a.as_str().to_string(), o.clone()))
+                        .map(|(a, o)| (a.as_str().to_string(), None, o.clone()))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -175,21 +179,21 @@ pub fn render_as(ctx: &Ctx, reading: Reading) -> String {
                     MatchApi::ALL
                         .iter()
                         .zip(v.iter())
-                        .map(|(a, o)| (a.as_str().to_string(), o.clone()))
+                        .map(|(a, o)| (a.as_str().to_string(), None, o.clone()))
                         .collect()
                 })
                 .unwrap_or_default(),
             Service::Worker => Vec::new(),
         };
-        for (op, o) in ops {
+        for (op, ns, o) in ops {
             if o.count == 0 {
                 continue;
             }
-            let l = [
-                ("service_name", svc.clone()),
-                ("operation", op.clone()),
-                ("instance", inst.clone()),
-            ];
+            let mut l = vec![("service_name", svc.clone()), ("operation", op.clone())];
+            if let Some(ns) = ns {
+                l.push(("namespace", ns));
+            }
+            l.push(("instance", inst.clone()));
             w.counter("service_requests", &l, o.count as f64);
             w.timer("service_latency", &l, &o.latency);
             for (e, n) in &o.errors {

@@ -170,6 +170,9 @@ pub struct Metrics {
     pub shard_moves: u64,
     pub shard_unavailable_waits: Histogram,
     pub history_long_polls: u64,
+    /// frontend requests per (pod, namespace, API), for the `namespace` label Temporal puts on
+    /// the frontend's `service_*` metrics
+    pub fe_by_ns: BTreeMap<(PodId, usize, Api), OpStats>,
     /// frontend requests per (pod, namespace, visibility?) for namespace limiter headroom
     pub fe_ns_requests: BTreeMap<(PodId, usize, bool), u64>,
     pub samples: Vec<Sample>,

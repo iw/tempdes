@@ -374,6 +374,7 @@ pub fn build(p: Params) -> (Ctx, Executor) {
         fwd_limiter: TokenBucket::new(fwd_rate, fwd_rate.max(1.0)),
         last_poll: 0,
         dispatch_limiter: dispatch.map(|r| TokenBucket::new(r, r.max(1.0))),
+        dispatch_retry: false,
         acked_since_delete: 0,
         last_delete: 0,
         range_left: 100_000,
@@ -595,6 +596,7 @@ pub fn start(ctx: &Ctx, ex: &mut Executor) -> Rc<RefCell<Rates>> {
     let system_client = misc_base + 4;
     let rates = Rc::new(RefCell::new(Rates {
         start: p.wf_types.iter().map(|t| t.start_rate).collect(),
+        signal: p.signals.iter().map(|s| s.rate).collect(),
         scale: 1.0,
     }));
 
@@ -652,6 +654,14 @@ async fn apply_event(ctx: &Ctx, i: usize, rates: &Rc<RefCell<Rates>>) {
         .push(format!("t={:.1}s {label}", now() as f64 / 1e6));
     if let Some((t, r)) = e.start_rate {
         rates.borrow_mut().start[t] = r;
+    }
+    if let Some((t, r)) = e.signal_rate {
+        let mut rates = rates.borrow_mut();
+        for (si, s) in ctx.p.signals.iter().enumerate() {
+            if s.wf_type == t {
+                rates.signal[si] = r;
+            }
+        }
     }
     for (k, v) in &e.dc {
         apply_dc(ctx, k, v);

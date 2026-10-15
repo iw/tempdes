@@ -772,6 +772,9 @@ pub struct EventSpec {
     pub dynamic_config: BTreeMap<String, DcValue>,
     #[serde(default)]
     pub start_rate: Option<StartRatePatch>,
+    /// The rate of the signal loads that send to `workflow_type`.
+    #[serde(default)]
+    pub signal_rate: Option<StartRatePatch>,
     #[serde(default)]
     pub label: Option<String>,
 }

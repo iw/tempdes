@@ -9,6 +9,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Timed signal rates.** An event's `signal_rate: { workflow_type, rate }` sets the rate of
+  the signal loads that send to that type, as `start_rate` does for starts. A signal load can
+  start at `0/s`, so signals can begin mid-run. An event for a type no signal load sends to is
+  refused.
+
+- **The frontend's metrics carry `namespace`.** `service_requests`, `service_latency`,
+  `service_errors_resource_exhausted` and `service_error_with_type` from the frontend are
+  written per namespace, as Temporal writes them, so a query for one namespace's polls or
+  signals finds them.
+
 - **The Workers' metrics in the Prometheus output.** `--prom` adds the Go SDK's metrics under
   its tally reporter's names, one series per worker process (`instance`):
   - `temporal_worker_task_slots_available` and `temporal_worker_task_slots_used`, by
@@ -270,6 +280,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hosts, are counted but never written.
 
 ### Fixed
+
+- **A partition dispatch limit never recovered from a refusal.** When the limiter refused a
+  dispatch, Matching took a token to time its retry (`reserve_delay`), and the retry took
+  another with `allow()`. Every refused attempt deepened the bucket's debt, so a partition with
+  `admin.matchingNamespaceTaskqueueToPartitionDispatchRate` set stopped dispatching for good:
+  with two partitions at 50/s, one dispatched nothing from the start and the other stopped
+  after 13 minutes. The retry now waits for a token without taking one (`TokenBucket::delay`),
+  and a partition keeps one retry pending at a time, as Matching's task reader waits on its
+  limiter. Both partitions now dispatch 50/s for as long as their backlog lasts.
 
 - **Update-with-start caches its new run.** As in Temporal, the run it creates goes into the
   host cache with its mutable state, so its first workflow task makes no `GetWorkflowExecution`
