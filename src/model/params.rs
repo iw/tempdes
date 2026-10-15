@@ -1316,7 +1316,8 @@ impl Params {
                 name: f.name.clone(),
                 ns: ns_idx(&f.namespace),
                 tq,
-                processes: f.processes.max(1),
+                // 0: the fleet is down, and nothing polls its task queue.
+                processes: f.processes,
                 wf_pollers: f.workflow_pollers.max(1),
                 act_pollers: f.activity_pollers,
                 wf_slots: f.workflow_slots.max(1),

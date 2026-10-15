@@ -1,5 +1,6 @@
 //! Generator for the embedded dynamic config registry (`data/dynamicconfig-<version>.json`).
 //! The `gen-dc-registry` binary (`src/bin/gen-dc-registry.rs`) is its command-line front end.
+//! Its Go lexing helpers are public, for other readers of Temporal's source.
 //!
 //! Temporal registers every dynamic config setting with a constructor call:
 //!
@@ -225,7 +226,8 @@ fn short(v: &Value) -> String {
     }
 }
 
-fn one_line(s: &str) -> String {
+/// `s` on one line, trimmed, with each run of whitespace (newlines included) a single space.
+pub fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -233,7 +235,7 @@ fn one_line(s: &str) -> String {
 
 /// Non-test Go files under `dir`. Test-only trees (`tests*`, `temporaltest*`) and hidden
 /// directories are skipped.
-fn collect_go_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+pub fn collect_go_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     let entries = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
@@ -259,7 +261,7 @@ fn collect_go_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// `path` relative to the checkout, with `/` separators.
-fn relative(root: &Path, path: &Path) -> String {
+pub fn relative(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy())
@@ -366,7 +368,7 @@ fn match_ctor(b: &[u8], at: usize) -> Option<Ctor> {
 }
 
 /// `func NewGlobalIntSetting(...)`: the text before `at` on its line starts with `func`.
-fn is_func_decl(src: &str, at: usize) -> bool {
+pub fn is_func_decl(src: &str, at: usize) -> bool {
     let line_start = src[..at].rfind('\n').map_or(0, |p| p + 1);
     src[line_start..at].trim_start().starts_with("func")
 }
@@ -411,11 +413,13 @@ fn setting(ctor: &Ctor, args: &[String], source: String) -> Option<SettingDef> {
 
 // --- Go lexing ------------------------------------------------------------------------------------
 
-fn is_space(c: u8) -> bool {
+/// Go's whitespace.
+pub fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
-fn is_ident(c: u8) -> bool {
+/// A byte that can be part of a Go identifier.
+pub fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80
 }
 
@@ -427,7 +431,7 @@ fn find(b: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
 }
 
 /// If a comment or a string / rune literal starts at `i`, the index just past it.
-fn skip_opaque(b: &[u8], i: usize) -> Option<usize> {
+pub fn skip_opaque(b: &[u8], i: usize) -> Option<usize> {
     match b[i] {
         b'/' => match b.get(i + 1) {
             Some(b'/') => Some(find(b, i + 2, b"\n").unwrap_or(b.len())),
@@ -464,7 +468,7 @@ fn quoted_end(b: &[u8], i: usize) -> Option<usize> {
 }
 
 /// Index of the bracket that closes the one opened at `open`, skipping literals and comments.
-fn closing(b: &[u8], open: usize) -> Option<usize> {
+pub fn closing(b: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = open;
     while i < b.len() {
@@ -489,7 +493,7 @@ fn closing(b: &[u8], open: usize) -> Option<usize> {
 
 /// Arguments of the call whose `(` ends just before `start`: split at top-level commas, with
 /// comments removed and whitespace trimmed. Empty arguments (a trailing comma) are dropped.
-fn split_args(src: &str, start: usize) -> Option<Vec<String>> {
+pub fn split_args(src: &str, start: usize) -> Option<Vec<String>> {
     let b = src.as_bytes();
     let mut args = Vec::new();
     let mut cur = String::new();
@@ -548,7 +552,7 @@ fn drop_comment(src: &str, cur: &mut String, seg: usize, at: usize, end: usize) 
 }
 
 /// The value of a Go string constant: literals (interpreted or raw) joined by `+`.
-fn string_const(expr: &str) -> Option<String> {
+pub fn string_const(expr: &str) -> Option<String> {
     let b = expr.as_bytes();
     let mut out = String::new();
     let mut i = 0;
