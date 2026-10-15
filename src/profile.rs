@@ -564,7 +564,7 @@ fn absolute(p: &Path) -> PathBuf {
 }
 
 /// Create `dir` (and missing parents), and make `dir` itself private to the user.
-fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(unix)]
     {
@@ -576,7 +576,7 @@ fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Write a file readable only by the user.
-fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);

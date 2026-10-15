@@ -9,6 +9,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`tempdes workload fetch`.** Fetches histories for `workload import` from a Temporal
+  frontend's HTTP API. It lists the executions started in a window, counts them by type, and
+  fetches up to `--limit` of each type (300 by default), spread over the window, page by page.
+  - **Connecting:** it uses the Temporal CLI's client profiles. It reads a profile from
+    `temporal.toml`, with the `TEMPORAL_*` environment variables over it, resolved as sdk-core
+    resolves them. The profile gives the address, namespace, API key, TLS settings (client
+    certificate, CA, server name and host verification) and `grpc_meta` headers. Requests go
+    to the frontend's `httpPort` (7243) on the profile's host, or to `--http-url`.
+  - **Privacy:** payloads, and failures' messages and stack traces, are dropped before
+    anything is written. The directory and its files are readable only by you.
+  - **Start rates:** `fetch.yaml` records each type's count, and `workload import` takes each
+    type's start rate from it rather than estimating it from a sample's start times.
+  - **Reruns:** a rerun into the same directory fetches only the histories still missing.
+
+  The `fetch` feature adds the `toml` crate, already in the default build through Topcoat.
+
 - **`history.cacheTTL`.** A cached workflow expires an hour after it was cached (the setting's
   default), however often it is read, as in Temporal's cache. The access that finds it expired
   is a cache miss and loads the mutable state again with `GetWorkflowExecution`. Runs shorter

@@ -18,9 +18,11 @@ default = ["ui", "fetch"]
 # `tempdes ui`: the live visualisation served by the Topcoat web framework. Disable it for a
 # lean, dependency-light CLI build (`--no-default-features`).
 ui = ["dep:topcoat", "dep:tokio", "dep:futures-util"]
-# `tempdes metrics fetch` / `scan`: read observations from a Prometheus HTTP API, over rustls
-# with the system's trusted certificates (no OpenSSL).
-fetch = ["dep:ureq", "dep:rustls"]
+# `tempdes metrics fetch` / `scan`: read observations from a Prometheus HTTP API; and
+# `tempdes workload fetch`: read histories from a Temporal frontend's HTTP API, connecting with
+# the Temporal CLI's `temporal.toml` profiles. Over rustls with the system's trusted
+# certificates (no OpenSSL).
+fetch = ["dep:ureq", "dep:rustls", "dep:toml"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -33,6 +35,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"], 
 futures-util = { version = "0.3", optional = true }
 ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "platform-verifier"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"], optional = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

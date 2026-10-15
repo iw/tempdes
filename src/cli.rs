@@ -55,12 +55,62 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum WorkloadCmd {
-    /// Infer `workflows:` entries from exported histories (`temporal workflow show --output
-    /// json`, or the Web UI's download): steps, durations, attempts, retry policies and
-    /// timeouts, with waits in the cluster left out, and payload sizes from the history sizes
-    /// the server recorded, with a commented worker fleet per task queue. Payloads are not
-    /// read.
+    /// Infer `workflows:` entries from exported histories (`workload fetch`, `temporal workflow
+    /// show --output json`, or the Web UI's download): steps, durations, attempts, retry
+    /// policies and timeouts, with waits in the cluster left out, and payload sizes from the
+    /// history sizes the server recorded, with a commented worker fleet per task queue.
+    /// Payloads are not read.
     Import(ImportArgs),
+    /// Fetch histories for `import` from a Temporal frontend's HTTP API: the executions started
+    /// in a window, counted by type, and up to `--limit` of each spread over it, without their
+    /// payloads. It connects as the Temporal CLI does, from a `temporal.toml` profile and
+    /// `TEMPORAL_*` environment variables.
+    #[cfg(feature = "fetch")]
+    Fetch(WorkloadFetchArgs),
+}
+
+#[cfg(feature = "fetch")]
+#[derive(Args)]
+struct WorkloadFetchArgs {
+    /// End of the window: RFC 3339 (`2026-10-01T22:17:00Z`), `YYYY-MM-DD HH:MM` (UTC) or Unix
+    /// seconds.
+    #[arg(long)]
+    end: String,
+    /// Window length: the executions started in it are listed.
+    #[arg(long, default_value = "15m")]
+    window: String,
+    /// Only this workflow type (repeatable).
+    #[arg(long = "type", value_name = "TYPE")]
+    types: Vec<String>,
+    /// A visibility filter ANDed with the window, e.g. `TaskQueue = 'orders'`.
+    #[arg(long)]
+    query: Option<String>,
+    /// Histories to fetch of each type, spread over the window.
+    #[arg(long, default_value_t = 300)]
+    limit: usize,
+    /// Directory for the histories, created readable only by you.
+    #[arg(short, long, default_value = "histories")]
+    output: PathBuf,
+    /// Profile in Temporal's client config file [default: TEMPORAL_PROFILE, else `default`].
+    #[arg(long, value_name = "NAME")]
+    temporal_profile: Option<String>,
+    /// Temporal's client config file [default: TEMPORAL_CONFIG_FILE, else
+    /// temporalio/temporal.toml in your config folder, where the Temporal CLI keeps it].
+    #[arg(long, value_name = "FILE")]
+    temporal_config: Option<PathBuf>,
+    /// Frontend address, `host:port` (overrides the profile and TEMPORAL_ADDRESS).
+    #[arg(long)]
+    address: Option<String>,
+    /// Namespace to read (overrides the profile and TEMPORAL_NAMESPACE).
+    #[arg(long, short = 'n')]
+    namespace: Option<String>,
+    /// The frontend's HTTP API [default: the address's host on port 7243, the frontend's
+    /// httpPort].
+    #[arg(long, value_name = "URL")]
+    http_url: Option<String>,
+    /// Seconds allowed per request.
+    #[arg(long, default_value_t = 60.0)]
+    timeout: f64,
 }
 
 #[derive(Args)]
@@ -72,7 +122,8 @@ struct ImportArgs {
     #[arg(long, default_value = "default")]
     namespace: String,
     /// Start rate of each imported workflow type (`100/s`), split across its paths. By default
-    /// it is estimated from the histories' start times.
+    /// it comes from the counts in a `workload fetch` directory, else it is estimated from the
+    /// histories' start times.
     #[arg(long, value_parser = parse_rate)]
     rate: Option<f64>,
     /// Paths (step sequences) that at least this share of a type's executions took become
@@ -487,10 +538,41 @@ pub fn main() -> anyhow::Result<ExitCode> {
         },
         #[cfg(feature = "ui")]
         Cmd::Ui(a) => cmd_ui(a),
-        Cmd::Workload {
-            cmd: WorkloadCmd::Import(a),
-        } => cmd_import(a),
+        Cmd::Workload { cmd } => match cmd {
+            WorkloadCmd::Import(a) => cmd_import(a),
+            #[cfg(feature = "fetch")]
+            WorkloadCmd::Fetch(a) => cmd_workload_fetch(a),
+        },
     }
+}
+
+#[cfg(feature = "fetch")]
+fn cmd_workload_fetch(a: WorkloadFetchArgs) -> anyhow::Result<ExitCode> {
+    let mut profile = crate::envconfig::load(&crate::envconfig::Choice {
+        file: a.temporal_config,
+        profile: a.temporal_profile,
+    })?;
+    if let Some(address) = a.address {
+        profile.profile.address = Some(address);
+        profile.origin.push_str(", with --address");
+    }
+    if let Some(ns) = a.namespace {
+        profile.profile.namespace = Some(ns);
+        profile.origin.push_str(", with --namespace");
+    }
+    let summary = crate::histories::fetch::fetch(&crate::histories::fetch::FetchArgs {
+        profile,
+        http_url: a.http_url,
+        end: a.end,
+        window: a.window,
+        types: a.types,
+        query: a.query,
+        limit: a.limit,
+        output: a.output,
+        timeout_s: a.timeout,
+    })?;
+    eprint!("{summary}");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_import(a: ImportArgs) -> anyhow::Result<ExitCode> {
@@ -502,6 +584,7 @@ fn cmd_import(a: ImportArgs) -> anyhow::Result<ExitCode> {
         namespace: a.namespace,
         rate: a.rate,
         min_path_share: a.min_path_share,
+        ..Default::default()
     };
     let program = crate::histories::import(&a.paths, &opts)?;
     eprint!("{}", program.summary);

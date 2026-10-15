@@ -82,8 +82,9 @@ The binary is `target/release/tempdes`. The simulator itself depends only on `se
 `serde-saphyr` (YAML), `serde_json`, `clap` and `anyhow`. Two default features add more:
 * `ui` (`tempdes ui`, the live view) adds the [Topcoat](https://github.com/tokio-rs/topcoat)
   web framework and tokio;
-* `fetch` (`tempdes metrics fetch` and `scan`) adds the `ureq` HTTP client over rustls. It
-  trusts the system's certificates, so it needs no OpenSSL.
+* `fetch` (`tempdes metrics fetch` and `scan`, and `tempdes workload fetch`) adds the `ureq`
+  HTTP client over rustls, and `toml` to read the Temporal CLI's profiles. It trusts the
+  system's certificates, so it needs no OpenSSL.
 
 `--no-default-features` builds the lean command-line tool. The simulation runs
 on a single thread per run. A 60-second simulation at 150 workflows/s takes one to two
@@ -126,8 +127,10 @@ tempdes metrics queries --window 15m     # PromQL to collect calibration inputs
 tempdes metrics template > observed.yaml
 tempdes metrics show examples/metrics/observed.yaml
 
-# workloads from exported workflow histories (steps, durations, attempts, retry policies)
-tempdes workload import histories/ --namespace orders --rate 150/s -o workflows.yaml
+# workloads from workflow histories (steps, durations, attempts, retry policies), fetched from
+# the cluster with a Temporal CLI profile, or exported
+tempdes workload fetch --temporal-profile prod --end 2026-10-01T22:17Z --window 15m -o histories
+tempdes workload import histories/ --namespace orders -o workflows.yaml
 ```
 
 `run` also writes `--json` (the full result), `--prom` (simulated metrics in Prometheus text
@@ -423,8 +426,16 @@ metrics is skipped, because the simulated workload is no longer the observed one
 
 ## Importing workflow histories
 
-Rather than writing a workflow's `steps` by hand, you can infer them from histories exported
-from your cluster, a few hundred executions of each workflow type:
+Rather than writing a workflow's `steps` by hand, you can infer them from your cluster's
+histories, a few hundred executions of each workflow type. `workload fetch` reads them from the
+frontend (see [Fetching histories](#fetching-histories)):
+
+```bash
+tempdes workload fetch --temporal-profile prod --end 2026-10-01T22:17Z --window 15m -o histories
+tempdes workload import histories/ --namespace orders -o workflows.yaml
+```
+
+Histories exported another way import too:
 
 ```bash
 temporal workflow show --workflow-id <id> --output json > histories/<id>.json   # or the Web UI's download
@@ -465,9 +476,10 @@ snake_case keys).
 * **Paths.** Executions of a type that took the same steps are pooled. A path taken by at least
   5% of them (`--min-path-share`) becomes a workflow type of its own (`OrderWorkflow~2`) with its
   share of the start rate; rarer paths are folded into the most common.
-* **Start rate.** `--rate` sets it; otherwise it is estimated from the start times, which is
-  right only if the export holds every execution in that time. Calibrating with observed
-  `service_requests` (`-o`) also sets it.
+* **Start rate.** `--rate` sets it. Otherwise it comes from the counts in a `workload fetch`
+  directory, or is estimated from the start times, which is right only if the export holds
+  every execution in that time. Calibrating with observed `service_requests` (`-o`) also sets
+  it.
 * **Payload sizes are estimated.** Servers record on each workflow task the size of the history
   before it (`historySizeBytes`). Less 128 bytes an event and 256 a signal, over the events
   that carry payloads, that gives each type's `payload_bytes`. The summary gives the range for
@@ -486,6 +498,42 @@ snake_case keys).
 Not modelled, and counted in the summary: updates, Nexus operations, search attribute upserts,
 markers other than local activities, and continue-as-new (each run is imported as its own
 execution). A child type whose histories weren't given is written as a stub with no steps.
+
+### Fetching histories
+
+`workload fetch` lists the executions started in the window and counts them by type. It then
+fetches up to `--limit` of each type (300 by default), spread over the window, page by page.
+The histories go into the directory one file per execution, with `fetch.yaml` holding the
+counts. `--type` (repeatable) keeps to some workflow types, and `--query` adds a visibility
+filter, such as `TaskQueue = 'orders'`.
+
+* **Connecting.** It connects as the Temporal CLI does, from a profile in Temporal's
+  `temporal.toml`, with the `TEMPORAL_*` environment variables over it:
+  * the profile is `--temporal-profile`, else `TEMPORAL_PROFILE`, else `default`;
+  * the file is `--temporal-config`, else `TEMPORAL_CONFIG_FILE`, else the CLI's own:
+    `~/.config/temporalio/temporal.toml` on Linux and
+    `~/Library/Application Support/temporalio/temporal.toml` on macOS;
+  * `--address` and `--namespace` override both.
+
+  The profile's address, namespace, API key, TLS settings (client certificate, CA, server name,
+  host verification) and `grpc_meta` headers are used. Its codec isn't, as payloads are never
+  decoded.
+* **The HTTP API.** Requests go to the frontend's HTTP API. It serves the same calls as gRPC on
+  the frontend's `httpPort`, 7243 by default, which the Helm chart's frontend Service exposes.
+  So the profile's host is reached on port 7243 unless `--http-url` says otherwise. From
+  outside the cluster, for example, run `kubectl port-forward svc/<release>-frontend 7243` and
+  pass `--http-url http://localhost:7243`.
+* **Start rates.** `import` takes each type's start rate from `fetch.yaml`: the executions
+  started in the window without a parent, over the window's length. `--rate` still wins.
+* **Privacy.** Payloads (inputs, results, details, memos, headers and search attribute values)
+  and failures' messages and stack traces are dropped before anything is written, and the
+  directory and its files are readable only by you. The files still name workflow types,
+  activity types, task queues and worker hosts, so keep them with your private profiles.
+* **Limits.** Histories last only as long as the namespace's retention, and `fetch` warns when
+  the window ended longer ago than that. A workflow ID containing `/` can't be asked for over
+  the HTTP API, so it is counted but not fetched. Run again into the same directory, `fetch`
+  fetches only the histories still missing; a different window or query needs another
+  directory.
 
 ## Saved run profiles
 
