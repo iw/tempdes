@@ -654,7 +654,7 @@ workers:                       # SDK worker fleets (Go SDK behaviour)
   - name: order-workers
     namespace: orders
     task_queue: orders
-    processes: 6
+    processes: 6               # 0: the fleet is down, and nothing polls the task queue
     workflow_pollers: 10       # MaxConcurrentWorkflowTaskPollers
     activity_pollers: 16
     workflow_slots: 200

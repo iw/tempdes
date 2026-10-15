@@ -287,3 +287,27 @@ fn a_signal_rate_event_changes_the_rate() {
     );
     assert!(run::prepare(&Scenario::parse_str(&bad).expect("scenario"), &ov, None).is_err());
 }
+
+#[test]
+fn a_fleet_that_is_down_leaves_its_tasks_waiting() {
+    let mut down = baseline();
+    for fleet in &mut down.workers {
+        fleet.processes = 0;
+    }
+    let texts = scrapes(&down, &short(), &[12, 18]);
+    assert!(samples(&texts[1], "temporal_num_pollers").is_empty());
+    let backlog = |text: &str| -> f64 {
+        samples(text, "approximate_backlog_count")
+            .iter()
+            .filter(|(l, _)| l.contains("task_type=\"Workflow\""))
+            .map(|(_, v)| v)
+            .sum()
+    };
+    assert!(backlog(&texts[0]) > 0.0, "{}", backlog(&texts[0]));
+    assert!(
+        backlog(&texts[1]) > backlog(&texts[0]),
+        "{} then {}",
+        backlog(&texts[0]),
+        backlog(&texts[1])
+    );
+}

@@ -369,7 +369,7 @@ pub struct WorkerFleetSpec {
     #[serde(default = "default_ns")]
     pub namespace: String,
     pub task_queue: String,
-    /// Worker processes (pods).
+    /// Worker processes (pods). 0 means the fleet is down: no Worker polls its task queue.
     #[serde(default = "one")]
     pub processes: u32,
     /// MaxConcurrentWorkflowTaskPollers per process.

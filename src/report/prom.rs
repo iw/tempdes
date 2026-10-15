@@ -363,7 +363,9 @@ pub fn render_as(ctx: &Ctx, reading: Reading) -> String {
             ("instance", pods[pt.host].addr.clone()),
         ];
         let matched = pt.sync_matches + pt.async_matches;
-        if matched + pt.polls == 0 {
+        // A partition that tasks were added to reports its backlog whether or not anything
+        // polled it.
+        if matched + pt.polls + pt.adds == 0 {
             continue;
         }
         w.counter("poll_success", &l, matched as f64);

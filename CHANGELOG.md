@@ -9,6 +9,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A fleet that is down.** A worker fleet's `processes` can be 0: no Worker polls its task
+  queue, so its tasks wait in Matching and the Workers' metrics have no series for it.
+
 - **Timed signal rates.** An event's `signal_rate: { workflow_type, rate }` sets the rate of
   the signal loads that send to that type, as `start_rate` does for starts. A signal load can
   start at `0/s`, so signals can begin mid-run. An event for a type no signal load sends to is
@@ -284,6 +287,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hosts, are counted but never written.
 
 ### Fixed
+
+- **The backlog of a queue nothing polls.** Matching's metrics left out a partition that had
+  been neither polled nor matched, so a task queue with no workers showed no
+  `approximate_backlog_count` or `approximate_backlog_age_seconds` at all, however large its
+  backlog. A partition that tasks were added to is now reported, polled or not.
 
 - **A partition dispatch limit never recovered from a refusal.** When the limiter refused a
   dispatch, Matching took a token to time its retry (`reserve_delay`), and the retry took
