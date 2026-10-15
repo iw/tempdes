@@ -343,4 +343,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   simulated. They also described only one of the throughput tests, and gave stale counts of
   simulated keys. All three are corrected.
 
+### Security
+
+- **rustls 0.23.46.** The `fetch` feature's TLS client, used by `metrics fetch`, `metrics scan`
+  and `workload fetch`, moves from rustls 0.23.45, which RUSTSEC-2026-0346, -0347, -0348 and
+  -0349 affect.
+
 [Unreleased]: https://github.com/iw/tempdes/commits/main
