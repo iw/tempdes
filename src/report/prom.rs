@@ -1,7 +1,13 @@
 //! Export simulated metrics in Prometheus text format using Temporal's metric names and labels
 //! (tally reporter conventions: timers are histograms in seconds with Temporal's default
-//! buckets, counters have no `_total` suffix). Values are totals over the measurement window,
-//! i.e. equivalent to the difference between two scrapes `window` seconds apart.
+//! buckets, counters have no `_total` suffix). The server's metrics come with the Workers' own,
+//! under the Go SDK's names.
+//!
+//! [`render`] reads a finished run: values are totals over the measurement window, i.e.
+//! equivalent to the difference between two scrapes `window` seconds apart, and gauges that
+//! vary are their mean over it. [`render_as`] with [`Reading::Scrape`] reads a run in progress
+//! as Prometheus would scrape it at that moment: counters and histograms since the warm-up
+//! ended, and gauges at their current value.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -16,9 +22,29 @@ const MS_BOUNDS: [u64; 19] = [
     200_000, 500_000, 1_000_000,
 ];
 
+/// When the metrics are read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// After a run, over its measurement window.
+    Window,
+    /// During a run, as a scrape at the current simulated time.
+    Scrape,
+}
+
 struct W {
     out: String,
     typed: BTreeMap<String, &'static str>,
+}
+
+/// `base` with one more label.
+fn with(
+    base: &[(&'static str, String)],
+    label: &'static str,
+    value: String,
+) -> Vec<(&'static str, String)> {
+    let mut l = base.to_vec();
+    l.push((label, value));
+    l
 }
 
 fn labels(l: &[(&str, String)]) -> String {
@@ -70,7 +96,12 @@ impl W {
     }
 }
 
+/// The metrics of a finished run, over its measurement window.
 pub fn render(ctx: &Ctx) -> String {
+    render_as(ctx, Reading::Window)
+}
+
+pub fn render_as(ctx: &Ctx, reading: Reading) -> String {
     let p = &ctx.p;
     let m = ctx.m.borrow();
     let pods = ctx.pods.borrow();
@@ -78,17 +109,34 @@ pub fn render(ctx: &Ctx) -> String {
         out: String::new(),
         typed: BTreeMap::new(),
     };
-    let _ = writeln!(
-        w.out,
-        "# tempdes simulated metrics (Temporal {} naming) scenario={} window_seconds={}",
-        crate::config::dynamic::registry().temporal_version,
-        p.name,
-        p.duration as f64 / 1e6
-    );
-    let _ = writeln!(
-        w.out,
-        "# counters are totals over the window; divide by window_seconds for rates"
-    );
+    match reading {
+        Reading::Window => {
+            let _ = writeln!(
+                w.out,
+                "# tempdes simulated metrics (Temporal {} naming) scenario={} window_seconds={}",
+                crate::config::dynamic::registry().temporal_version,
+                p.name,
+                p.duration as f64 / 1e6
+            );
+            let _ = writeln!(
+                w.out,
+                "# counters are totals over the window; divide by window_seconds for rates"
+            );
+        }
+        Reading::Scrape => {
+            let _ = writeln!(
+                w.out,
+                "# tempdes simulated metrics (Temporal {} naming) scenario={} scraped_at_seconds={}",
+                crate::config::dynamic::registry().temporal_version,
+                p.name,
+                crate::sim::executor::now() as f64 / 1e6
+            );
+            let _ = writeln!(
+                w.out,
+                "# counters count from the end of the warm-up; gauges are current values"
+            );
+        }
+    }
 
     // service_* per pod
     for (id, pod) in pods.iter().enumerate() {
@@ -199,11 +247,11 @@ pub fn render(ctx: &Ctx) -> String {
                 &l,
                 f64::from(pool.capacity),
             );
-            w.gauge(
-                "persistence_sql_in_use",
-                &l,
-                pool.utilization * f64::from(pool.capacity),
-            );
+            let in_use = match reading {
+                Reading::Window => pool.utilization * f64::from(pool.capacity),
+                Reading::Scrape => f64::from(pod.db_pool.in_use()),
+            };
+            w.gauge("persistence_sql_in_use", &l, in_use);
         }
     }
 
@@ -319,9 +367,80 @@ pub fn render(ctx: &Ctx) -> String {
         w.counter("poll_timeouts", &l, pt.poll_timeouts as f64);
         w.counter("forwarded", &l, pt.forwarded_tasks as f64);
         w.counter("task_write_throttle_count", &l, pt.write_rejects as f64);
-        let mut g = pt.backlog_gauge.clone();
-        w.gauge("approximate_backlog_count", &l, g.mean());
+        let backlog = match reading {
+            Reading::Window => pt.backlog_gauge.clone().mean(),
+            Reading::Scrape => pt.backlog_len() as f64,
+        };
+        w.gauge("approximate_backlog_count", &l, backlog);
+        w.gauge(
+            "approximate_backlog_age_seconds",
+            &l,
+            pt.backlog_head_age() as f64 / 1e6,
+        );
         w.timer("asyncmatch_latency", &l, &pt.task_wait);
+    }
+
+    // The Workers' metrics, as the Go SDK's tally reporter names them: one series per worker
+    // process, told apart by `instance` as Prometheus tells scrape targets apart. The server's
+    // own system workers are left out.
+    let workers = ctx.workers.borrow();
+    for (wk, proc) in workers.iter().enumerate() {
+        let f = &p.fleets[proc.fleet];
+        if f.system {
+            continue;
+        }
+        let base = [
+            ("namespace", p.namespaces[f.ns].name.clone()),
+            ("task_queue", p.task_queues[f.tq].name.clone()),
+            ("instance", format!("{}-{}", f.name, proc.ordinal)),
+        ];
+        for (worker_type, slots) in [
+            ("WorkflowWorker", &proc.wft_slots),
+            ("ActivityWorker", &proc.act_slots),
+        ] {
+            let l = with(&base, "worker_type", worker_type.into());
+            let used = slots.in_use();
+            w.gauge(
+                "temporal_worker_task_slots_available",
+                &l,
+                f64::from(slots.capacity().saturating_sub(used)),
+            );
+            w.gauge("temporal_worker_task_slots_used", &l, f64::from(used));
+        }
+        for (poller_type, n) in [
+            ("workflow_task", proc.pending_regular),
+            ("workflow_sticky_task", proc.pending_sticky),
+            ("activity_task", proc.pending_activity),
+        ] {
+            w.gauge(
+                "temporal_num_pollers",
+                &with(&base, "poller_type", poller_type.into()),
+                f64::from(n),
+            );
+        }
+        let s = m.workers.get(wk).cloned().unwrap_or_default();
+        for (wf_type, n) in &s.wft_polls_succeeded {
+            w.counter(
+                "temporal_workflow_task_queue_poll_succeed",
+                &with(&base, "workflow_type", p.wf_types[*wf_type].name.clone()),
+                *n as f64,
+            );
+        }
+        w.counter(
+            "temporal_workflow_task_queue_poll_empty",
+            &base,
+            s.wft_polls_empty as f64,
+        );
+        w.counter(
+            "temporal_activity_poll_no_task",
+            &base,
+            s.act_polls_empty as f64,
+        );
+        for ((operation, status_code), n) in &s.poll_failures {
+            let mut l = with(&base, "operation", (*operation).into());
+            l.push(("status_code", (*status_code).into()));
+            w.counter("temporal_long_request_failure", &l, *n as f64);
+        }
     }
 
     // workflows
@@ -333,6 +452,23 @@ pub fn render(ctx: &Ctx) -> String {
         ];
         w.counter("workflow_success", &l, s.completed as f64);
         w.timer("workflow_schedule_to_close_latency", &l, &s.e2e);
+        // Schedule-to-start as the Workers' SDK reports it, recorded where Matching hands the
+        // task to a poll.
+        let l = [
+            ("namespace", p.namespaces[t.ns].name.clone()),
+            ("task_queue", p.task_queues[t.tq].name.clone()),
+            ("workflow_type", t.name.clone()),
+        ];
+        w.timer(
+            "temporal_workflow_task_schedule_to_start_latency",
+            &l,
+            &s.wft_sched_to_start,
+        );
+        w.timer(
+            "temporal_activity_schedule_to_start_latency",
+            &l,
+            &s.act_sched_to_start,
+        );
     }
     if !p.schedules.is_empty() {
         w.counter("schedule_action_success", &[], m.schedule_actions as f64);

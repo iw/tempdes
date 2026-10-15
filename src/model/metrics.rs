@@ -120,6 +120,19 @@ pub struct Sample {
     pub running: u64,
 }
 
+/// What a worker process's SDK counts, as the Go SDK's metrics count it.
+#[derive(Clone, Debug, Default)]
+pub struct WorkerStats {
+    /// Workflow Task polls that returned a task, by workflow type
+    pub wft_polls_succeeded: BTreeMap<usize, u64>,
+    /// Workflow Task polls that returned no task
+    pub wft_polls_empty: u64,
+    /// Activity Task polls that returned no task
+    pub act_polls_empty: u64,
+    /// failed polls, by operation and gRPC status code
+    pub poll_failures: BTreeMap<(&'static str, &'static str), u64>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Metrics {
     /// SDK-observed latency per frontend API (end to end, including retries)
@@ -147,6 +160,8 @@ pub struct Metrics {
     pub events_cache_hits: u64,
     pub events_cache_misses: u64,
     pub wf: Vec<WfStats>,
+    /// per worker process (index into `Ctx::workers`), grown as processes report
+    pub workers: Vec<WorkerStats>,
     /// (limiter, where) -> rejections
     pub rejections: BTreeMap<(String, String), u64>,
     pub schedule_actions: u64,
@@ -214,6 +229,14 @@ impl Metrics {
             self.tasks_by_pod.resize(pod + 1, 0);
         }
         self.tasks_by_pod[pod] += 1;
+    }
+
+    /// Worker process `wk`'s SDK counts.
+    pub fn worker(&mut self, wk: usize) -> &mut WorkerStats {
+        if self.workers.len() <= wk {
+            self.workers.resize_with(wk + 1, WorkerStats::default);
+        }
+        &mut self.workers[wk]
     }
 
     pub fn reject(&mut self, limiter: &str, place: String) {

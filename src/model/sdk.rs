@@ -404,16 +404,32 @@ async fn wft_poller(ctx: Ctx, wk: usize, idx: u32) {
         match r {
             Ok(Some(Polled::Wft(info))) => {
                 failures = 0;
+                *ctx.m
+                    .borrow_mut()
+                    .worker(wk)
+                    .wft_polls_succeeded
+                    .entry(info.wf_type)
+                    .or_default() += 1;
                 let c = ctx.clone();
                 spawn(async move { process_wft(c, wk, info, permit).await });
             }
             Ok(_) => {
                 failures = 0;
+                ctx.m.borrow_mut().worker(wk).wft_polls_empty += 1;
                 drop(permit);
             }
             Err(e) => {
                 drop(permit);
                 failures += 1;
+                *ctx.m
+                    .borrow_mut()
+                    .worker(wk)
+                    .poll_failures
+                    .entry((
+                        Api::PollWorkflowTaskQueue.metric_operation(),
+                        e.status_code(),
+                    ))
+                    .or_default() += 1;
                 let d = match e {
                     Err::ResourceExhausted(..) => {
                         backoff(&ctx, 1_000_000, 2.0, 10_000_000, failures)
@@ -437,6 +453,7 @@ async fn activity_poller(ctx: Ctx, wk: usize) {
     let mut failures = 0u32;
     loop {
         let permit = slots.acquire().await;
+        ctx.workers.borrow_mut()[wk].pending_activity += 1;
         let r = sdk_call(
             &ctx,
             Conn::Worker(wk),
@@ -449,6 +466,10 @@ async fn activity_poller(ctx: Ctx, wk: usize) {
             },
         )
         .await;
+        {
+            let mut ws = ctx.workers.borrow_mut();
+            ws[wk].pending_activity = ws[wk].pending_activity.saturating_sub(1);
+        }
         match r {
             Ok(Some(Polled::Act(info))) => {
                 failures = 0;
@@ -457,11 +478,21 @@ async fn activity_poller(ctx: Ctx, wk: usize) {
             }
             Ok(_) => {
                 failures = 0;
+                ctx.m.borrow_mut().worker(wk).act_polls_empty += 1;
                 drop(permit);
             }
             Err(e) => {
                 drop(permit);
                 failures += 1;
+                *ctx.m
+                    .borrow_mut()
+                    .worker(wk)
+                    .poll_failures
+                    .entry((
+                        Api::PollActivityTaskQueue.metric_operation(),
+                        e.status_code(),
+                    ))
+                    .or_default() += 1;
                 let d = match e {
                     Err::ResourceExhausted(..) => {
                         backoff(&ctx, 1_000_000, 2.0, 10_000_000, failures)
