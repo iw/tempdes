@@ -372,6 +372,12 @@ async fn wft_poller(ctx: Ctx, wk: usize, idx: u32) {
             s
         };
         let sticky_worker = sticky.then_some(wk);
+        *ctx.m
+            .borrow_mut()
+            .worker(wk)
+            .long_polls
+            .entry(Api::PollWorkflowTaskQueue.metric_operation())
+            .or_default() += 1;
         let r = sdk_call(
             &ctx,
             Conn::Worker(wk),
@@ -454,6 +460,12 @@ async fn activity_poller(ctx: Ctx, wk: usize) {
     loop {
         let permit = slots.acquire().await;
         ctx.workers.borrow_mut()[wk].pending_activity += 1;
+        *ctx.m
+            .borrow_mut()
+            .worker(wk)
+            .long_polls
+            .entry(Api::PollActivityTaskQueue.metric_operation())
+            .or_default() += 1;
         let r = sdk_call(
             &ctx,
             Conn::Worker(wk),

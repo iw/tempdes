@@ -423,6 +423,13 @@ pub fn render_as(ctx: &Ctx, reading: Reading) -> String {
             );
         }
         let s = m.workers.get(wk).cloned().unwrap_or_default();
+        for (operation, n) in &s.long_polls {
+            w.counter(
+                "temporal_long_request",
+                &with(&base, "operation", (*operation).into()),
+                *n as f64,
+            );
+        }
         for (wf_type, n) in &s.wft_polls_succeeded {
             w.counter(
                 "temporal_workflow_task_queue_poll_succeed",

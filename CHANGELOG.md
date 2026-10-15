@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   start at `0/s`, so signals can begin mid-run. An event for a type no signal load sends to is
   refused.
 
+- **Every long poll counted.** The Workers' metrics add `temporal_long_request`, each
+  worker process's polls by `operation`, counted as they are sent, as the SDKs count them.
+  Beside it, a `temporal_long_request_failure` with no series means no poll failed.
+
 - **The frontend's metrics carry `namespace`.** `service_requests`, `service_latency`,
   `service_errors_resource_exhausted` and `service_error_with_type` from the frontend are
   written per namespace, as Temporal writes them, so a query for one namespace's polls or

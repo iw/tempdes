@@ -123,6 +123,8 @@ pub struct Sample {
 /// What a worker process's SDK counts, as the Go SDK's metrics count it.
 #[derive(Clone, Debug, Default)]
 pub struct WorkerStats {
+    /// long polls sent, by operation, counted as they are sent
+    pub long_polls: BTreeMap<&'static str, u64>,
     /// Workflow Task polls that returned a task, by workflow type
     pub wft_polls_succeeded: BTreeMap<usize, u64>,
     /// Workflow Task polls that returned no task

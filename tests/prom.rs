@@ -117,6 +117,19 @@ fn a_scrape_reads_a_run_in_progress() {
             .all(|(l, _)| l.contains("namespace="))
     );
 
+    // Every poll is counted as it is sent, so a failure counter's absence means none failed.
+    let polls = samples(&text, "temporal_long_request");
+    assert!(
+        polls
+            .iter()
+            .any(|(l, v)| l.contains("operation=\"PollWorkflowTaskQueue\"") && *v > 0.0)
+    );
+    assert!(
+        polls
+            .iter()
+            .any(|(l, v)| l.contains("operation=\"PollActivityTaskQueue\"") && *v > 0.0)
+    );
+
     let succeeded = samples(&text, "temporal_workflow_task_queue_poll_succeed");
     assert!(
         succeeded
