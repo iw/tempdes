@@ -700,6 +700,8 @@ pub struct WorkerProc {
     pub pending_sticky: u32,
     pub pending_regular: u32,
     pub sticky_backlog: u64,
+    /// outstanding activity polls
+    pub pending_activity: u32,
     /// the worker service pod hosting this process (system per-namespace workers only)
     pub host_pod: Option<PodId>,
 }

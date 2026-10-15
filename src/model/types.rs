@@ -623,6 +623,20 @@ pub enum Err {
     StickyWorkerUnavailable,
 }
 
+impl Err {
+    /// The gRPC status code the client sees, as SDK metrics write it
+    /// (`common/serviceerror/` for the server's own errors).
+    pub fn status_code(self) -> &'static str {
+        match self {
+            Err::ResourceExhausted(..) => "RESOURCE_EXHAUSTED",
+            Err::DeadlineExceeded => "DEADLINE_EXCEEDED",
+            Err::ShardOwnershipLost => "ABORTED",
+            Err::Unavailable | Err::StickyWorkerUnavailable => "UNAVAILABLE",
+            Err::NotFound => "NOT_FOUND",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {
     System,

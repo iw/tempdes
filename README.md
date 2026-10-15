@@ -134,7 +134,8 @@ tempdes workload import histories/ --namespace orders -o workflows.yaml
 ```
 
 `run` also writes `--json` (the full result), `--prom` (simulated metrics in Prometheus text
-format with Temporal metric names), `--html` (a self-contained report with time-series charts
+format with Temporal metric names: the server's, and the Workers' under the Go SDK's names),
+`--html` (a self-contained report with time-series charts
 and a shard map) and `--md` (the report as Markdown, with GitHub-flavoured tables for pull
 requests, issues and docs). `-v` prints per-pod, per-shard and per-partition tables. `ui` takes the same
 scenario and overrides and shows the run live in the browser.

@@ -495,6 +495,7 @@ pub fn build(p: Params) -> (Ctx, Executor) {
                 pending_sticky: 0,
                 pending_regular: 0,
                 sticky_backlog: 0,
+                pending_activity: 0,
                 host_pod,
             });
         }

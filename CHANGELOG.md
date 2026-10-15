@@ -9,6 +9,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The Workers' metrics in the Prometheus output.** `--prom` adds the Go SDK's metrics under
+  its tally reporter's names, one series per worker process (`instance`):
+  - `temporal_worker_task_slots_available` and `temporal_worker_task_slots_used`, by
+    `worker_type`;
+  - `temporal_num_pollers`, the outstanding polls by `poller_type` (`workflow_task`,
+    `workflow_sticky_task`, `activity_task`);
+  - `temporal_workflow_task_queue_poll_succeed` by `workflow_type`,
+    `temporal_workflow_task_queue_poll_empty` and `temporal_activity_poll_no_task`;
+  - `temporal_long_request_failure` for failed polls, by `operation` and `status_code`;
+  - `temporal_workflow_task_schedule_to_start_latency` and
+    `temporal_activity_schedule_to_start_latency`, by `workflow_type`, recorded where Matching
+    hands a task to a poll.
+
+  Matching adds `approximate_backlog_age_seconds`, the age of each partition's oldest backlog
+  task. The server's own system workers are left out. In `baseline.yaml` with two Workflow Task
+  slots per worker process, no slot is free and tasks wait about a second in Matching; with the
+  scenario's 200, about 1,100 are free and tasks wait about 13 ms.
+
+- **Scraping a run in progress.** `report::prom::render_as(ctx, Reading::Scrape)` reads a run
+  as Prometheus would scrape it at the current simulated time: counters and histograms since the
+  warm-up ended, and gauges at their current value (`approximate_backlog_count` and
+  `persistence_sql_in_use` are otherwise means over the measurement window). A run advanced in
+  slices with `model::build::start` and `Executor::run_until` can be scraped every few simulated
+  seconds, as a real cluster is. `render`, and `--prom`, still read the measurement window.
+
 - **`tempdes workload fetch`.** Fetches histories for `workload import` from a Temporal
   frontend's HTTP API. It lists the executions started in a window, counts them by type, and
   fetches up to `--limit` of each type (300 by default), spread over the window, page by page.
