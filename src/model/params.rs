@@ -665,6 +665,8 @@ pub struct EventParams {
     pub replicas: Option<ReplicasPatch>,
     pub dc: Vec<(String, DcValue)>,
     pub start_rate: Option<(usize, f64)>,
+    /// (workflow type, rate) for the signal loads that send to that type
+    pub signal_rate: Option<(usize, f64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1668,6 +1670,19 @@ impl Params {
                 Some(p) => Some((find_type(&p.workflow_type)?, p.rate.0)),
                 None => None,
             };
+            let signal_rate = match &e.signal_rate {
+                Some(p) => {
+                    let t = find_type(&p.workflow_type)?;
+                    anyhow::ensure!(
+                        signals.iter().any(|s| s.wf_type == t),
+                        "event at {}: no signal load sends to {}",
+                        e.at,
+                        p.workflow_type
+                    );
+                    Some((t, p.rate.0))
+                }
+                None => None,
+            };
             for k in e.dynamic_config.keys() {
                 if crate::config::dynamic::registry().get(k).is_none() {
                     prov.warnings
@@ -1684,6 +1699,7 @@ impl Params {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
                 start_rate: sr,
+                signal_rate,
             });
         }
         events.sort_by_key(|e| e.at);

@@ -19,6 +19,8 @@ use super::world::*;
 /// Current start rate per workflow type (events may change it).
 pub struct Rates {
     pub start: Vec<f64>,
+    /// per signal load (index into `Params::signals`), changed by `signal_rate` events
+    pub signal: Vec<f64>,
     /// Live multiplier on every start and signal rate, changed between steps by `tempdes ui`.
     /// Always 1.0 in a CLI run.
     pub scale: f64,
@@ -391,10 +393,8 @@ pub async fn start_entities(ctx: Ctx, client: usize) {
 }
 
 pub fn start_signalers(ctx: &Ctx, rates: &Rc<RefCell<Rates>>, client_base: usize) {
+    // Loads that start at 0/s run too, since an event can raise their rate.
     for (si, s) in ctx.p.signals.iter().enumerate() {
-        if s.rate <= 0.0 {
-            continue;
-        }
         let c = ctx.clone();
         let s = s.clone();
         let rates = rates.clone();
@@ -402,7 +402,10 @@ pub fn start_signalers(ctx: &Ctx, rates: &Rc<RefCell<Rates>>, client_base: usize
             // hot entities are started at t=0; give them a moment
             sleep(500_000).await;
             loop {
-                let rate = s.rate * rates.borrow().scale;
+                let rate = {
+                    let r = rates.borrow();
+                    r.signal[si] * r.scale
+                };
                 if rate <= 0.0 {
                     sleep(1_000_000).await;
                     continue;

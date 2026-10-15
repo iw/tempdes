@@ -235,9 +235,13 @@ where
         body(ctx.clone(), pod).await
     }
     .await;
-    ctx.m
-        .borrow_mut()
-        .fe_op(pod, api)
-        .record(now() - t0, r.as_ref().err().copied());
+    let (took, err) = (now() - t0, r.as_ref().err().copied());
+    let mut m = ctx.m.borrow_mut();
+    m.fe_op(pod, api).record(took, err);
+    m.fe_by_ns
+        .entry((pod, ns, api))
+        .or_default()
+        .record(took, err);
+    drop(m);
     r
 }

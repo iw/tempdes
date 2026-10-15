@@ -708,6 +708,7 @@ events:                        # changes during the run
   - { at: 50s, replicas: { history: 5 }, label: scale history }
   - { at: 80s, dynamic_config: { matching.rps: 2400 } }
   - { at: 90s, start_rate: { workflow_type: OrderWorkflow, rate: 300/s } }
+  - { at: 2m, signal_rate: { workflow_type: CartWorkflow, rate: 1200/s } }  # its signal loads; 0/s loads too
 
 calibration:
   observations: [ ../metrics/observed.yaml ]

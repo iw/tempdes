@@ -406,7 +406,9 @@ fn try_dispatch(ctx: &Ctx, pid: usize) {
             && !l.allow()
         {
             p.pollers.push_front(w);
-            limited_delay = Some(l.reserve_delay().max(1_000));
+            // The retry takes its token with `allow()`. Reserving one here as well would put
+            // the bucket in debt on every refusal, and the partition would never dispatch again.
+            limited_delay = Some(l.delay().max(1_000));
             break;
         }
         let task = p.backlog_mem.pop_front().unwrap();
@@ -458,10 +460,18 @@ fn try_dispatch(ctx: &Ctx, pid: usize) {
             });
         }
     }
-    if let Some(d) = limited_delay {
+    // One retry per partition, as Matching's task reader waits on its limiter: a retry for
+    // every refusal would pile up faster than they run.
+    if let Some(d) = limited_delay
+        && !std::mem::replace(
+            &mut ctx.matching.borrow_mut().parts[pid].dispatch_retry,
+            true,
+        )
+    {
         let c = ctx.clone();
         spawn(async move {
             sleep(d).await;
+            c.matching.borrow_mut().parts[pid].dispatch_retry = false;
             try_dispatch(&c, pid);
         });
     }
