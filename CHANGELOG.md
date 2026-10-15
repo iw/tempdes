@@ -9,6 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The registry generator's Go lexing is public.** `config::registry_gen` exports the helpers
+  it reads Temporal's source with (`collect_go_files`, `relative`, `one_line`, `is_func_decl`,
+  `is_space`, `is_ident`, `skip_opaque`, `closing`, `split_args`, `string_const`), so other
+  readers of the source can share them rather than copy them.
+
 - **A fleet that is down.** A worker fleet's `processes` can be 0: no Worker polls its task
   queue, so its tasks wait in Matching and the Workers' metrics have no series for it.
 
