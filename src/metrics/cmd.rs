@@ -19,6 +19,9 @@ pub enum Kind {
     Counter,
     /// a gauge, recorded as its value at the end of the window
     Gauge,
+    /// a gauge, recorded as its largest value during the window, over all series (an age, which
+    /// can't be summed)
+    Peak,
     /// a histogram, recorded as these quantiles over the window
     Histogram(&'static [f64]),
     /// cAdvisor's CPU seconds, recorded as cores over the window
@@ -173,6 +176,54 @@ pub const SPECS: &[Spec] = &[
         fixed: &[],
         what: "mutable state cleared after errors, twice per failed write (not read by tempdes)",
     },
+    Spec {
+        name: "cache_latency",
+        kind: Kind::Histogram(&[0.5, 0.99]),
+        by: "operation",
+        filter: r#"cache_type="mutablestate""#,
+        fixed: &[("cache_type", "mutablestate")],
+        what: "getting a workflow from history's cache, which waits for its lock (not read by tempdes)",
+    },
+    Spec {
+        name: "shard_closed_count",
+        kind: Kind::Counter,
+        by: "",
+        filter: "",
+        fixed: &[],
+        what: "history shards closed, as when they move between pods (not read by tempdes)",
+    },
+    Spec {
+        name: "syncmatch_latency",
+        kind: Kind::Histogram(&[0.5, 0.99]),
+        by: "namespace, operation",
+        filter: "",
+        fixed: &[],
+        what: "AddActivityTask / AddWorkflowTask for tasks handed straight to a poller, the start record included (not read by tempdes)",
+    },
+    Spec {
+        name: "approximate_backlog_age_seconds",
+        kind: Kind::Peak,
+        by: "namespace, task_type",
+        filter: "",
+        fixed: &[],
+        what: "oldest backlog task's age, largest in the window, against matching.backlogNegligibleAge (not read by tempdes)",
+    },
+    Spec {
+        name: "task_write_throttle_count",
+        kind: Kind::Counter,
+        by: "",
+        filter: "",
+        fixed: &[],
+        what: "backlog appends refused with SystemOverloaded, against matching.outstandingTaskAppendsThreshold (not read by tempdes)",
+    },
+    Spec {
+        name: "temporal_num_pollers",
+        kind: Kind::Gauge,
+        by: "namespace, poller_type",
+        filter: "",
+        fixed: &[],
+        what: "concurrent worker pollers, from the SDKs (not read by tempdes)",
+    },
 ];
 
 impl Spec {
@@ -194,19 +245,27 @@ impl Spec {
         } else {
             format!("{{{filter}}}")
         };
-        // `sum(` or `sum by (labels) (`
-        let sum = |extra: &str| match (extra.is_empty(), self.by.is_empty()) {
-            (true, true) => "sum(".to_string(),
-            (true, false) => format!("sum by ({}) (", self.by),
-            (false, true) => format!("sum by ({extra}) ("),
-            (false, false) => format!("sum by ({extra}, {}) (", self.by),
+        // `sum(` or `sum by (labels) (`, and likewise for `max`
+        let group = |op: &str, extra: &str| match (extra.is_empty(), self.by.is_empty()) {
+            (true, true) => format!("{op}("),
+            (true, false) => format!("{op} by ({}) (", self.by),
+            (false, true) => format!("{op} by ({extra}) ("),
+            (false, false) => format!("{op} by ({extra}, {}) (", self.by),
         };
+        let sum = |extra: &str| group("sum", extra);
         match self.kind {
             Kind::Counter | Kind::Cores => vec![(
                 None,
                 format!("{}rate({metric}{filter}[{window}]))", sum("")),
             )],
             Kind::Gauge => vec![(None, format!("{}{metric}{filter})", sum("")))],
+            Kind::Peak => vec![(
+                None,
+                format!(
+                    "{}max_over_time({metric}{filter}[{window}]))",
+                    group("max", "")
+                ),
+            )],
             Kind::Histogram(qs) => qs
                 .iter()
                 .map(|&q| {
@@ -228,6 +287,7 @@ impl Spec {
             Kind::Counter => "rate".to_string(),
             Kind::Cores => "rate (cores)".to_string(),
             Kind::Gauge => "value".to_string(),
+            Kind::Peak => "largest value".to_string(),
             Kind::Histogram(qs) => qs
                 .iter()
                 .map(|q| format!("p{}", (q * 100.0).round()))

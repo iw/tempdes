@@ -81,9 +81,20 @@ fn answer(e: Exporter, q: &str) -> Series {
         "service_errors_resource_exhausted",
         "workflow_success",
         "workflow_context_cleared",
+        "shard_closed_count",
+        "task_write_throttle_count",
     ];
-    let gauges = ["approximate_backlog_count", "numshards_gauge"];
-    let hists = ["service_latency", "persistence_latency"];
+    let gauges = [
+        "approximate_backlog_count",
+        "numshards_gauge",
+        "approximate_backlog_age_seconds",
+    ];
+    let hists = [
+        "service_latency",
+        "persistence_latency",
+        "cache_latency",
+        "syncmatch_latency",
+    ];
     if let Some(name) = q
         .strip_prefix("count by (le) (")
         .and_then(|r| r.strip_suffix(')'))
@@ -101,7 +112,9 @@ fn answer(e: Exporter, q: &str) -> Series {
         let known = counters.iter().any(|b| e.name(b, false, true) == name)
             || gauges.iter().any(|b| e.name(b, false, false) == name)
             || hists.iter().any(|b| e.name(b, true, false) == name)
-            || name == "container_cpu_usage_seconds_total";
+            || name == "container_cpu_usage_seconds_total"
+            // the SDKs' own name, whichever exporter the server uses
+            || name == "temporal_num_pollers";
         return if known { one(3.0) } else { vec![] };
     }
     let labels = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
@@ -142,6 +155,22 @@ fn answer(e: Exporter, q: &str) -> Series {
                 // no samples in the window
                 (labels(&[("operation", "GetWorkflowExecution")]), f64::NAN),
             ];
+        }
+        if q.contains(&e.name("cache_latency", true, false)) {
+            assert!(q.contains(r#"cache_type="mutablestate""#), "{q}");
+            return vec![(
+                labels(&[("operation", "HistoryCacheGetOrCreate")]),
+                p(2.0, 200.0, 480.0),
+            )];
+        }
+        if q.contains(&e.name("syncmatch_latency", true, false)) {
+            return vec![(
+                labels(&[
+                    ("namespace", "orders-prod"),
+                    ("operation", "AddActivityTask"),
+                ]),
+                p(40.0, 300.0, 450.0),
+            )];
         }
         if q.contains(&e.name("service_latency", true, false)) {
             return vec![(
@@ -203,6 +232,52 @@ fn answer(e: Exporter, q: &str) -> Series {
     }
     if q.contains(&name("poll_success", true)) {
         return one(1000.0);
+    }
+    if q.contains(&name("approximate_backlog_age_seconds", false)) {
+        assert!(
+            q.starts_with("max by (namespace, task_type) (max_over_time("),
+            "{q}"
+        );
+        return vec![
+            (
+                labels(&[("namespace", "orders-prod"), ("task_type", "Activity")]),
+                12.5,
+            ),
+            // never a backlog: a peak of zero is kept
+            (
+                labels(&[("namespace", "orders-prod"), ("task_type", "Workflow")]),
+                0.0,
+            ),
+        ];
+    }
+    if q.contains(&name("shard_closed_count", true)) {
+        return one(0.8);
+    }
+    if q.contains(&name("task_write_throttle_count", true)) {
+        // no refusals: an ungrouped zero is kept
+        return one(0.0);
+    }
+    if q.contains("temporal_num_pollers") {
+        return vec![
+            (
+                labels(&[
+                    ("namespace", "orders-prod"),
+                    ("poller_type", "workflow_task"),
+                ]),
+                450.0,
+            ),
+            (
+                labels(&[
+                    ("namespace", "orders-prod"),
+                    ("poller_type", "activity_task"),
+                ]),
+                360.0,
+            ),
+            (
+                labels(&[("namespace", "orders-prod"), ("poller_type", "nexus_task")]),
+                0.0,
+            ),
+        ];
     }
     if q.contains(&name("approximate_backlog_count", false)) {
         return vec![(
@@ -395,6 +470,33 @@ fn fetched_observations_read_back_whatever_the_exporter() {
             Some(100.0)
         );
         assert_eq!(o.rate("poll_success_sync", &[]), Some(800.0));
+        // the dispatch path: lock waits, sync matches, backlog age, writer refusals, pollers
+        let lock = o
+            .latency("cache_latency", &[("cache_type", "mutablestate")])
+            .unwrap();
+        assert!(
+            (lock.quantile_us(0.99).unwrap() - 480_000.0).abs() < 1.0,
+            "{e:?}"
+        );
+        let sync = o
+            .latency(
+                "syncmatch_latency",
+                &[("namespace", "orders"), ("operation", "AddActivityTask")],
+            )
+            .unwrap();
+        assert!(
+            (sync.quantile_us(0.5).unwrap() - 40_000.0).abs() < 1.0,
+            "{e:?}"
+        );
+        let age = |t: &str| o.value_sum("approximate_backlog_age_seconds", &[("task_type", t)]);
+        assert_eq!(age("Activity"), Some(12.5), "{e:?}");
+        assert_eq!(age("Workflow"), Some(0.0), "{e:?}");
+        assert_eq!(o.rate("task_write_throttle_count", &[]), Some(0.0), "{e:?}");
+        assert_eq!(o.rate("shard_closed_count", &[]), Some(0.8), "{e:?}");
+        // the loader drops the SDKs' `temporal_` prefix too
+        let pollers = |t: &str| o.value_sum("num_pollers", &[("poller_type", t)]);
+        assert_eq!(pollers("workflow_task"), Some(450.0), "{e:?}");
+        assert_eq!(pollers("nexus_task"), None, "{e:?}");
         // the window before the run, beside it
         let baseline = Observations::load(&dir.join("baseline.yaml")).unwrap();
         assert_eq!(baseline.rate("service_requests", &start), Some(125.0));

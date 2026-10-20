@@ -9,6 +9,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`metrics fetch` records the dispatch path.** It adds six metrics that tempdes doesn't read
+  yet, to compare with a simulation by eye:
+  - **Waits:** `cache_latency` for mutable state, which is mostly the wait for a workflow's
+    lock, and `syncmatch_latency`, which includes the poller's start record in history.
+  - **Backlog:** `approximate_backlog_age_seconds`, recorded as the largest in the window
+    (`max_over_time`) rather than summed. `task_write_throttle_count` counts appends matching
+    refused with SystemOverloaded.
+  - **Shards and pollers:** `shard_closed_count`, and the SDKs' `temporal_num_pollers` by poller
+    type.
+
+  A zero throttle rate and a backlog age of zero are kept, because each says the limit never
+  came into play. `metrics queries` prints the same queries.
+
 - **The registry generator's Go lexing is public.** `config::registry_gen` exports the helpers
   it reads Temporal's source with (`collect_go_files`, `relative`, `one_line`, `is_func_decl`,
   `is_space`, `is_ident`, `skip_opaque`, `closing`, `split_args`, `string_const`), so other

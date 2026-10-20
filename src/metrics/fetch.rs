@@ -23,7 +23,7 @@ const START_CALLS: &str = "(.*/)?(StartWorkflowExecution|SignalWithStartWorkflow
 fn variants(kind: Kind) -> &'static [&'static str] {
     match kind {
         Kind::Counter => &["{}", "{}_total", "temporal_{}", "temporal_{}_total"],
-        Kind::Gauge => &["{}", "temporal_{}"],
+        Kind::Gauge | Kind::Peak => &["{}", "temporal_{}"],
         Kind::Histogram(_) => &[
             "{}_bucket",
             "{}_milliseconds_bucket",
@@ -391,7 +391,7 @@ fn observe(prom: &Prometheus, t: f64, src: &Sources<'_>) -> anyhow::Result<Obser
                 let value = match (s.kind, q) {
                     (Kind::Counter, _) => Value::Rate(v),
                     (Kind::Cores, _) => Value::Cores(v),
-                    (Kind::Gauge, _) => Value::Gauge(v),
+                    (Kind::Gauge | Kind::Peak, _) => Value::Gauge(v),
                     (Kind::Histogram(_), q) => Value::Quantiles(vec![(q.unwrap_or(0.5), v * ms)]),
                 };
                 match (series.get_mut(&l), value) {
@@ -443,10 +443,14 @@ fn observe(prom: &Prometheus, t: f64, src: &Sources<'_>) -> anyhow::Result<Obser
     })
 }
 
-/// Drop empty and non-finite values (a zero rate of a grouped series says nothing), and
-/// rewrite label values. Warns about values that contain a renamed one.
+/// Drop empty and non-finite values (a zero rate of a grouped series says nothing, while a peak
+/// of zero says there was never a backlog), and rewrite label values. Warns about values that
+/// contain a renamed one.
 fn clean(o: &mut Observed, rename: &[(String, String)]) {
-    let grouped: BTreeMap<&str, bool> = SPECS.iter().map(|s| (s.name, !s.by.is_empty())).collect();
+    let grouped: BTreeMap<&str, bool> = SPECS
+        .iter()
+        .map(|s| (s.name, !s.by.is_empty() && s.kind != Kind::Peak))
+        .collect();
     o.entries.retain_mut(|e| {
         let keep = match &mut e.value {
             Value::Quantiles(qs) => {

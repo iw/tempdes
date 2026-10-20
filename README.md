@@ -360,6 +360,21 @@ These commands work as follows:
   verification.
 * **CPU and the database.** `--cpu-selector` picks Temporal's containers in cAdvisor's metrics.
   `--db-utilization` or `--db-utilization-query` adds the database's busy fraction.
+* **The dispatch path.** `fetch` also records six metrics that tempdes doesn't read yet. They
+  show where a task's schedule-to-start goes, to compare with a simulation by eye:
+  * `cache_latency` (mutable state): getting a workflow from history's cache, which waits for
+    its lock;
+  * `syncmatch_latency`: `AddActivityTask` and `AddWorkflowTask` for tasks handed straight to a
+    waiting poller, which includes the poller's start record in history;
+  * `approximate_backlog_age_seconds`: the oldest backlog task's age, the largest in the window,
+    to set beside `matching.backlogNegligibleAge`;
+  * `task_write_throttle_count`: backlog appends refused with SystemOverloaded, to set beside
+    `matching.outstandingTaskAppendsThreshold`;
+  * `shard_closed_count`: history shards closed, as when they move between pods;
+  * `temporal_num_pollers`: concurrent worker pollers, from the SDKs.
+
+  A zero throttle rate and a backlog age of zero are kept, because each says the limit never
+  came into play.
 
 An observations file lists Temporal metric names with labels. Each entry gives a `rate`,
 `increase` (with `window`), `value`, quantiles (`p50`/`p90`/`p99` or a `quantiles` map) or raw
