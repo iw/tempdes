@@ -419,6 +419,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **rustls-webpki 0.103.16 and webpki-root-certs 1.0.10.** The `fetch` feature's certificate
+  verification moves from rustls-webpki 0.103.15 and webpki-root-certs 1.0.9, which
+  RUSTSEC-2026-0382 and RUSTSEC-2026-0383 affect: both could trust distrusted emSign
+  intermediates.
+
 - **rustls 0.23.46.** The `fetch` feature's TLS client, used by `metrics fetch`, `metrics scan`
   and `workload fetch`, moves from rustls 0.23.45, which RUSTSEC-2026-0346, -0347, -0348 and
   -0349 affect.
