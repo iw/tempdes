@@ -10,14 +10,16 @@
 #   metrics/    tempdes metrics fetch: the observed metrics (observed.yaml, baseline.yaml)
 #   workload/   tempdes workload fetch and import: the histories (histories/), and the
 #               workflows inferred from them (workflows.yaml)
+# With --period PERIOD too, a period's files go into a folder of its own in each:
+# metrics/PERIOD/ and workload/PERIOD/.
 
 description: __DESCRIPTION__   # shown by `tempdes profile list`
 
 scenario: scenario.yaml               # the cluster and its workload
 
-# Where the scenario's own relative paths resolve: its helm_values, dynamic_config_files and
-# calibration.observations. Unless given, this folder, so the profile can be copied anywhere;
-# a relative path is taken from this folder.
+# Where the scenario's own relative paths resolve: its helm_values, dynamic_config_files,
+# workflows (when it names a file) and calibration.observations. Unless given, this folder,
+# so the profile can be copied anywhere; a relative path is taken from this folder.
 #{off
 scenario_dir: .
 #}off

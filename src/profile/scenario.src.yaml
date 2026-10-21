@@ -133,7 +133,9 @@ workers:
 
 # The workflow types and their steps. `tempdes workload fetch --profile __NAME__` fetches
 # histories into workload/histories, and `tempdes workload import --profile __NAME__` infers
-# workflow types from them into workload/workflows.yaml: paste its entries in place of these.
+# workflow types from them into workload/workflows.yaml. To use those, name the file, or the
+# folder it is in, in place of these entries: `workflows: workload`. With --period PERIOD,
+# both commands use workload/PERIOD instead: `workflows: workload/PERIOD`.
 workflows:
   - type: OrderWorkflow
     namespace: orders                 # default: default

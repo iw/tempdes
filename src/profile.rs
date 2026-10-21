@@ -10,10 +10,14 @@
 //!   profile.yaml         the run options
 //!   scenario.yaml        the scenario: a copy, or the one `tempdes profile init` wrote
 //!   metrics/             observed metrics: what `tempdes metrics fetch --profile prod` writes,
-//!                        and the copies `profile save` makes (with their scrape files)
+//!                        observed.yaml, and in saved/ the copies `profile save` makes (with
+//!                        their scrape files)
 //!   workload/            what `tempdes workload fetch` and `import --profile prod` write:
 //!                        histories/ and workflows.yaml
 //! ```
+//!
+//! With `--period NAME`, those commands write a period's files in a folder of its own, such as
+//! `metrics/NAME/observed.yaml` and `workload/NAME/workflows.yaml`.
 //!
 //! `tempdes profile init` writes a profile to start from ([`template`]). A scenario file placed
 //! in the store as `<name>.yaml` is a profile too: the scenario is the whole run, and it has no
@@ -22,9 +26,9 @@
 //! The store is `$TEMPDES_PROFILES`, else `$XDG_CONFIG_HOME/tempdes/profiles`, else
 //! `~/.config/tempdes/profiles` (`%APPDATA%\tempdes\profiles` on Windows). On Unix its
 //! directories are created `0700` and its files `0600`. Files the scenario itself refers to
-//! (Helm values, dynamic config files, calibration observations) resolve against the profile's
-//! folder, unless `profile.yaml` names another as `scenario_dir`. `profile save` doesn't copy
-//! them: when the scenario refers to any, it names the folder they are in.
+//! (Helm values, dynamic config files, workflows, calibration observations) resolve against
+//! the profile's folder, unless `profile.yaml` names another as `scenario_dir`. `profile save`
+//! doesn't copy them: when the scenario refers to any, it names the folder they are in.
 
 pub mod template;
 
@@ -196,9 +200,9 @@ pub struct Profile {
     /// The scenario copy.
     pub scenario: PathBuf,
     /// The folder the scenario's own relative paths (Helm values, dynamic config files,
-    /// calibration observations) resolve against: the profile's folder when absent, and taken
-    /// from it when relative. `profile save` records the folder the scenario came from when the
-    /// scenario refers to files there, which aren't copied.
+    /// workflows, calibration observations) resolve against: the profile's folder when absent,
+    /// and taken from it when relative. `profile save` records the folder the scenario came
+    /// from when the scenario refers to files there, which aren't copied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario_dir: Option<PathBuf>,
     /// Copies of the observed-metrics files.
@@ -278,9 +282,15 @@ const PROFILE_FILE: &str = "profile.yaml";
 /// writes and `profile save` copies.
 pub const METRICS_DIR: &str = "metrics";
 
+/// Inside [`METRICS_DIR`]: the copies `profile save` makes, one folder per observations file.
+pub const SAVED_DIR: &str = "saved";
+
 /// Inside a profile's folder: the histories and the workflows inferred from them, which
 /// `tempdes workload fetch` and `import --profile` write.
 pub const WORKLOAD_DIR: &str = "workload";
+
+/// Inside [`WORKLOAD_DIR`], or a period's folder in it: the histories `workload fetch` writes.
+pub const HISTORIES_DIR: &str = "histories";
 
 impl Store {
     /// The store at its default location (see the module docs). Nothing is created until a
@@ -545,8 +555,9 @@ impl Store {
 }
 
 /// Write a profile's files into `dir`; returns the files copied into it.
-/// `refers`: the scenario refers to files (Helm values, dynamic config files, calibration
-/// observations), which stay where they are and resolve against the folder it came from.
+/// `refers`: the scenario refers to files (Helm values, dynamic config files, workflows,
+/// calibration observations), which stay where they are and resolve against the folder it
+/// came from.
 fn write_profile(
     dir: &Path,
     spec: &RunSpec,
@@ -557,8 +568,11 @@ fn write_profile(
     copy_private(&spec.scenario, &dir.join("scenario.yaml"))?;
     let mut observed = Vec::new();
     for (i, f) in spec.options.observed.iter().enumerate() {
-        let sub = PathBuf::from(METRICS_DIR).join((i + 1).to_string());
+        let sub = PathBuf::from(METRICS_DIR)
+            .join(SAVED_DIR)
+            .join((i + 1).to_string());
         create_private_dir(&dir.join(METRICS_DIR))?;
+        create_private_dir(&dir.join(METRICS_DIR).join(SAVED_DIR))?;
         create_private_dir(&dir.join(&sub))?;
         let file_name = f
             .file_name()
@@ -625,6 +639,27 @@ pub fn default_dir(env: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
         .or_else(|| env("APPDATA").filter(|d| cfg!(windows) && d.is_absolute()))
         .or_else(|| env("HOME").map(|h| h.join(".config")))?;
     Some(config.join("tempdes").join("profiles"))
+}
+
+/// Period names (`--period`) are one path component: letters, digits, `-` and `_`, other than
+/// the folders a profile keeps its own files in, [`HISTORIES_DIR`] and [`SAVED_DIR`].
+pub fn check_period(name: &str) -> anyhow::Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    if !ok {
+        bail!("invalid period name {name:?}: use letters, digits, '-' and '_'");
+    }
+    // on a filesystem that ignores case too
+    if let Some(r) = [HISTORIES_DIR, SAVED_DIR]
+        .iter()
+        .find(|r| r.eq_ignore_ascii_case(name))
+    {
+        bail!("a profile keeps its own files in {r:?}: choose another period name");
+    }
+    Ok(())
 }
 
 /// Profile names are one path component: letters, digits, `-`, `_` and `.`, not starting with
@@ -827,6 +862,18 @@ mod tests {
     }
 
     #[test]
+    fn periods_are_folders_of_their_own() {
+        for ok in ["202610012217", "burst", "peak-2", "a_b"] {
+            assert!(check_period(ok).is_ok(), "{ok}");
+        }
+        let long = "x".repeat(65);
+        // nor the folders a profile keeps its own files in, in any case
+        for bad in ["", "../x", "a/b", "a.b", ".x", "histories", "Saved", &long] {
+            assert!(check_period(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn save_load_derive_and_remove() {
         let src = temp_dir("src");
         let store = Store::at(temp_dir("store").join("profiles"));
@@ -852,8 +899,8 @@ mod tests {
             .save("prod", &spec, Some("private cluster".into()), false)
             .unwrap();
         assert!(saved.dir.join("scenario.yaml").is_file());
-        assert!(saved.dir.join("metrics/1/observed.yaml").is_file());
-        assert!(saved.dir.join("metrics/1/scrape.prom").is_file());
+        assert!(saved.dir.join("metrics/saved/1/observed.yaml").is_file());
+        assert!(saved.dir.join("metrics/saved/1/scrape.prom").is_file());
         assert_eq!(saved.copied.len(), 3);
 
         #[cfg(unix)]

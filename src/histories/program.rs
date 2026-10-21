@@ -185,9 +185,10 @@ fn workers(fleets: &BTreeMap<&str, Fleet<'_>>, opts: &Options, yaml: &mut String
     }
     let _ = writeln!(
         yaml,
-        "# Worker fleets, one per task queue: uncomment them and set the pollers and slots,\n\
-         # which histories don't record. `processes` counts the processes seen running tasks:\n\
-         # fewer than ran if the histories are a sample, more if processes were replaced.\n\
+        "# Worker fleets, one per task queue, for the scenario's `workers:` (a scenario that names\n\
+         # this file reads only its workflows): set the pollers and slots, which histories don't\n\
+         # record. `processes` counts the processes seen running tasks: fewer than ran if the\n\
+         # histories are a sample, more if processes were replaced.\n\
          # workers:"
     );
     for (q, f) in fleets {

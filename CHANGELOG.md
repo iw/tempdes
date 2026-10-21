@@ -16,8 +16,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   result, so the prototype stays valid as the settings change.
 
 - **Profiles that move.** `scenario_dir` in `profile.yaml` is optional: without it, the
-  scenario's relative paths (Helm values, dynamic config files, calibration observations)
-  resolve in the profile's own folder, and a relative one is taken from that folder.
+  scenario's relative paths (Helm values, dynamic config files, workflows, calibration
+  observations) resolve in the profile's own folder, and a relative one is taken from that
+  folder.
   `profile init` doesn't write it, and `profile save` writes it only when the scenario refers
   to files, which stay where they are. A profile that keeps its files inside can be copied to
   another machine or store. Profiles saved before, with an absolute `scenario_dir`, read as
@@ -28,9 +29,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   into its `workload` folder (`histories/`). `workload import --profile NAME` reads
   `workload/histories` and writes `workload/workflows.yaml` rather than printing it. Relative
   paths are taken inside the folder, and absolute ones as given. `metrics fetch` says when the
-  profile doesn't read the file yet. `workload import -o` now writes its file readable only by
-  you, as it names your workflow and activity types and task queues. `profile save` now copies observed metrics into
-  `metrics/` too, rather than `observed/`; profiles saved before keep working as they are.
+  profile doesn't read the file yet, and `workload import` when the scenario doesn't. `workload
+  import -o` now writes its file readable only by you, as it names your workflow and activity
+  types and task queues, and warns before replacing one. `profile save` now copies observed
+  metrics into `metrics/saved/` too, rather than `observed/`; profiles saved before keep
+  working as they are.
+
+- **Periods.** With `--profile`, `--period NAME` on `metrics fetch`, `workload fetch` and
+  `workload import` keeps a period's files in folders of their own: `metrics/NAME/observed.yaml`
+  (and `baseline.yaml`), `workload/NAME/histories/` and `workload/NAME/workflows.yaml`. One
+  profile can then hold several load tests, each with its own scenario. A name is letters,
+  digits, `-` and `_`, such as `202610012217`; `histories` and `saved` are taken.
+
+- **Workflows from a file.** A scenario's `workflows:` can name a file instead of listing the
+  types: one holding its own `workflows:`, as `workload import` writes it, or the folder of a
+  `workflows.yaml`, as in `workflows: workload/202610012217`. The path resolves as the
+  scenario's other paths do, and `profile show` lists the file. Only its `workflows:` is read,
+  so a `workers:` block uncommented there is refused with a note to move it into the scenario.
+  The comment over the fleets the import writes says as much.
+
+- **`workload fetch` paces its requests.** One at a time, at most a listing a second, a tenth
+  of what each frontend allows a namespace by default, and five history reads a second; after
+  an answer, the next waits at least as long as the answer took. `--list-rate` and
+  `--history-rate` lower either. When the frontend refuses a request (HTTP
+  429 or 503, or through the Temporal CLI, which asks again itself until its deadline, a
+  deadline exceeded or a command over `--timeout`), the fetch waits, 2s and then twice as long
+  after each refusal in a row, and halves that kind's pace. After six refusals in a row it
+  stops and says so; what it wrote is kept, so running it again goes on. The summary counts the
+  requests made, and its next step names the profile and period.
 
 - **`workload fetch` through the Temporal CLI.** `--cli` lists and fetches with the Temporal CLI
   (`temporal workflow list`, `workflow show` and `operator namespace describe`), run with its

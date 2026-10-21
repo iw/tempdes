@@ -57,8 +57,12 @@ pub struct Scenario {
     pub namespaces: Vec<NamespaceSpec>,
     #[serde(default)]
     pub workers: Vec<WorkerFleetSpec>,
-    #[serde(default)]
+    /// The workflow types: those written in the scenario, or read from the file its
+    /// `workflows:` names.
+    #[serde(skip)]
     pub workflows: Vec<WorkflowSpec>,
+    #[serde(default, rename = "workflows")]
+    workflows_written: Workflows,
     #[serde(default)]
     pub load: LoadSpec,
     #[serde(default)]
@@ -472,6 +476,65 @@ pub enum IdPattern {
     Unique,
 }
 
+/// `workflows:` as the scenario writes it: the workflow types, or the path of a file holding
+/// them under its own `workflows:` (what `tempdes workload import` writes), or of a folder with
+/// a `workflows.yaml`.
+#[derive(Clone, Debug)]
+enum Workflows {
+    Inline(Vec<WorkflowSpec>),
+    File(String),
+}
+
+impl Default for Workflows {
+    fn default() -> Self {
+        Workflows::Inline(Vec::new())
+    }
+}
+
+impl<'de> Deserialize<'de> for Workflows {
+    // by the node's kind rather than untagged, which would hide a mistyped key in an entry
+    // behind "matches no variant"
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Workflows;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a list of workflow types, or the path of a file or folder holding them",
+                )
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Workflows, E> {
+                Ok(Workflows::File(s.to_string()))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Workflows, A::Error> {
+                Vec::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(Workflows::Inline)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Workflows, E> {
+                Ok(Workflows::default())
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Workflows, E> {
+                Ok(Workflows::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// A file of workflow types, as `tempdes workload import` writes it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowsFile {
+    #[serde(default)]
+    workflows: Vec<WorkflowSpec>,
+    /// read only to say where it belongs
+    #[serde(default)]
+    workers: Option<serde::de::IgnoredAny>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowSpec {
@@ -872,14 +935,15 @@ impl Scenario {
     }
 
     /// Load `path`, resolving the scenario's own relative paths (Helm values, dynamic config
-    /// files, calibration observations) against `base_dir` rather than the file's folder. A
-    /// saved profile keeps a copy of the scenario away from its original folder.
+    /// files, workflows, calibration observations) against `base_dir` rather than the file's
+    /// folder. A saved profile keeps a copy of the scenario away from its original folder.
     pub fn load_with_base(path: &Path, base_dir: &Path) -> anyhow::Result<Scenario> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading scenario {}", path.display()))?;
         let mut sc: Scenario = serde_saphyr::from_str(&text)
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         sc.base_dir = base_dir.to_path_buf();
+        sc.read_workflows()?;
         if let Some(h) = sc.cluster.helm_values.clone() {
             let hp = sc.resolve_path(&h);
             sc.import_notes = crate::config::helm::apply(&mut sc, &hp)?;
@@ -891,15 +955,54 @@ impl Scenario {
     pub fn parse_str(text: &str) -> anyhow::Result<Scenario> {
         let mut sc: Scenario = serde_saphyr::from_str(text).map_err(|e| anyhow::anyhow!("{e}"))?;
         sc.base_dir = PathBuf::from(".");
+        sc.read_workflows()?;
         sc.validate()?;
         Ok(sc)
     }
 
-    /// Files the scenario itself refers to (Helm values, dynamic config files, calibration
-    /// observations), as written in the scenario.
+    /// Take the workflow types from `workflows:`, reading the file it names, or the
+    /// `workflows.yaml` in the folder it names.
+    fn read_workflows(&mut self) -> anyhow::Result<()> {
+        let written = match &mut self.workflows_written {
+            Workflows::Inline(v) => {
+                self.workflows = std::mem::take(v);
+                return Ok(());
+            }
+            Workflows::File(p) => p.clone(),
+        };
+        let file = if self.resolve_path(&written).is_dir() {
+            format!("{}/workflows.yaml", written.trim_end_matches(['/', '\\']))
+        } else {
+            written
+        };
+        let path = self.resolve_path(&file);
+        anyhow::ensure!(
+            path.exists(),
+            "workflows: {} doesn't exist; `tempdes workload import` writes the workflows a scenario can name",
+            path.display()
+        );
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading workflows {}", path.display()))?;
+        let read: WorkflowsFile = serde_saphyr::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        anyhow::ensure!(
+            read.workers.is_none(),
+            "{}: only its `workflows:` is read; move its `workers:` into the scenario",
+            path.display()
+        );
+        self.workflows = read.workflows;
+        self.workflows_written = Workflows::File(file);
+        Ok(())
+    }
+
+    /// Files the scenario itself refers to (Helm values, dynamic config files, the workflows
+    /// file, calibration observations), as written in the scenario.
     pub fn referenced_files(&self) -> Vec<String> {
         let mut files: Vec<String> = self.cluster.helm_values.iter().cloned().collect();
         files.extend(self.dynamic_config_files.iter().cloned());
+        if let Workflows::File(f) = &self.workflows_written {
+            files.push(f.clone());
+        }
         if let Some(c) = &self.calibration {
             files.extend(c.observations.iter().cloned());
         }

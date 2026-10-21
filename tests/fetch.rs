@@ -640,7 +640,23 @@ fn with_a_profile_observations_go_into_its_metrics_folder() {
     let elsewhere = store.join("elsewhere.yaml");
     assert!(fetch(&["-o", elsewhere.to_str().unwrap()]).status.success());
     assert!(elsewhere.is_file());
-    // a profile that doesn't exist says how to start one
+    // a period has a folder of its own
+    let out = fetch(&[
+        "--period",
+        "202610012217",
+        "--baseline-end",
+        "2026-10-01 21:55",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(metrics.join("202610012217/observed.yaml").is_file());
+    assert!(metrics.join("202610012217/baseline.yaml").is_file());
+    assert!(
+        stderr.contains("as `observed: [metrics/202610012217/observed.yaml]`"),
+        "{stderr}"
+    );
+    // a period is a name, not a path, and needs a profile
+    assert!(!fetch(&["--period", "../up"]).status.success());
     let mut args = vec![
         "metrics",
         "fetch",
@@ -648,7 +664,12 @@ fn with_a_profile_observations_go_into_its_metrics_folder() {
         &url,
         "--end",
         "2026-10-01T22:17:00Z",
+        "--period",
+        "202610012217",
     ];
+    assert!(!tempdes(&store, &args).status.success());
+    args.truncate(6);
+    // a profile that doesn't exist says how to start one
     args.extend(["--profile", "nope"]);
     let out = tempdes(&store, &args);
     assert!(!out.status.success());

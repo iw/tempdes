@@ -64,7 +64,8 @@ enum WorkloadCmd {
     /// Fetch histories for `import` from a Temporal frontend's HTTP API: the executions started
     /// in a window, counted by type, and up to `--limit` of each spread over it, without their
     /// payloads. It connects as the Temporal CLI does, from a `temporal.toml` profile and
-    /// `TEMPORAL_*` environment variables.
+    /// `TEMPORAL_*` environment variables. Requests go one at a time, at most a listing and five
+    /// history reads a second, and wait when the frontend refuses them.
     #[cfg(feature = "fetch")]
     Fetch(Box<WorkloadFetchArgs>),
 }
@@ -99,6 +100,17 @@ struct WorkloadFetchArgs {
     /// inside it.
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
+    /// With --profile, a folder of its own in `workload` for this period's histories:
+    /// workload/PERIOD/histories. Letters, digits, '-' and '_'.
+    #[arg(long, value_name = "PERIOD", requires = "profile")]
+    period: Option<String>,
+    /// Listing requests a second at most, 1/s or fewer: listings share each frontend's
+    /// visibility limit for the namespace (10/s by default) with the Web UI and other clients.
+    #[arg(long, value_name = "RATE", value_parser = parse_rate, default_value = "1/s")]
+    list_rate: f64,
+    /// History reads a second at most, a page of a history each, 5/s or fewer.
+    #[arg(long, value_name = "RATE", value_parser = parse_rate, default_value = "5/s")]
+    history_rate: f64,
     /// Profile in Temporal's client config file [default: TEMPORAL_PROFILE, else `default`].
     #[arg(long, value_name = "NAME")]
     temporal_profile: Option<String>,
@@ -149,6 +161,10 @@ struct ImportArgs {
     /// when relative, are inside it, and the output is workflows.yaml unless --output says.
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
+    /// With --profile, read and write in this period's folder in `workload`, as `workload
+    /// fetch --period` wrote it: workload/PERIOD/histories into workload/PERIOD/workflows.yaml.
+    #[arg(long, value_name = "PERIOD", requires = "profile")]
+    period: Option<String>,
     /// Namespace of the imported workflow types.
     #[arg(long, default_value = "default")]
     namespace: String,
@@ -169,43 +185,102 @@ struct ImportArgs {
 /// When profile `name` doesn't read the observations in `file` yet, say how to make it.
 #[cfg(feature = "fetch")]
 fn observed_hint(name: &str, file: &std::path::Path) {
-    let same = |a: &std::path::Path| match (std::fs::canonicalize(a), std::fs::canonicalize(file)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == file,
-    };
     let Ok(entry) = profile::Store::open().and_then(|s| s.load(name)) else {
         return;
     };
-    let listed = entry.spec.options.observed.iter().any(|f| same(f));
+    let listed = entry
+        .spec
+        .options
+        .observed
+        .iter()
+        .any(|f| same_file(f, file));
     let calibrated = entry.spec.load_scenario().is_ok_and(|sc| {
-        sc.calibration
-            .as_ref()
-            .is_some_and(|c| c.observations.iter().any(|o| same(&sc.resolve_path(o))))
+        sc.calibration.as_ref().is_some_and(|c| {
+            c.observations
+                .iter()
+                .any(|o| same_file(&sc.resolve_path(o), file))
+        })
     });
     if !listed && !calibrated {
-        // inside the profile, relative and with `/` between the parts, as profile.yaml takes it
-        // on any platform; elsewhere, as it is
-        let shown = match file.strip_prefix(&entry.path) {
-            Ok(rel) => rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/"),
-            Err(_) => file.display().to_string(),
-        };
         eprintln!(
-            "profile {name} doesn't read it yet: list it in its profile.yaml as `observed: [{shown}]`"
+            "profile {name} doesn't read it yet: list it in its profile.yaml as `observed: [{}]`",
+            relative_to(&entry.path, file)
         );
     }
 }
 
 /// The folder in profile `name` where its fetched and imported files go (`metrics` or
-/// `workload`), created private if it isn't there yet.
-fn profile_area(name: &str, sub: &str) -> anyhow::Result<PathBuf> {
-    let dir = profile::Store::open()?.folder(name)?.join(sub);
+/// `workload`), or the folder of `period` in it, created private if it isn't there yet.
+fn profile_area(name: &str, sub: &str, period: Option<&str>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = period {
+        profile::check_period(p)?;
+    }
+    let mut dir = profile::Store::open()?.folder(name)?.join(sub);
     profile::create_private_dir(&dir)?;
+    if let Some(p) = period {
+        dir.push(p);
+        profile::create_private_dir(&dir)?;
+    }
     eprintln!("using profile {name} ({})", dir.display());
     Ok(dir)
+}
+
+/// Whether `a` and `b` are the same file.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// `file` as a file in `folder` refers to it: relative, with `/` between the parts as YAML
+/// takes it on any platform, or as it is when it is elsewhere.
+fn relative_to(folder: &std::path::Path, file: &std::path::Path) -> String {
+    let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    let rel = file
+        .strip_prefix(folder)
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            real(file)?
+                .strip_prefix(real(folder)?)
+                .ok()
+                .map(PathBuf::from)
+        });
+    match rel {
+        Some(rel) => rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+        None => file.display().to_string(),
+    }
+}
+
+/// When the scenario of profile `name` doesn't take its workflows from `file` yet, say how to
+/// make it.
+fn workflows_hint(name: &str, file: &std::path::Path) {
+    let Ok(entry) = profile::Store::open().and_then(|s| s.load(name)) else {
+        return;
+    };
+    let Ok(sc) = entry.spec.load_scenario() else {
+        return;
+    };
+    let reads = sc
+        .referenced_files()
+        .iter()
+        .any(|f| same_file(&sc.resolve_path(f), file));
+    if !reads {
+        // a folder's workflows.yaml is named by the folder
+        let named = match file.file_name() {
+            Some(f) if f == "workflows.yaml" => file.parent().unwrap_or(file),
+            _ => file,
+        };
+        eprintln!(
+            "profile {name} doesn't read it yet: set its scenario's `workflows: {}`",
+            relative_to(&entry.spec.scenario_dir, named)
+        );
+    }
 }
 
 fn parse_rate(s: &str) -> Result<f64, String> {
@@ -440,6 +515,10 @@ struct FetchArgs {
     /// when relative, are inside it.
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
+    /// With --profile, a folder of its own in `metrics` for this period's observations:
+    /// metrics/PERIOD/observed.yaml. Letters, digits, '-' and '_'.
+    #[arg(long, value_name = "PERIOD", requires = "profile")]
+    period: Option<String>,
     /// Also write the window ending here, such as the run's start.
     #[arg(long)]
     baseline_end: Option<String>,
@@ -595,7 +674,7 @@ pub fn main() -> anyhow::Result<ExitCode> {
                 let output = a.output.unwrap_or_else(|| PathBuf::from("observed.yaml"));
                 let (output, baseline_out) = match &a.profile {
                     Some(name) => {
-                        let area = profile_area(name, profile::METRICS_DIR)?;
+                        let area = profile_area(name, profile::METRICS_DIR, a.period.as_deref())?;
                         (
                             profile::within(&area, &output),
                             a.baseline_out.map(|b| profile::within(&area, &b)),
@@ -648,7 +727,15 @@ pub fn main() -> anyhow::Result<ExitCode> {
 
 #[cfg(feature = "fetch")]
 fn cmd_workload_fetch(a: WorkloadFetchArgs) -> anyhow::Result<ExitCode> {
-    use crate::histories::fetch::{Cli, Via};
+    use crate::histories::fetch::{Cli, LIST_PER_S, READ_PER_S, Via};
+    anyhow::ensure!(
+        a.list_rate <= LIST_PER_S,
+        "--list-rate can only lower the pace, 1/s at most: listings share each frontend's visibility limit for the namespace (frontend.namespaceRPS.visibility, 10/s by default) with the Web UI and other clients"
+    );
+    anyhow::ensure!(
+        a.history_rate <= READ_PER_S,
+        "--history-rate can only lower the pace, 5/s at most"
+    );
     let via = match a.cli {
         // the CLI reads its own configuration
         Some(program) => Via::Cli(Cli {
@@ -676,10 +763,29 @@ fn cmd_workload_fetch(a: WorkloadFetchArgs) -> anyhow::Result<ExitCode> {
             }
         }
     };
-    let output = a.output.unwrap_or_else(|| PathBuf::from("histories"));
+    // import finds them by itself where they go by default
+    let found = a.profile.is_some() && a.output.is_none();
+    let output = a
+        .output
+        .unwrap_or_else(|| PathBuf::from(profile::HISTORIES_DIR));
     let output = match &a.profile {
-        Some(name) => profile::within(&profile_area(name, profile::WORKLOAD_DIR)?, &output),
+        Some(name) => profile::within(
+            &profile_area(name, profile::WORKLOAD_DIR, a.period.as_deref())?,
+            &output,
+        ),
         None => output,
+    };
+    let next = match &a.profile {
+        Some(name) if found => format!(
+            "tempdes workload import --profile {name}{} --namespace <namespace in your scenario>",
+            a.period
+                .as_ref()
+                .map_or(String::new(), |p| format!(" --period {p}"))
+        ),
+        _ => format!(
+            "tempdes workload import {} --namespace <namespace in your scenario> -o workflows.yaml",
+            output.display()
+        ),
     };
     let summary = crate::histories::fetch::fetch(&crate::histories::fetch::FetchArgs {
         via,
@@ -691,8 +797,14 @@ fn cmd_workload_fetch(a: WorkloadFetchArgs) -> anyhow::Result<ExitCode> {
         limit: a.limit,
         output,
         timeout_s: a.timeout,
+        pace: crate::histories::fetch::Pace {
+            list_per_s: a.list_rate,
+            read_per_s: a.history_rate,
+            ..Default::default()
+        },
     })?;
     eprint!("{summary}");
+    eprintln!("next: {next}");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -709,9 +821,9 @@ fn cmd_import(a: ImportArgs) -> anyhow::Result<ExitCode> {
     };
     let (paths, output) = match &a.profile {
         Some(name) => {
-            let area = profile_area(name, profile::WORKLOAD_DIR)?;
+            let area = profile_area(name, profile::WORKLOAD_DIR, a.period.as_deref())?;
             let paths = if a.paths.is_empty() {
-                vec![area.join("histories")]
+                vec![area.join(profile::HISTORIES_DIR)]
             } else {
                 a.paths.iter().map(|p| profile::within(&area, p)).collect()
             };
@@ -724,9 +836,18 @@ fn cmd_import(a: ImportArgs) -> anyhow::Result<ExitCode> {
     eprint!("{}", program.summary);
     match output {
         Some(f) => {
+            if f.exists() {
+                eprintln!(
+                    "warning: replacing {}: a scenario that names it reads the new workflows, and edits made to it are lost",
+                    f.display()
+                );
+            }
             // it names your workflow types, activity types and task queues
             profile::write_private(&f, program.yaml.as_bytes())?;
             eprintln!("wrote {}", f.display());
+            if let Some(name) = &a.profile {
+                workflows_hint(name, &f);
+            }
         }
         None => print!("{}", program.yaml),
     }
