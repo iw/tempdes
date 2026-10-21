@@ -183,10 +183,18 @@ fn observed_hint(name: &str, file: &std::path::Path) {
             .is_some_and(|c| c.observations.iter().any(|o| same(&sc.resolve_path(o))))
     });
     if !listed && !calibrated {
-        let rel = file.strip_prefix(&entry.path).unwrap_or(file);
+        // inside the profile, relative and with `/` between the parts, as profile.yaml takes it
+        // on any platform; elsewhere, as it is
+        let shown = match file.strip_prefix(&entry.path) {
+            Ok(rel) => rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/"),
+            Err(_) => file.display().to_string(),
+        };
         eprintln!(
-            "profile {name} doesn't read it yet: list it in its profile.yaml as `observed: [{}]`",
-            rel.display()
+            "profile {name} doesn't read it yet: list it in its profile.yaml as `observed: [{shown}]`"
         );
     }
 }
