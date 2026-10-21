@@ -9,6 +9,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`workload fetch` through the Temporal CLI.** `--cli` lists and fetches with the Temporal CLI
+  (`temporal workflow list`, `workflow show` and `operator namespace describe`), run with its
+  own configuration, for a frontend that only its gRPC port reaches. `--namespace` and
+  `--address` are passed on, and `--cli-arg` passes anything else, such as
+  `--cli-arg=--env=prod`. Payloads are dropped whether the CLI prints them encoded or decoded,
+  and workflow IDs containing `/`, which the HTTP API can't take, are fetched.
+
+- **`workload fetch` slice by slice.** The window is listed one slice at a time (`--slice`, a
+  minute by default; a window of more than 1,440 slices gets longer ones). `fetch.yaml` counts
+  each type's starts and closes in every slice, how its executions stood when listed, and the
+  p50, p90, p99 and max durations of the closed ones. The summary gives each type a line: when
+  its starts ran and peaked, its statuses and its durations. A `fetch.yaml` written before
+  reads as it did.
+
 - **`metrics fetch` records the dispatch path.** It adds six metrics that tempdes doesn't read
   yet, to compare with a simulation by eye:
   - **Waits:** `cache_latency` for mutable state, which is mostly the wait for a workflow's

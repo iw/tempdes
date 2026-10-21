@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use tempdes::envconfig::{Choice, Loaded, load_with};
-use tempdes::histories::fetch::{FetchArgs, fetch};
+use tempdes::histories::fetch::{Cli, FetchArgs, Via, fetch};
 use tempdes::histories::{Options, import, read_manifest};
 
 /// A payload as the frontend sends it with `noPayloadShorthand`: `{"card":"4111"}`.
@@ -168,6 +168,46 @@ const EXECUTIONS: [Execution; 6] = [
     ("Shipment", "s-2", "r-s2", 481_000, Some(("o-2", "r-o2"))),
 ];
 
+/// An execution as visibility lists it. Each closes when its history ends, 1.55s after it
+/// started, except `s-2`, still running.
+fn info(e: &Execution) -> Value {
+    let mut v = json!({
+        "execution": {"workflowId": e.1, "runId": e.2},
+        "type": {"name": e.0},
+        "startTime": at(e.3),
+        "status": "WORKFLOW_EXECUTION_STATUS_COMPLETED",
+        "closeTime": at(e.3 + 1550),
+        "historyLength": "11",
+        "memo": {"fields": {"customer": payloads()["payloads"][0].clone()}},
+    });
+    if e.1 == "s-2" {
+        v["status"] = json!("WORKFLOW_EXECUTION_STATUS_RUNNING");
+        v.as_object_mut().unwrap().remove("closeTime");
+    }
+    if let Some((wid, rid)) = e.4 {
+        v["parentExecution"] = json!({"workflowId": wid, "runId": rid});
+    }
+    v
+}
+
+/// The start times a visibility query asks for, in ms after 01:00 on 2026-10-07: `StartTime
+/// >= 'A' AND StartTime < 'B'`.
+fn slice(query: &str) -> (i64, i64) {
+    let ms = |after: &str| -> i64 {
+        let t = query
+            .split(after)
+            .nth(1)
+            .unwrap()
+            .split('\'')
+            .next()
+            .unwrap();
+        assert!(t.starts_with("2026-10-07T") && t.ends_with('Z'), "{t}");
+        let n = |r: std::ops::Range<usize>| t[r].parse::<i64>().unwrap();
+        ((n(11..13) - 1) * 3600 + n(14..16) * 60 + n(17..19)) * 1000
+    };
+    (ms("StartTime >= '"), ms("StartTime < '"))
+}
+
 /// The stand-in's answer: status, content type and body.
 fn answer(path: &str, params: &BTreeMap<String, String>) -> (u16, &'static str, Value) {
     let json = "application/json";
@@ -182,31 +222,20 @@ fn answer(path: &str, params: &BTreeMap<String, String>) -> (u16, &'static str, 
         );
     }
     if path == "/api/v1/namespaces/orders/workflows" {
-        let query = &params["query"];
-        if !query.contains("2026-10-07T01:20:00Z") {
-            return (200, json, json!({}));
-        }
-        let info = |e: &Execution| {
-            let mut v = json!({
-                "execution": {"workflowId": e.1, "runId": e.2},
-                "type": {"name": e.0},
-                "startTime": at(e.3),
-                "status": "WORKFLOW_EXECUTION_STATUS_COMPLETED",
-                "historyLength": "11",
-                "memo": {"fields": {"customer": payloads()["payloads"][0].clone()}},
-            });
-            if let Some((wid, rid)) = e.4 {
-                v["parentExecution"] = json!({"workflowId": wid, "runId": rid});
-            }
-            v
-        };
-        let page: Vec<Value> = match params.get("nextPageToken").map(String::as_str) {
-            None => EXECUTIONS[..3].iter().map(info).collect(),
-            Some("cGFnZTI=") => EXECUTIONS[3..].iter().map(info).collect(),
+        let (from, to) = slice(&params["query"]);
+        let matching: Vec<Value> = EXECUTIONS
+            .iter()
+            .filter(|e| (from..to).contains(&(e.3 as i64)))
+            .map(info)
+            .collect();
+        // a page of one, so that a slice with two executions takes two pages
+        let (page, next) = match params.get("nextPageToken").map(String::as_str) {
+            None => (&matching[..matching.len().min(1)], matching.len() > 1),
+            Some("cGFnZTI=") => (&matching[1..], false),
             Some(t) => panic!("unknown list token {t}"),
         };
         let mut body = json!({"executions": page});
-        if !params.contains_key("nextPageToken") {
+        if next {
             body["nextPageToken"] = json!("cGFnZTI=");
         }
         return (200, json, body);
@@ -326,11 +355,14 @@ fn profile(dir: &Path) -> Loaded {
 
 fn args(url: &str, profile: Loaded, output: PathBuf) -> FetchArgs {
     FetchArgs {
-        profile,
-        // the profile's API key turns TLS on; the stand-in speaks plain HTTP
-        http_url: Some(url.to_string()),
+        via: Via::Http {
+            profile,
+            // the profile's API key turns TLS on; the stand-in speaks plain HTTP
+            http_url: Some(url.to_string()),
+        },
         end: "2026-10-07T01:20:00Z".into(),
         window: "15m".into(),
+        slice: "1m".into(),
         types: Vec::new(),
         query: None,
         limit: 300,
@@ -353,18 +385,31 @@ fn fetched_histories_import_without_their_payloads() {
         assert_eq!(r.headers["grpc-metadata-tenant-id"], "t1", "{}", r.path);
     }
     assert_eq!(reqs[0].path, "/api/v1/namespaces/orders");
-    // the window's executions, page by page
+    // the window's executions, a minute at a time, page by page
     let lists: Vec<&Request> = reqs
         .iter()
         .filter(|r| r.path == "/api/v1/namespaces/orders/workflows")
         .collect();
-    assert_eq!(lists.len(), 2);
+    let firsts: Vec<&&Request> = lists
+        .iter()
+        .filter(|r| !r.params.contains_key("nextPageToken"))
+        .collect();
+    assert_eq!(firsts.len(), 15);
     assert_eq!(
-        lists[0].params["query"],
-        "StartTime >= '2026-10-07T01:05:00Z' AND StartTime < '2026-10-07T01:20:00Z'"
+        firsts[0].params["query"],
+        "StartTime >= '2026-10-07T01:05:00Z' AND StartTime < '2026-10-07T01:06:00Z'"
     );
-    assert_eq!(lists[0].params["pageSize"], "1000");
-    assert_eq!(lists[1].params["nextPageToken"], "cGFnZTI=");
+    assert_eq!(
+        firsts[14].params["query"],
+        "StartTime >= '2026-10-07T01:19:00Z' AND StartTime < '2026-10-07T01:20:00Z'"
+    );
+    assert_eq!(firsts[0].params["pageSize"], "1000");
+    // the minutes with two executions took a second page each
+    let seconds: Vec<&String> = lists
+        .iter()
+        .filter_map(|r| r.params.get("nextPageToken"))
+        .collect();
+    assert_eq!(seconds, ["cGFnZTI=", "cGFnZTI="]);
     // histories page by page, with payloads in a shape that can be dropped
     let histories: Vec<&Request> = reqs
         .iter()
@@ -433,6 +478,31 @@ fn fetched_histories_import_without_their_payloads() {
         .map(|t| (t.name.as_str(), t.started, t.children, t.fetched))
         .collect();
     assert_eq!(counts, [("Order", 4, 0, 2), ("Shipment", 2, 2, 2)]);
+    // minute by minute: Order starts at 01:06, 01:08, 01:10 and 01:11, each closing 1.55s later
+    assert_eq!(m.slice_s, 60.0);
+    let minutes = |v: &[u64]| -> Vec<usize> { (0..v.len()).filter(|i| v[*i] > 0).collect() };
+    let order = &m.types[0];
+    let started = &order.started_by_slice.as_ref().unwrap().0;
+    assert_eq!(started.len(), 15);
+    assert_eq!(minutes(started), [1, 3, 5, 6]);
+    assert_eq!(
+        minutes(&order.closed_by_slice.as_ref().unwrap().0),
+        [1, 3, 5, 6]
+    );
+    assert_eq!(order.status, BTreeMap::from([("Completed".to_string(), 4)]));
+    assert_eq!(order.duration_s.unwrap().p50, 1.55);
+    let ship = &m.types[1];
+    assert_eq!(
+        ship.status,
+        BTreeMap::from([("Completed".to_string(), 1), ("Running".to_string(), 1)])
+    );
+    // the one still running hasn't closed
+    assert_eq!(minutes(&ship.closed_by_slice.as_ref().unwrap().0), [1]);
+    assert!(
+        summary
+            .contains("started 01:06-01:11, busiest 01:06 at 0.017/s; 4 Completed; ran p50 1.55s"),
+        "{summary}"
+    );
     assert!(summary.contains("1 skipped"), "{summary}");
     assert!(
         summary.contains("1 was deleted between listing and fetching"),
@@ -476,4 +546,168 @@ fn an_empty_window_says_how_long_the_namespace_keeps_executions() {
     assert!(err.contains("keeps closed executions for 30 days"), "{err}");
     // nothing was written
     assert!(!base.join("histories").exists());
+}
+
+/// A stand-in Temporal CLI: a shell script answering `operator namespace describe`, `workflow
+/// list` and `workflow show` from files beside it, and logging each call's arguments.
+#[cfg(unix)]
+fn fake_cli(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let script = dir.join("temporal");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$*" >> "$dir/calls.log"
+case "$1 $2" in
+"operator namespace") cat "$dir/namespace.json" ;;
+"workflow list") cat "$dir/list.jsonl" ;;
+"workflow show")
+  for a in "$@"; do case "$a" in --run-id=*) rid="${a#--run-id=}" ;; esac; done
+  if [ -f "$dir/$rid.json" ]; then cat "$dir/$rid.json"
+  else echo "Error: unable to show workflow: workflow execution not found" >&2; exit 1; fi ;;
+*) echo "Error: unexpected command: $*" >&2; exit 2 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let namespace = json!({
+        "namespaceInfo": {"name": "orders"},
+        "config": {"workflowExecutionRetentionTtl": "2592000s"},
+    });
+    std::fs::write(dir.join("namespace.json"), namespace.to_string()).unwrap();
+    let list: String = EXECUTIONS
+        .iter()
+        .map(|e| info(e).to_string() + "\n")
+        .collect();
+    std::fs::write(dir.join("list.jsonl"), list).unwrap();
+    // every history but o-3's, deleted since it was listed, as the CLI prints them
+    for e in EXECUTIONS.iter().filter(|e| e.2 != "r-o3") {
+        let activity = if e.0 == "Order" { "Charge" } else { "Ship" };
+        let doc = json!({"events": events(e.0, activity, e.3, e.4)});
+        std::fs::write(dir.join(format!("{}.json", e.2)), doc.to_string()).unwrap();
+    }
+    script
+}
+
+fn cli_args(cli: Cli, slice: &str, output: PathBuf) -> FetchArgs {
+    FetchArgs {
+        via: Via::Cli(cli),
+        end: "2026-10-07T01:20:00Z".into(),
+        window: "15m".into(),
+        slice: slice.into(),
+        types: Vec::new(),
+        query: None,
+        limit: 300,
+        output,
+        timeout_s: 10.0,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_cli_lists_and_fetches_with_its_own_configuration() {
+    let base = fresh_dir("cli");
+    let cli = Cli {
+        program: fake_cli(&base.join("bin")),
+        namespace: Some("orders".into()),
+        address: None,
+        args: vec!["--env".into(), "test".into()],
+    };
+    let out = base.join("histories");
+    // the stand-in lists every execution whatever the query, so the window is one slice
+    let summary = fetch(&cli_args(cli, "15m", out.clone())).unwrap();
+
+    // the namespace, the window, then the histories: each call with the namespace and the
+    // arguments passed through
+    let log = std::fs::read_to_string(base.join("bin/calls.log")).unwrap();
+    let calls: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        calls[0],
+        "operator namespace describe --output=json --namespace=orders --env test"
+    );
+    assert_eq!(
+        calls[1],
+        "workflow list --query=StartTime >= '2026-10-07T01:05:00Z' AND StartTime < '2026-10-07T01:20:00Z' \
+         --output=jsonl --namespace=orders --env test"
+    );
+    assert!(
+        calls[2..]
+            .iter()
+            .all(|c| c.starts_with("workflow show --workflow-id=")
+                && c.ends_with(" --output=json --namespace=orders --env test")),
+        "{calls:?}"
+    );
+    // over gRPC, an ID with a '/' can be asked for
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("--workflow-id=o/4 --run-id=r-o4")),
+        "{calls:?}"
+    );
+
+    // the histories, without their payloads or failure messages
+    let mut files: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            "fetch.yaml",
+            "r-o1.json",
+            "r-o2.json",
+            "r-o4.json",
+            "r-s1.json",
+            "r-s2.json"
+        ]
+    );
+    for f in &files {
+        let text = std::fs::read_to_string(out.join(f)).unwrap();
+        for gone in [SECRET, "4111", "at charge()"] {
+            assert!(!text.contains(gone), "{gone} in {f}");
+        }
+    }
+    let m = read_manifest(&out.join("fetch.yaml")).unwrap();
+    assert_eq!(m.namespace, "orders");
+    let counts: Vec<(&str, u64, u64, u64)> = m
+        .types
+        .iter()
+        .map(|t| (t.name.as_str(), t.started, t.children, t.fetched))
+        .collect();
+    assert_eq!(counts, [("Order", 4, 0, 3), ("Shipment", 2, 2, 2)]);
+    assert!(
+        summary.contains("1 was deleted between listing and fetching"),
+        "{summary}"
+    );
+    assert!(!summary.contains("skipped"), "{summary}");
+
+    // import reads them as it reads the HTTP API's
+    let program = import(std::slice::from_ref(&out), &Options::default()).unwrap();
+    assert!(
+        program
+            .summary
+            .contains("from the 4 starts `workload fetch` counted over 15.0m"),
+        "{}",
+        program.summary
+    );
+}
+
+#[test]
+fn a_missing_cli_says_how_to_point_at_it() {
+    let base = fresh_dir("nocli");
+    let cli = Cli {
+        program: base.join("no-such-temporal"),
+        namespace: Some("orders".into()),
+        address: None,
+        args: Vec::new(),
+    };
+    let err = fetch(&cli_args(cli, "1m", base.join("histories")))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("cannot run the Temporal CLI"), "{err}");
+    assert!(err.contains("--cli PATH"), "{err}");
 }
