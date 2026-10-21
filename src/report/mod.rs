@@ -238,6 +238,9 @@ pub struct TaskResult {
     /// admitted at once, with those still held counted as held until the window's end (all
     /// zero unless the limiter is enforced)
     pub held_back: Lat,
+    /// each run's wait for a worker of the host scheduler's pool: the scheduling wait without
+    /// the waits for workflows' execution queues (not a Temporal metric)
+    pub pool_wait: Lat,
     pub processing: Lat,
     pub queue: Lat,
     pub mean_attempts: f64,
@@ -882,6 +885,7 @@ pub fn analyze_window(
             load: Lat::of(&o.load_latency),
             schedule: Lat::of(&o.schedule_latency),
             held_back: Lat::of(&held),
+            pool_wait: Lat::of(&o.pool_wait),
             processing: Lat::of(&o.processing),
             queue: Lat::of(&o.queue_latency),
             mean_attempts: o.attempts.mean(),

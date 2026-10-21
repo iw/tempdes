@@ -922,6 +922,7 @@ fn execution_queue_waits_are_not_put_down_to_scheduler_workers() {
         .expect("workflow task timeouts");
     assert!(timeouts.exec_queue_runs_per_s > 0.0, "{timeouts:?}");
     assert!(timeouts.schedule.p99_ms > 200.0, "{timeouts:?}");
+    assert!(timeouts.pool_wait.p99_ms < 200.0, "{timeouts:?}");
     assert!(
         !r.hotspots
             .iter()

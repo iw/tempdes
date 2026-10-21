@@ -1139,27 +1139,18 @@ fn locks(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
 /// History task queues. A run's scheduling wait (`task_latency_schedule`) starts once the task
 /// scheduler's rate limiter admits it (`task_scheduler` reports the hold-back), and a run on a
 /// workflow's execution queue waits for that queue's workers rather than the pool's. So a
-/// wait is put down to busy scheduler workers only as far as the pool's own wait shows it.
+/// wait is put down to busy scheduler workers by the runs' wait for a pool worker alone.
 fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     let h = &c.r.history;
-    // the pool's wait for a worker per queue category, on its busiest history pod
-    let pool_wait = |i: usize| {
-        c.r.services
-            .iter()
-            .flat_map(|s| &s.pods)
-            .filter_map(|p| p.scheduler_wait_p99_ms)
-            .map(|w| w[i])
-            .fold(0.0, f64::max)
-    };
     for t in &h.tasks {
-        let (cat, i) = if t.task_type.starts_with("Transfer") {
-            ("transfer", 0)
+        let cat = if t.task_type.starts_with("Transfer") {
+            "transfer"
         } else if t.task_type.starts_with("Timer") {
-            ("timer", 1)
+            "timer"
         } else {
-            ("visibility", 2)
+            "visibility"
         };
-        let wait = t.schedule.p99_ms.min(pool_wait(i));
+        let wait = t.pool_wait.p99_ms;
         if wait > 200.0 {
             let sev = if wait > 2000.0 {
                 Severity::Critical

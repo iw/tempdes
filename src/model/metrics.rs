@@ -53,6 +53,10 @@ pub struct TaskStats {
     /// admitted it at once (not a Temporal metric). Holds still open are in
     /// [`Metrics::open_holds`].
     pub held_back: Histogram,
+    /// each run's wait for a worker of the host scheduler's pool, the part of the scheduling
+    /// wait that busy workers make: a run on a workflow's execution queue waits for that
+    /// queue's workers instead (not a Temporal metric)
+    pub pool_wait: Histogram,
     pub processing: Histogram,
     pub queue_latency: Histogram,
     pub attempts: Histogram,

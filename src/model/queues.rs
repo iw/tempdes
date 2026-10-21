@@ -415,6 +415,8 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
         let owner = ctx.shard_owner(shard);
         // the submission that gets the run into the scheduler (`SetScheduledTime`)
         let mut enq = now();
+        // how long the run waited for a pool worker, when it took one
+        let mut pool_waited = None;
         let permit = match routed.take() {
             Some((pod, workers)) => RunPermit::Exec(workers.acquire().await, pod),
             None => {
@@ -433,6 +435,7 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
                     .await;
                 }
                 let p = sched.acquire(channel, weight).await;
+                pool_waited = Some(now() - enq);
                 match exec_queue(&ctx, owner, c, exec_key, false) {
                     Some(workers) => {
                         drop(p);
@@ -461,6 +464,9 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
             let ts = &mut m.tasks[task.kind.idx()];
             ts.runs += 1;
             ts.schedule_latency.record(start - enq);
+            if let Some(w) = pool_waited {
+                ts.pool_wait.record(w);
+            }
             ts.processing.record(proc_time);
             m.task_pod(owner);
         }

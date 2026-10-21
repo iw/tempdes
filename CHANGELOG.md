@@ -376,9 +376,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   time at every submission (`reader.go`, `rescheduler.go`) and records the wait as each run
   ends (`Execute`). The wait now starts when the limiter admits the task, and every run records
   its own, failed runs included.
-  - **The pool's own wait.** The busy-worker hotspot is now rated by the pool's wait for a
-    worker, so the waits of runs on workflows' execution queues aren't put down to busy workers
-    either.
+  - **The pool's own wait.** The busy-worker hotspot is now rated by each run's wait for a
+    worker of the pool, so the waits of runs on workflows' execution queues aren't put down to
+    busy workers either.
   - **The hold-back.** How long the enforced limiter held tasks back is measured on its own,
     per task type and per namespace, and the limiter's hotspot takes its evidence and severity
     from it. While the limiter is enforced, the history task table shows it.

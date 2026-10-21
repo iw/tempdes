@@ -623,9 +623,9 @@ knobs.
   * The history task scheduler's limiter, enforced, is rated by how long it holds tasks back:
     a p99 over 1 s for any task type or any namespace is a warning, and over 5 s critical. In
     shadow mode it is reported for information.
-  * A `history-queue` hotspot for a scheduler worker is rated by the pool's own wait for a
-    worker, on the busiest history pod, so it means the workers were busy. It leaves out the
-    limiter's hold-back, and the waits of runs on workflows' execution queues.
+  * A `history-queue` hotspot for a scheduler worker is rated by the runs' wait for a worker of
+    the pool, per task type, so it means the workers were busy. It leaves out the limiter's
+    hold-back, and the waits of runs on workflows' execution queues.
 * **Throughput.** Two tests, each flagged only beyond a 3σ Poisson band:
   * *start shortfall*: accepted starts fall short of the offered rate, or more than 1% of
     starts fail;
