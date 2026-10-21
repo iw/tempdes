@@ -14,10 +14,12 @@ pub mod parse;
 pub mod program;
 pub mod trace;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use serde_saphyr::FlowSeq;
 
 pub use program::{Counted, Options, Program};
 
@@ -34,6 +36,10 @@ pub struct Manifest {
     pub end: String,
     /// its length in seconds
     pub window_s: f64,
+    /// the length of the slices it was listed in, one at a time, in seconds (0 when written
+    /// before slicing)
+    #[serde(default)]
+    pub slice_s: f64,
     /// the visibility query that listed them
     pub query: String,
     pub types: Vec<TypeCount>,
@@ -50,6 +56,45 @@ pub struct TypeCount {
     pub children: u64,
     /// histories written
     pub fetched: u64,
+    /// started in each slice of the window, in order
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by_slice: Option<FlowSeq<Vec<u64>>>,
+    /// closed in each slice of the window (those that closed after it aren't in any)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by_slice: Option<FlowSeq<Vec<u64>>>,
+    /// how they stood when listed: `Running`, or how they closed (`Completed`, `Failed`, ...)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub status: BTreeMap<String, u64>,
+    /// start to close of those closed when listed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_s: Option<Durations>,
+}
+
+/// A distribution of durations, in seconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Durations {
+    pub p50: f64,
+    pub p90: f64,
+    pub p99: f64,
+    pub max: f64,
+}
+
+impl Durations {
+    /// Nearest-rank quantiles of `v`, to the millisecond; None when it is empty.
+    pub fn of(mut v: Vec<f64>) -> Option<Durations> {
+        if v.is_empty() {
+            return None;
+        }
+        v.sort_by(f64::total_cmp);
+        let ms = |x: f64| (x * 1000.0).round() / 1000.0;
+        let q = |p: f64| ms(v[((p * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1]);
+        Some(Durations {
+            p50: q(0.5),
+            p90: q(0.9),
+            p99: q(0.99),
+            max: ms(v[v.len() - 1]),
+        })
+    }
 }
 
 /// Read a manifest that `workload fetch` wrote.
@@ -119,4 +164,36 @@ fn read(f: &Path) -> Result<trace::Trace, String> {
     let text = std::fs::read_to_string(f).map_err(|e| e.to_string())?;
     let events = parse::parse_history(&text)?;
     trace::trace(&events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_take_nearest_rank_quantiles() {
+        let d = Durations::of((1..=100).map(f64::from).rev().collect()).unwrap();
+        assert_eq!((d.p50, d.p90, d.p99, d.max), (50.0, 90.0, 99.0, 100.0));
+        let one = Durations::of(vec![1.234_567]).unwrap();
+        assert_eq!((one.p50, one.max), (1.235, 1.235));
+        assert_eq!(Durations::of(Vec::new()), None);
+    }
+
+    #[test]
+    fn a_manifest_from_before_slicing_still_reads() {
+        let m: Manifest = serde_saphyr::from_str(
+            "namespace: orders\nstart: a\nend: b\nwindow_s: 900.0\nquery: q\ntypes:\n- type: Order\n  started: 4\n  children: 0\n  fetched: 2\n",
+        )
+        .unwrap();
+        assert_eq!(m.slice_s, 0.0);
+        assert_eq!(m.types[0].started_by_slice, None);
+        // and a new one reads back as written
+        let mut new = m.clone();
+        new.slice_s = 60.0;
+        new.types[0].started_by_slice = Some(FlowSeq(vec![1, 0, 3]));
+        new.types[0].duration_s = Durations::of(vec![2.0]);
+        let yaml = serde_saphyr::to_string(&new).unwrap();
+        assert!(yaml.contains("started_by_slice: [1, 0, 3]"), "{yaml}");
+        assert_eq!(serde_saphyr::from_str::<Manifest>(&yaml).unwrap(), new);
+    }
 }

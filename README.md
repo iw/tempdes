@@ -128,8 +128,9 @@ tempdes metrics template > observed.yaml
 tempdes metrics show examples/metrics/observed.yaml
 
 # workloads from workflow histories (steps, durations, attempts, retry policies), fetched from
-# the cluster with a Temporal CLI profile, or exported
+# the cluster with a Temporal CLI profile, through the Temporal CLI itself, or exported
 tempdes workload fetch --temporal-profile prod --end 2026-10-01T22:17Z --window 15m -o histories
+tempdes workload fetch --cli --namespace orders --end 2026-10-01T22:17Z --window 2h -o histories
 tempdes workload import histories/ --namespace orders -o workflows.yaml
 ```
 
@@ -517,11 +518,12 @@ execution). A child type whose histories weren't given is written as a stub with
 
 ### Fetching histories
 
-`workload fetch` lists the executions started in the window and counts them by type. It then
-fetches up to `--limit` of each type (300 by default), spread over the window, page by page.
-The histories go into the directory one file per execution, with `fetch.yaml` holding the
-counts. `--type` (repeatable) keeps to some workflow types, and `--query` adds a visibility
-filter, such as `TaskQueue = 'orders'`.
+`workload fetch` lists the executions started in the window, one slice of it at a time
+(`--slice`, a minute by default), and counts them by type. It then fetches up to `--limit` of
+each type (300 by default), spread over the window, page by page. The histories go into the
+directory one file per execution, with `fetch.yaml` holding the counts. `--type` (repeatable)
+keeps to some workflow types, and `--query` adds a visibility filter, such as
+`TaskQueue = 'orders'`.
 
 * **Connecting.** It connects as the Temporal CLI does, from a profile in Temporal's
   `temporal.toml`, with the `TEMPORAL_*` environment variables over it:
@@ -539,6 +541,19 @@ filter, such as `TaskQueue = 'orders'`.
   So the profile's host is reached on port 7243 unless `--http-url` says otherwise. From
   outside the cluster, for example, run `kubectl port-forward svc/<release>-frontend 7243` and
   pass `--http-url http://localhost:7243`.
+* **Through the Temporal CLI.** `--cli` runs the Temporal CLI instead (`temporal workflow
+  list`, `workflow show` and `operator namespace describe`), for a frontend that only its gRPC
+  port reaches. The CLI uses its own configuration: its environment variables, config file and
+  defaults. `--namespace` and `--address` are passed on, and `--cli-arg` passes anything else
+  to every command, such as `--cli-arg=--env=prod`. `--cli PATH` runs a CLI that isn't on your
+  `PATH`, and `--timeout` limits each command. The connection line names the flags passed
+  through, never their values.
+* **Over the window.** For each type, `fetch.yaml` counts the executions started in each slice
+  (`started_by_slice`) and closed in each (`closed_by_slice`), how they stood when listed
+  (`status`: `Running`, `Completed`, `Failed`, ...), and how long the closed ones ran
+  (`duration_s`: p50, p90, p99 and max). The summary puts this on a line per type, for
+  example `started 10:12-10:34, busiest 10:29 at 126/s; 99812 Completed, 188 Failed; ran p50
+  1.3h, p99 1.4h, max 1.5h`. A window longer than 1,440 slices is listed in longer ones.
 * **Start rates.** `import` takes each type's start rate from `fetch.yaml`: the executions
   started in the window without a parent, over the window's length. `--rate` still wins.
 * **Privacy.** Payloads (inputs, results, details, memos, headers and search attribute values)
@@ -547,7 +562,7 @@ filter, such as `TaskQueue = 'orders'`.
   activity types, task queues and worker hosts, so keep them with your private profiles.
 * **Limits.** Histories last only as long as the namespace's retention, and `fetch` warns when
   the window ended longer ago than that. A workflow ID containing `/` can't be asked for over
-  the HTTP API, so it is counted but not fetched. Run again into the same directory, `fetch`
+  the HTTP API, so it is counted but not fetched; the Temporal CLI fetches it. Run again into the same directory, `fetch`
   fetches only the histories still missing; a different window or query needs another
   directory.
 

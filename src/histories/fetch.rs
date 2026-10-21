@@ -1,28 +1,35 @@
-//! `tempdes workload fetch`: histories read from a Temporal frontend's HTTP API, for `import`.
+//! `tempdes workload fetch`: histories read from a Temporal frontend, for `import`.
 //!
-//! The executions started in a window are listed (`ListWorkflowExecutions`) and counted by type.
-//! Up to `limit` of each type, spread evenly over the listing, are fetched page by page
-//! (`GetWorkflowExecutionHistory`) and written one file per execution, beside a manifest
-//! ([`super::Manifest`]) with the counts, from which `import` takes each type's start rate.
-//! Payloads (inputs, results, details, memos, headers and search attribute values), and
-//! failures' messages and stack traces, are dropped before anything is written.
+//! The executions started in a window are listed (`ListWorkflowExecutions`) one slice of the
+//! window at a time, and counted by type: in all and slice by slice, by how they stood when
+//! listed, and by how long the closed ones ran. Up to `limit` of each type, spread evenly over
+//! the listing, are fetched (`GetWorkflowExecutionHistory`) and written one file per execution,
+//! beside a manifest ([`super::Manifest`]) with the counts, from which `import` takes each type's
+//! start rate. Payloads (inputs, results, details, memos, headers and search attribute values),
+//! and failures' messages and stack traces, are dropped before anything is written.
 //!
-//! The frontend is reached as the Temporal CLI reaches it, from a client profile
-//! ([`crate::envconfig`]), but over its HTTP API: the same calls as gRPC, served on the
-//! frontend's `httpPort`, 7243 unless the cluster sets another.
+//! The frontend is reached one of two ways ([`Via`]):
+//!   - over its HTTP API, as the Temporal CLI would reach it from a client profile
+//!     ([`crate::envconfig`]): the same calls as gRPC, served on the frontend's `httpPort`, 7243
+//!     unless the cluster sets another;
+//!   - through the Temporal CLI itself (`temporal workflow list`, `workflow show` and `operator
+//!     namespace describe`), run once per call with the CLI's own configuration, for a frontend
+//!     only its gRPC port reaches.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
+use serde_saphyr::FlowSeq;
 use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
 
-use super::{MANIFEST, Manifest, TypeCount};
+use super::{Durations, MANIFEST, Manifest, TypeCount};
 use crate::envconfig::{Loaded, Profile};
 use crate::metrics::fetch::{iso, parse_time, window_secs};
 use crate::util::units::{fmt_rate, fmt_us};
@@ -33,15 +40,18 @@ pub const HTTP_PORT: u16 = 7243;
 /// The executions listed per page: the frontend's most (`frontend.visibilityMaxPageSize`).
 const PAGE_SIZE: u32 = 1000;
 
+/// The most slices a window is listed in; a longer window gets longer slices.
+const MAX_SLICES: f64 = 1440.0;
+
 pub struct FetchArgs {
-    /// the client profile, with the command line's overrides applied
-    pub profile: Loaded,
-    /// the frontend's HTTP API, when it isn't the profile's host on [`HTTP_PORT`]
-    pub http_url: Option<String>,
+    /// how the frontend is reached
+    pub via: Via,
     /// end of the window
     pub end: String,
     /// window length, e.g. `15m`
     pub window: String,
+    /// the window is listed one slice of this length at a time, e.g. `1m`
+    pub slice: String,
     /// only these workflow types
     pub types: Vec<String>,
     /// an extra visibility filter, ANDed with the window
@@ -49,92 +59,169 @@ pub struct FetchArgs {
     /// histories to fetch of each type
     pub limit: usize,
     pub output: PathBuf,
+    /// seconds allowed per request, or per Temporal CLI command
     pub timeout_s: f64,
+}
+
+/// How the frontend is reached.
+pub enum Via {
+    /// its HTTP API, with a client profile (the command line's overrides applied)
+    Http {
+        profile: Loaded,
+        /// the frontend's HTTP API, when it isn't the profile's host on [`HTTP_PORT`]
+        http_url: Option<String>,
+    },
+    /// the Temporal CLI
+    Cli(Cli),
+}
+
+/// The Temporal CLI, run with its own configuration: its environment variables and config file.
+pub struct Cli {
+    /// the `temporal` executable
+    pub program: PathBuf,
+    /// the namespace (`--namespace`), else the CLI's own
+    pub namespace: Option<String>,
+    /// the frontend's address (`--address`), else the CLI's own
+    pub address: Option<String>,
+    /// more arguments for every command, e.g. `--env` and `prod`
+    pub args: Vec<String>,
 }
 
 /// Fetch the histories; a summary of what was written.
 pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
     anyhow::ensure!(a.limit > 0, "--limit must be at least 1");
     let end = parse_time(&a.end)?;
-    let start = end - window_secs(&a.window)? as f64;
-    let p = &a.profile.profile;
-    let ns = p.namespace().to_string();
-    let query = visibility_query(start, end, &a.types, a.query.as_deref())?;
-    let fe = Frontend::new(p, a.http_url.as_deref(), a.timeout_s)?;
-    eprintln!(
-        "namespace {ns} at {} ({}), from {}",
-        fe.base,
-        fe.auth(p),
-        a.profile.origin
-    );
-    if fe.base.starts_with("http://") && fe.headers.iter().any(|(k, _)| k == "Authorization") {
-        eprintln!("warning: credentials are going over plain HTTP, unencrypted");
+    let window_s = window_secs(&a.window)? as f64;
+    let start = end - window_s;
+    let mut slice_s = (window_secs(&a.slice)? as f64).min(window_s);
+    let mut slice_label = if slice_s < window_s {
+        a.slice.clone()
+    } else {
+        a.window.clone()
+    };
+    let mut notes = Vec::new();
+    if window_s / slice_s > MAX_SLICES {
+        slice_s = (window_s / MAX_SLICES).ceil();
+        slice_label = fmt_us(slice_s * 1e6);
+        notes.push(format!(
+            "slices of {slice_label} rather than --slice {}, to list the window in at most {MAX_SLICES} of them",
+            a.slice
+        ));
     }
-    let progress = std::io::stderr().is_terminal();
+    let slices = (window_s / slice_s).ceil().max(1.0) as usize;
+    let query = visibility_query(start, end, &a.types, a.query.as_deref())?;
+    let source: Box<dyn Source + '_> = match &a.via {
+        Via::Http { profile, http_url } => {
+            let p = &profile.profile;
+            let fe = Frontend::new(p, http_url.as_deref(), a.timeout_s)?;
+            if fe.base.starts_with("http://")
+                && fe.headers.iter().any(|(k, _)| k == "Authorization")
+            {
+                eprintln!("warning: credentials are going over plain HTTP, unencrypted");
+            }
+            let connection = format!("at {} ({}), from {}", fe.base, fe.auth(p), profile.origin);
+            Box::new(HttpSource {
+                fe,
+                ns: p.namespace().to_string(),
+                connection,
+            })
+        }
+        Via::Cli(cli) => Box::new(CliSource {
+            cli,
+            timeout: Duration::from_secs_f64(a.timeout_s),
+        }),
+    };
     // the namespace exists, and its retention says whether the window's histories still do
-    let retention_s = fe.retention_s(&ns)?;
-    check_output(&a.output, &ns, &query)?;
+    let ns = source.namespace()?;
+    eprintln!("namespace {} {}", ns.name, ns.connection);
+    let progress = std::io::stderr().is_terminal();
+    check_output(&a.output, &ns.name, &query)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
-    let expired = retention_s.filter(|r| now - end > *r);
+    let expired = ns.retention_s.filter(|r| now - end > *r);
     if let Some(r) = expired {
         eprintln!(
-            "warning: the window ended {} ago, and {ns} keeps closed executions for {}: those of the window are likely deleted",
+            "warning: the window ended {} ago, and {} keeps closed executions for {}: those of the window are likely deleted",
             fmt_span(now - end),
+            ns.name,
             fmt_span(r)
         );
     }
 
-    // list and count
+    // list and count, slice by slice
     let mut listed: BTreeMap<String, Listed> = a
         .types
         .iter()
-        .map(|t| (t.clone(), Listed::default()))
+        .map(|t| (t.clone(), Listed::new(slices)))
         .collect();
-    let mut token: Option<String> = None;
+    let slice_of = |t: f64| (((t - start) / slice_s).floor().max(0.0) as usize).min(slices - 1);
+    let mut seen: HashSet<String> = HashSet::new();
     let mut n = 0usize;
-    loop {
-        let (execs, next) = fe.list(&ns, &query, token.as_deref())?;
-        for e in &execs {
+    for i in 0..slices {
+        let s0 = start + i as f64 * slice_s;
+        let s1 = (s0 + slice_s).min(end);
+        let q = visibility_query(s0, s1, &a.types, a.query.as_deref())?;
+        source.list(&ns.name, &q, &mut |e: &Value| {
             let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
-            let wtype = s(&e["type"]["name"]);
             let (wid, rid) = (
                 s(&e["execution"]["workflowId"]),
                 s(&e["execution"]["runId"]),
             );
-            let l = listed.entry(wtype).or_default();
+            // slices don't overlap, but an execution is never counted twice
+            if !rid.is_empty() && !seen.insert(rid.clone()) {
+                return;
+            }
+            n += 1;
+            let l = listed
+                .entry(s(&e["type"]["name"]))
+                .or_insert_with(|| Listed::new(slices));
             l.started += 1;
             if !s(&e["parentExecution"]["workflowId"]).is_empty() {
                 l.children += 1;
             }
-            // the HTTP API reads the workflow ID from the path, decoded, so an ID with a `/`
-            // can't be asked for
-            if wid.contains('/') || wid.is_empty() || rid.is_empty() {
-                l.unaddressable += 1;
-            } else {
-                l.runs.push((wid, rid));
+            let started = e["startTime"].as_str().and_then(|t| parse_time(t).ok());
+            l.started_by_slice[started.map_or(i, slice_of)] += 1;
+            if let Some(st) = status_name(&s(&e["status"])) {
+                *l.status.entry(st).or_default() += 1;
             }
-        }
-        n += execs.len();
+            if let Some(closed) = e["closeTime"].as_str().and_then(|t| parse_time(t).ok()) {
+                if let Some(t0) = started {
+                    l.durations.push((closed - t0).max(0.0));
+                }
+                if (start..end).contains(&closed) {
+                    l.closed_by_slice[slice_of(closed)] += 1;
+                }
+            }
+            match source.unaddressable(&wid) {
+                _ if wid.is_empty() || rid.is_empty() => {
+                    l.unaddressable += 1;
+                    l.why_skipped = Some("listed without a workflow or run ID");
+                }
+                Some(why) => {
+                    l.unaddressable += 1;
+                    l.why_skipped = Some(why);
+                }
+                None => l.runs.push((wid, rid)),
+            }
+        })?;
         if progress {
-            eprint!("\rlisted {n} executions");
-        }
-        token = next;
-        if token.is_none() {
-            break;
+            eprint!("\rlisted {n} executions, slice {}/{slices}", i + 1);
         }
     }
     if progress {
         eprintln!();
     }
     if n == 0 {
-        let mut msg =
-            format!("no executions in {ns} matched {query:?} (times without a zone are UTC)");
-        if let Some(r) = retention_s {
+        let mut msg = format!(
+            "no executions in {} matched {query:?} (times without a zone are UTC)",
+            ns.name
+        );
+        if let Some(r) = ns.retention_s {
             let _ = write!(
                 msg,
-                ". {ns} keeps closed executions for {}{}",
+                ". {} keeps closed executions for {}{}",
+                ns.name,
                 fmt_span(r),
                 if expired.is_some() {
                     ", and the window ended longer ago than that"
@@ -148,29 +235,29 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
 
     // choose the histories, and record the counts before fetching, so that a fetch that stops
     // part-way can be run again to finish
-    let chosen: Vec<(&String, Vec<&(String, String)>)> = listed
-        .iter()
-        .map(|(t, l)| {
-            (
-                t,
-                spread(l.runs.len(), a.limit).map(|i| &l.runs[i]).collect(),
-            )
-        })
+    let chosen: Vec<Vec<&(String, String)>> = listed
+        .values()
+        .map(|l| spread(l.runs.len(), a.limit).map(|i| &l.runs[i]).collect())
         .collect();
     let mut manifest = Manifest {
-        namespace: ns.clone(),
+        namespace: ns.name.clone(),
         start: iso(start),
         end: iso(end),
-        window_s: end - start,
+        window_s,
+        slice_s,
         query: query.clone(),
         types: listed
             .iter()
             .zip(&chosen)
-            .map(|((t, l), (_, runs))| TypeCount {
+            .map(|((t, l), runs)| TypeCount {
                 name: t.clone(),
                 started: l.started,
                 children: l.children,
                 fetched: runs.len() as u64,
+                started_by_slice: Some(FlowSeq(l.started_by_slice.clone())),
+                closed_by_slice: Some(FlowSeq(l.closed_by_slice.clone())),
+                status: l.status.clone(),
+                duration_s: Durations::of(l.durations.clone()),
             })
             .collect(),
     };
@@ -178,10 +265,10 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
     write_manifest(&a.output, &manifest)?;
 
     // fetch
-    let total: usize = chosen.iter().map(|(_, r)| r.len()).sum();
+    let total: usize = chosen.iter().map(Vec::len).sum();
     let (mut done, mut kept, mut gone) = (0usize, 0usize, 0usize);
     let mut shorthand = false;
-    for (count, (_, runs)) in manifest.types.iter_mut().zip(&chosen) {
+    for (count, runs) in manifest.types.iter_mut().zip(&chosen) {
         count.fetched = 0;
         for (wid, rid) in runs {
             done += 1;
@@ -194,12 +281,9 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
                 count.fetched += 1;
                 continue;
             }
-            match fe.history(&ns, wid, rid) {
-                Ok((mut events, short)) => {
+            match source.history(&ns.name, wid, rid)? {
+                Some((events, short)) => {
                     shorthand |= short;
-                    for e in &mut events {
-                        strip(e, short);
-                    }
                     let doc = json!({
                         "workflowId": wid,
                         "runId": rid,
@@ -210,13 +294,7 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
                     count.fetched += 1;
                 }
                 // deleted since it was listed (its retention ran out)
-                Err(e)
-                    if e.downcast_ref::<ApiError>()
-                        .is_some_and(|x| x.status == 404) =>
-                {
-                    gone += 1;
-                }
-                Err(e) => return Err(e),
+                None => gone += 1,
             }
         }
     }
@@ -233,11 +311,10 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
         .map(|t| t.name.len())
         .max()
         .unwrap_or(0);
-    let window_s = end - start;
     let _ = writeln!(
         out,
-        "executions started {} to {} ({}):",
-        manifest.start, manifest.end, a.window
+        "executions started {} to {} ({}), listed {slice_label} at a time:",
+        manifest.start, manifest.end, a.window,
     );
     for (t, l) in manifest.types.iter().zip(listed.values()) {
         let own = t.started - t.children;
@@ -260,14 +337,14 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
             "  {:<width$}  {started}; {} fetched",
             t.name, t.fetched
         );
-        if l.unaddressable > 0 {
-            let _ = write!(
-                out,
-                "; {} skipped: the HTTP API can't ask for workflow IDs containing '/'",
-                l.unaddressable
-            );
+        if let Some(why) = l.why_skipped {
+            let _ = write!(out, "; {} skipped: {why}", l.unaddressable);
         }
         let _ = writeln!(out);
+        let _ = writeln!(out, "  {:<width$}  {}", "", shape(l, start, end, slice_s));
+    }
+    for note in &notes {
+        let _ = writeln!(out, "{note}");
     }
     let _ = write!(
         out,
@@ -301,6 +378,73 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
     Ok(out)
 }
 
+/// A type's starts over the window, how its executions stood when listed, and how long the
+/// closed ones ran, on one line: `started 10:12-10:34, busiest 10:29 at 126/s; 99812
+/// Completed, 188 Failed; ran p50 1.3h, p99 1.4h, max 1.5h`.
+fn shape(l: &Listed, start: f64, end: f64, slice_s: f64) -> String {
+    let mut parts = Vec::new();
+    let at = |i: usize| -> String {
+        let t = iso(start + i as f64 * slice_s);
+        // to the minute, or to the second for slices shorter than one
+        t[11..if slice_s < 60.0 { 19 } else { 16 }].to_string()
+    };
+    let busy: Vec<usize> = (0..l.started_by_slice.len())
+        .filter(|i| l.started_by_slice[*i] > 0)
+        .collect();
+    if let (Some(&first), Some(&last)) = (busy.first(), busy.last()) {
+        let peak = busy
+            .iter()
+            .copied()
+            .max_by_key(|i| (l.started_by_slice[*i], std::cmp::Reverse(*i)))
+            .unwrap_or(first);
+        let len = slice_s.min(end - (start + peak as f64 * slice_s));
+        let rate = fmt_rate(l.started_by_slice[peak] as f64 / len);
+        parts.push(if first == last {
+            format!("started {} at {rate}", at(first))
+        } else {
+            format!(
+                "started {}-{}, busiest {} at {rate}",
+                at(first),
+                at(last),
+                at(peak)
+            )
+        });
+    }
+    if !l.status.is_empty() {
+        let mut st: Vec<(&String, &u64)> = l.status.iter().collect();
+        st.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let st: Vec<String> = st.iter().map(|(k, v)| format!("{v} {k}")).collect();
+        parts.push(st.join(", "));
+    }
+    if let Some(d) = Durations::of(l.durations.clone()) {
+        parts.push(format!(
+            "ran p50 {}, p99 {}, max {}",
+            fmt_us(d.p50 * 1e6),
+            fmt_us(d.p99 * 1e6),
+            fmt_us(d.max * 1e6)
+        ));
+    }
+    parts.join("; ")
+}
+
+/// A listed execution's status as its short name (`Completed`, `ContinuedAsNew`), whichever
+/// way the frontend spelled it; None when it gave none.
+fn status_name(s: &str) -> Option<String> {
+    let s = s.trim().trim_start_matches("WORKFLOW_EXECUTION_STATUS_");
+    if s.is_empty() || s.eq_ignore_ascii_case("unspecified") {
+        return None;
+    }
+    if !s.contains('_') && s.chars().any(|c| c.is_ascii_lowercase()) {
+        return Some(s.to_string());
+    }
+    Some(
+        s.split('_')
+            .filter(|w| !w.is_empty())
+            .map(|w| w[..1].to_ascii_uppercase() + &w[1..].to_ascii_lowercase())
+            .collect(),
+    )
+}
+
 /// A span of seconds, in days when it is that long.
 fn fmt_span(secs: f64) -> String {
     let days = secs / 86_400.0;
@@ -315,15 +459,38 @@ fn fmt_span(secs: f64) -> String {
 }
 
 /// A type's executions in the listing.
-#[derive(Default)]
 struct Listed {
     started: u64,
     /// started by another workflow
     children: u64,
     /// those whose histories can be asked for: (workflow ID, run ID)
     runs: Vec<(String, String)>,
-    /// those whose IDs the HTTP API can't take
+    /// those that can't, and why
     unaddressable: u64,
+    why_skipped: Option<&'static str>,
+    /// started, and closed, in each slice of the window
+    started_by_slice: Vec<u64>,
+    closed_by_slice: Vec<u64>,
+    /// how they stood when listed
+    status: BTreeMap<String, u64>,
+    /// seconds from start to close, of those closed
+    durations: Vec<f64>,
+}
+
+impl Listed {
+    fn new(slices: usize) -> Self {
+        Listed {
+            started: 0,
+            children: 0,
+            runs: Vec::new(),
+            unaddressable: 0,
+            why_skipped: None,
+            started_by_slice: vec![0; slices],
+            closed_by_slice: vec![0; slices],
+            status: BTreeMap::new(),
+            durations: Vec::new(),
+        }
+    }
 }
 
 /// The visibility query for executions started in `[start, end)`.
@@ -479,6 +646,290 @@ fn strip(v: &mut Value, shorthand: bool) {
         }
         _ => {}
     }
+}
+
+// --- where executions and histories come from -------------------------------------------------
+
+/// A namespace as a [`Source`] reaches it.
+struct Namespace {
+    name: String,
+    /// how long it keeps closed executions, in seconds
+    retention_s: Option<f64>,
+    /// how it is reached, for the connection line
+    connection: String,
+}
+
+/// Where executions and histories are read from.
+trait Source {
+    /// The namespace, which must exist.
+    fn namespace(&self) -> anyhow::Result<Namespace>;
+    /// Every execution matching `query`, as visibility lists them.
+    fn list(&self, ns: &str, query: &str, each: &mut dyn FnMut(&Value)) -> anyhow::Result<()>;
+    /// An execution's events with their payloads dropped, and whether the frontend sent the
+    /// payloads in shorthand; None when the execution is gone.
+    fn history(&self, ns: &str, wid: &str, rid: &str)
+    -> anyhow::Result<Option<(Vec<Value>, bool)>>;
+    /// Why a workflow ID can't be asked for, when it can't.
+    fn unaddressable(&self, _wid: &str) -> Option<&'static str> {
+        None
+    }
+}
+
+/// The frontend's HTTP API.
+struct HttpSource {
+    fe: Frontend,
+    ns: String,
+    connection: String,
+}
+
+impl Source for HttpSource {
+    fn namespace(&self) -> anyhow::Result<Namespace> {
+        Ok(Namespace {
+            name: self.ns.clone(),
+            retention_s: self.fe.retention_s(&self.ns)?,
+            connection: self.connection.clone(),
+        })
+    }
+
+    fn list(&self, ns: &str, query: &str, each: &mut dyn FnMut(&Value)) -> anyhow::Result<()> {
+        let mut token: Option<String> = None;
+        loop {
+            let (execs, next) = self.fe.list(ns, query, token.as_deref())?;
+            for e in &execs {
+                each(e);
+            }
+            token = next;
+            if token.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn history(
+        &self,
+        ns: &str,
+        wid: &str,
+        rid: &str,
+    ) -> anyhow::Result<Option<(Vec<Value>, bool)>> {
+        match self.fe.history(ns, wid, rid) {
+            Ok((mut events, short)) => {
+                for e in &mut events {
+                    strip(e, short);
+                }
+                Ok(Some((events, short)))
+            }
+            Err(e)
+                if e.downcast_ref::<ApiError>()
+                    .is_some_and(|x| x.status == 404) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn unaddressable(&self, wid: &str) -> Option<&'static str> {
+        // the HTTP API reads the workflow ID from the path, decoded, so an ID with a `/` can't
+        // be asked for
+        wid.contains('/')
+            .then_some("the HTTP API can't ask for workflow IDs containing '/'")
+    }
+}
+
+/// The Temporal CLI, run once per call.
+struct CliSource<'a> {
+    cli: &'a Cli,
+    timeout: Duration,
+}
+
+impl CliSource<'_> {
+    /// Run `temporal <args>` with the namespace and address, then the arguments passed
+    /// through: its standard output, or, when it fails, its standard error.
+    fn run(&self, ns: Option<&str>, args: &[String]) -> anyhow::Result<Result<Vec<u8>, String>> {
+        let mut cmd = Command::new(&self.cli.program);
+        cmd.args(args);
+        if let Some(ns) = ns.or(self.cli.namespace.as_deref()) {
+            cmd.arg(format!("--namespace={ns}"));
+        }
+        if let Some(a) = &self.cli.address {
+            cmd.arg(format!("--address={a}"));
+        }
+        cmd.args(&self.cli.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow!(
+                "cannot run the Temporal CLI as {}: {e}{}",
+                self.cli.program.display(),
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    " (give its path with --cli PATH)"
+                } else {
+                    ""
+                }
+            )
+        })?;
+        // read both pipes while it runs, so that neither fills up and stalls it
+        let mut stdout = child.stdout.take().context("the CLI's standard output")?;
+        let mut stderr = child.stderr.take().context("the CLI's standard error")?;
+        let out = std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = stdout.read_to_end(&mut b);
+            b
+        });
+        let err = std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = stderr.read_to_end(&mut b);
+            b
+        });
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "`temporal {}` took longer than --timeout ({})",
+                    args[..2.min(args.len())].join(" "),
+                    fmt_us(self.timeout.as_secs_f64() * 1e6)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let out = out.join().unwrap_or_default();
+        let err = String::from_utf8_lossy(&err.join().unwrap_or_default())
+            .trim()
+            .to_string();
+        Ok(if status.success() { Ok(out) } else { Err(err) })
+    }
+}
+
+impl Source for CliSource<'_> {
+    fn namespace(&self) -> anyhow::Result<Namespace> {
+        let args = ["operator", "namespace", "describe", "--output=json"].map(String::from);
+        let out = self.run(None, &args)?.map_err(|e| {
+            anyhow!(
+                "the Temporal CLI couldn't describe the namespace: {}",
+                brief(&e)
+            )
+        })?;
+        let v: Value = serde_json::from_slice(&out)
+            .context("reading `temporal operator namespace describe --output json`")?;
+        let name = v["namespaceInfo"]["name"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| self.cli.namespace.clone())
+            .context("the Temporal CLI described a namespace without naming it")?;
+        // the arguments passed through are named, never their values, which can be secrets
+        let mut connection = format!("through the Temporal CLI ({}", self.cli.program.display());
+        if let Some(a) = &self.cli.address {
+            let _ = write!(connection, ", at {a}");
+        }
+        let flags = flag_names(&self.cli.args);
+        if !flags.is_empty() {
+            let _ = write!(connection, ", with {}", flags.join(" "));
+        }
+        connection.push(')');
+        Ok(Namespace {
+            name,
+            retention_s: retention_of(&v),
+            connection,
+        })
+    }
+
+    fn list(&self, ns: &str, query: &str, each: &mut dyn FnMut(&Value)) -> anyhow::Result<()> {
+        let args = [
+            "workflow".into(),
+            "list".into(),
+            format!("--query={query}"),
+            "--output=jsonl".into(),
+        ];
+        let out = self
+            .run(Some(ns), &args)?
+            .map_err(|e| anyhow!("`temporal workflow list` failed: {}", brief(&e)))?;
+        for v in jsonl(&out).context("reading `temporal workflow list --output jsonl`")? {
+            each(&v);
+        }
+        Ok(())
+    }
+
+    fn history(
+        &self,
+        ns: &str,
+        wid: &str,
+        rid: &str,
+    ) -> anyhow::Result<Option<(Vec<Value>, bool)>> {
+        let args = [
+            "workflow".into(),
+            "show".into(),
+            format!("--workflow-id={wid}"),
+            format!("--run-id={rid}"),
+            "--output=json".into(),
+        ];
+        let out = match self.run(Some(ns), &args)? {
+            Ok(out) => out,
+            // deleted since it was listed
+            Err(e) if e.to_ascii_lowercase().contains("not found") => return Ok(None),
+            Err(e) => bail!("`temporal workflow show` for {wid} failed: {}", brief(&e)),
+        };
+        let v: Value = serde_json::from_slice(&out)
+            .with_context(|| format!("reading `temporal workflow show` for {wid}"))?;
+        let mut events = match v.get("events").or_else(|| v.pointer("/history/events")) {
+            Some(Value::Array(a)) => a.clone(),
+            _ => bail!("`temporal workflow show` for {wid} printed no events"),
+        };
+        // the CLI may print payloads decoded, as plain JSON: drop them by their shape, and by
+        // the fields that hold them
+        for e in &mut events {
+            strip(e, false);
+            strip(e, true);
+        }
+        Ok(Some((events, false)))
+    }
+}
+
+/// The values of JSON lines.
+fn jsonl(out: &[u8]) -> anyhow::Result<Vec<Value>> {
+    out.split(|b| *b == b'\n')
+        .enumerate()
+        .filter(|(_, line)| !line.trim_ascii().is_empty())
+        .map(|(i, line)| {
+            serde_json::from_slice(line).with_context(|| format!("line {} isn't JSON", i + 1))
+        })
+        .collect()
+}
+
+/// The gist of the CLI's standard error: its `Error:` line, else its first line, cut short.
+fn brief(stderr: &str) -> String {
+    let line = stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with("Error"))
+        .or_else(|| stderr.lines().find(|l| !l.trim().is_empty()))
+        .unwrap_or("no error message")
+        .trim();
+    let cut: String = line.chars().take(300).collect();
+    if cut.len() < line.len() {
+        format!("{cut}...")
+    } else {
+        cut
+    }
+}
+
+/// The flags among `args`, without their values: `--api-key=k` is `--api-key`.
+fn flag_names(args: &[String]) -> Vec<&str> {
+    args.iter()
+        .filter(|a| a.starts_with('-'))
+        .map(|a| a.split('=').next().unwrap_or(a))
+        .collect()
+}
+
+/// A described namespace's retention, in seconds.
+fn retention_of(v: &Value) -> Option<f64> {
+    v["config"]["workflowExecutionRetentionTtl"]
+        .as_str()
+        .and_then(|d| d.strip_suffix('s')?.parse().ok())
 }
 
 // --- the frontend's HTTP API ------------------------------------------------------------------
@@ -646,9 +1097,7 @@ impl Frontend {
                 }
                 _ => e,
             })?;
-        Ok(v["config"]["workflowExecutionRetentionTtl"]
-            .as_str()
-            .and_then(|d| d.strip_suffix('s')?.parse().ok()))
+        Ok(retention_of(&v))
     }
 
     /// A page of executions matching `query` (`ListWorkflowExecutions`), and the next page's
@@ -1061,6 +1510,67 @@ mod tests {
         assert_eq!(fmt_span(86_400.0), "1 day");
         assert_eq!(fmt_span(530_000.0), "6.1 days");
         assert_eq!(fmt_span(5400.0), "1.5h");
+    }
+
+    #[test]
+    fn statuses_read_by_their_short_names() {
+        let s = |x: &str| status_name(x);
+        assert_eq!(
+            s("WORKFLOW_EXECUTION_STATUS_COMPLETED").as_deref(),
+            Some("Completed")
+        );
+        assert_eq!(
+            s("WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW").as_deref(),
+            Some("ContinuedAsNew")
+        );
+        assert_eq!(
+            s("WORKFLOW_EXECUTION_STATUS_TIMED_OUT").as_deref(),
+            Some("TimedOut")
+        );
+        assert_eq!(s("Running").as_deref(), Some("Running"));
+        assert_eq!(s("WORKFLOW_EXECUTION_STATUS_UNSPECIFIED"), None);
+        assert_eq!(s(""), None);
+    }
+
+    #[test]
+    fn arguments_passed_to_the_cli_are_named_without_their_values() {
+        let args: Vec<String> = ["--env", "prod", "--api-key=s3cret", "-n", "x"]
+            .map(String::from)
+            .into();
+        assert_eq!(flag_names(&args), ["--env", "--api-key", "-n"]);
+    }
+
+    #[test]
+    fn cli_output_is_read_line_by_line() {
+        let v = jsonl(b"{\"a\":1}\n\n{\"b\":2}\n").unwrap();
+        assert_eq!(v, [json!({"a": 1}), json!({"b": 2})]);
+        let err = jsonl(b"{\"a\":1}\nnot json\n").unwrap_err().to_string();
+        assert!(err.contains("line 2"), "{err}");
+        // cobra prints its usage after the error: the error is what matters
+        let stderr = "Error: unknown flag: --nope\nUsage:\n  temporal workflow list [flags]\n";
+        assert_eq!(brief(stderr), "Error: unknown flag: --nope");
+        assert_eq!(brief("no such namespace\nmore"), "no such namespace");
+    }
+
+    #[test]
+    fn a_types_shape_reads_on_one_line() {
+        let mut l = Listed::new(4);
+        l.started_by_slice = vec![0, 6, 30, 0];
+        l.status = BTreeMap::from([("Completed".into(), 34), ("Failed".into(), 2)]);
+        l.durations = vec![60.0; 36];
+        // four minutes from 10:00
+        let start = parse_time("2026-10-20T10:00:00Z").unwrap();
+        assert_eq!(
+            shape(&l, start, start + 240.0, 60.0),
+            "started 10:01-10:02, busiest 10:02 at 0.500/s; 34 Completed, 2 Failed; ran p50 1.0m, p99 1.0m, max 1.0m"
+        );
+        // all in one slice
+        l.started_by_slice = vec![0, 0, 36, 0];
+        assert!(
+            shape(&l, start, start + 240.0, 60.0).starts_with("started 10:02 at 0.600/s;"),
+            "{}",
+            shape(&l, start, start + 240.0, 60.0)
+        );
     }
 
     #[test]

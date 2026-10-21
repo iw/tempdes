@@ -66,7 +66,7 @@ enum WorkloadCmd {
     /// payloads. It connects as the Temporal CLI does, from a `temporal.toml` profile and
     /// `TEMPORAL_*` environment variables.
     #[cfg(feature = "fetch")]
-    Fetch(WorkloadFetchArgs),
+    Fetch(Box<WorkloadFetchArgs>),
 }
 
 #[cfg(feature = "fetch")]
@@ -79,6 +79,10 @@ struct WorkloadFetchArgs {
     /// Window length: the executions started in it are listed.
     #[arg(long, default_value = "15m")]
     window: String,
+    /// List the window this much at a time; fetch.yaml counts each type's starts and closes
+    /// in every slice.
+    #[arg(long, default_value = "1m")]
+    slice: String,
     /// Only this workflow type (repeatable).
     #[arg(long = "type", value_name = "TYPE")]
     types: Vec<String>,
@@ -108,7 +112,25 @@ struct WorkloadFetchArgs {
     /// httpPort].
     #[arg(long, value_name = "URL")]
     http_url: Option<String>,
-    /// Seconds allowed per request.
+    /// Go through the Temporal CLI, `temporal` or the one at PATH, with its own configuration,
+    /// rather than the HTTP API: for a frontend only its gRPC port reaches.
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "temporal",
+        conflicts_with_all = ["http_url", "temporal_profile", "temporal_config"]
+    )]
+    cli: Option<PathBuf>,
+    /// An argument for every Temporal CLI command, e.g. `--cli-arg=--env=prod` (repeatable).
+    #[arg(
+        long = "cli-arg",
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        requires = "cli"
+    )]
+    cli_args: Vec<String>,
+    /// Seconds allowed per request, or per Temporal CLI command.
     #[arg(long, default_value_t = 60.0)]
     timeout: f64,
 }
@@ -541,30 +563,46 @@ pub fn main() -> anyhow::Result<ExitCode> {
         Cmd::Workload { cmd } => match cmd {
             WorkloadCmd::Import(a) => cmd_import(a),
             #[cfg(feature = "fetch")]
-            WorkloadCmd::Fetch(a) => cmd_workload_fetch(a),
+            WorkloadCmd::Fetch(a) => cmd_workload_fetch(*a),
         },
     }
 }
 
 #[cfg(feature = "fetch")]
 fn cmd_workload_fetch(a: WorkloadFetchArgs) -> anyhow::Result<ExitCode> {
-    let mut profile = crate::envconfig::load(&crate::envconfig::Choice {
-        file: a.temporal_config,
-        profile: a.temporal_profile,
-    })?;
-    if let Some(address) = a.address {
-        profile.profile.address = Some(address);
-        profile.origin.push_str(", with --address");
-    }
-    if let Some(ns) = a.namespace {
-        profile.profile.namespace = Some(ns);
-        profile.origin.push_str(", with --namespace");
-    }
+    use crate::histories::fetch::{Cli, Via};
+    let via = match a.cli {
+        // the CLI reads its own configuration
+        Some(program) => Via::Cli(Cli {
+            program,
+            namespace: a.namespace,
+            address: a.address,
+            args: a.cli_args,
+        }),
+        None => {
+            let mut profile = crate::envconfig::load(&crate::envconfig::Choice {
+                file: a.temporal_config,
+                profile: a.temporal_profile,
+            })?;
+            if let Some(address) = a.address {
+                profile.profile.address = Some(address);
+                profile.origin.push_str(", with --address");
+            }
+            if let Some(ns) = a.namespace {
+                profile.profile.namespace = Some(ns);
+                profile.origin.push_str(", with --namespace");
+            }
+            Via::Http {
+                profile,
+                http_url: a.http_url,
+            }
+        }
+    };
     let summary = crate::histories::fetch::fetch(&crate::histories::fetch::FetchArgs {
-        profile,
-        http_url: a.http_url,
+        via,
         end: a.end,
         window: a.window,
+        slice: a.slice,
         types: a.types,
         query: a.query,
         limit: a.limit,
