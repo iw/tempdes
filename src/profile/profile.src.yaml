@@ -3,8 +3,8 @@
 # Options given on the command line apply on top: lists grow, and single values replace these.
 #
 # Keep it private. The profile store (`tempdes profile dir`) is outside any repository, and
-# its folders are readable only by you. Paths here are relative to this folder, except
-# scenario_dir. Commented-out settings show an example: uncomment to use them.
+# its folders are readable only by you. Paths here are relative to this folder, and so is
+# scenario_dir unless absolute. Commented-out settings show an example: uncomment to use them.
 #
 # With --profile __NAME__, what tempdes fetches and imports goes into this folder:
 #   metrics/    tempdes metrics fetch: the observed metrics (observed.yaml, baseline.yaml)
@@ -16,8 +16,11 @@ description: __DESCRIPTION__   # shown by `tempdes profile list`
 scenario: scenario.yaml               # the cluster and its workload
 
 # Where the scenario's own relative paths resolve: its helm_values, dynamic_config_files and
-# calibration.observations. This folder, so that they stay in the profile.
-scenario_dir: __PROFILE_DIR__
+# calibration.observations. Unless given, this folder, so the profile can be copied anywhere;
+# a relative path is taken from this folder.
+#{off
+scenario_dir: .
+#}off
 
 # Observed metrics, to calibrate against and to validate the run with, as
 # `tempdes metrics fetch --profile __NAME__ ...` writes them.

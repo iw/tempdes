@@ -15,6 +15,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   line `profile list` shows. A test switches every commented-out setting on and runs the
   result, so the prototype stays valid as the settings change.
 
+- **Profiles that move.** `scenario_dir` in `profile.yaml` is optional: without it, the
+  scenario's relative paths (Helm values, dynamic config files, calibration observations)
+  resolve in the profile's own folder, and a relative one is taken from that folder.
+  `profile init` doesn't write it, and `profile save` writes it only when the scenario refers
+  to files, which stay where they are. A profile that keeps its files inside can be copied to
+  another machine or store. Profiles saved before, with an absolute `scenario_dir`, read as
+  they did.
+
 - **Fetching into a profile.** With `--profile NAME`, `metrics fetch` writes into the profile's
   `metrics` folder in the store (`observed.yaml`, and `baseline.yaml`), and `workload fetch`
   into its `workload` folder (`histories/`). `workload import --profile NAME` reads

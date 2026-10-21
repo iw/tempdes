@@ -6,8 +6,6 @@
 //! tests load so that every setting the template shows stays valid. Lines between `#{alt` and
 //! `#}alt` are alternatives to settings that are on, commented out in both.
 
-use std::path::Path;
-
 const PROFILE: &str = include_str!("profile.src.yaml");
 const SCENARIO: &str = include_str!("scenario.src.yaml");
 
@@ -23,11 +21,11 @@ pub enum Variant {
     Full,
 }
 
-/// The files of profile `name`, kept in `dir`: (file name, contents).
+/// The files of profile `name`: (file name, contents). They name no folder, so the profile can
+/// be moved or copied.
 pub fn render(
     variant: Variant,
     name: &str,
-    dir: &Path,
     description: Option<&str>,
 ) -> [(&'static str, String); 2] {
     // a JSON string is a YAML double-quoted string
@@ -40,7 +38,6 @@ pub fn render(
                 "__DESCRIPTION__",
                 &quote(description.unwrap_or(DESCRIPTION)),
             )
-            .replace("__PROFILE_DIR__", &quote(&dir.display().to_string()))
     };
     [
         ("profile.yaml", fill(PROFILE)),
@@ -114,7 +111,7 @@ mod tests {
             let closes = src.lines().filter(|l| l.trim().starts_with("#}")).count();
             assert_eq!(opens, closes, "{name}");
         }
-        for (_, text) in render(Variant::Full, "p-1", Path::new("/x/y"), Some("it's \"q\"")) {
+        for (_, text) in render(Variant::Full, "p-1", Some("it's \"q\"")) {
             assert!(!text.contains("__"), "{text}");
             assert!(!text.contains("#{") && !text.contains("#}"), "{text}");
         }

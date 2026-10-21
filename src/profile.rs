@@ -22,8 +22,9 @@
 //! The store is `$TEMPDES_PROFILES`, else `$XDG_CONFIG_HOME/tempdes/profiles`, else
 //! `~/.config/tempdes/profiles` (`%APPDATA%\tempdes\profiles` on Windows). On Unix its
 //! directories are created `0700` and its files `0600`. Files the scenario itself refers to
-//! (Helm values, dynamic config files, calibration observations) are not copied: they still
-//! resolve against the scenario's original folder.
+//! (Helm values, dynamic config files, calibration observations) resolve against the profile's
+//! folder, unless `profile.yaml` names another as `scenario_dir`. `profile save` doesn't copy
+//! them: when the scenario refers to any, it names the folder they are in.
 
 pub mod template;
 
@@ -194,9 +195,12 @@ pub struct Profile {
     pub description: Option<String>,
     /// The scenario copy.
     pub scenario: PathBuf,
-    /// Where the scenario was saved from. Its own relative paths (Helm values, dynamic config
-    /// files, calibration observations) resolve against this folder.
-    pub scenario_dir: PathBuf,
+    /// The folder the scenario's own relative paths (Helm values, dynamic config files,
+    /// calibration observations) resolve against: the profile's folder when absent, and taken
+    /// from it when relative. `profile save` records the folder the scenario came from when the
+    /// scenario refers to files there, which aren't copied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario_dir: Option<PathBuf>,
     /// Copies of the observed-metrics files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed: Vec<PathBuf>,
@@ -353,7 +357,12 @@ impl Store {
                     description: profile.description.clone(),
                     spec: RunSpec {
                         scenario: path.join(&profile.scenario),
-                        scenario_dir: profile.scenario_dir.clone(),
+                        // the profile's folder, so that one keeping its files inside can be
+                        // copied anywhere
+                        scenario_dir: profile
+                            .scenario_dir
+                            .as_deref()
+                            .map_or_else(|| path.clone(), |d| within(&path, d)),
                         options: profile.options(&path),
                         profile: Some(name.to_string()),
                     },
@@ -434,7 +443,8 @@ impl Store {
             std::fs::remove_dir_all(&staging)?;
         }
         create_private_dir(&staging)?;
-        let copied = match write_profile(&staging, spec, description) {
+        let refers = !scenario.referenced_files().is_empty();
+        let copied = match write_profile(&staging, spec, description, refers) {
             Ok(copied) => copied,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&staging);
@@ -487,13 +497,7 @@ impl Store {
         }
         let written = (|| -> anyhow::Result<()> {
             create_private_dir(&staging)?;
-            // the files name the folder they will be in
-            let files = template::render(
-                template::Variant::Template,
-                name,
-                &absolute(&target),
-                description,
-            );
+            let files = template::render(template::Variant::Template, name, description);
             for (file, text) in files {
                 write_private(&staging.join(file), text.as_bytes())?;
             }
@@ -541,10 +545,13 @@ impl Store {
 }
 
 /// Write a profile's files into `dir`; returns the files copied into it.
+/// `refers`: the scenario refers to files (Helm values, dynamic config files, calibration
+/// observations), which stay where they are and resolve against the folder it came from.
 fn write_profile(
     dir: &Path,
     spec: &RunSpec,
     description: Option<String>,
+    refers: bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut copied = vec![spec.scenario.clone()];
     copy_private(&spec.scenario, &dir.join("scenario.yaml"))?;
@@ -587,7 +594,7 @@ fn write_profile(
     let profile = Profile {
         description,
         scenario: PathBuf::from("scenario.yaml"),
-        scenario_dir: absolute(&spec.scenario_dir),
+        scenario_dir: refers.then(|| absolute(&spec.scenario_dir)),
         observed,
         replicas: o.replicas.clone(),
         dc: o.dc.clone(),
@@ -1010,7 +1017,7 @@ mod tests {
         assert_eq!(entry.kind, Kind::Saved);
         assert_eq!(entry.description.as_deref(), Some("a first try"));
         // the scenario's relative paths resolve in the profile's folder
-        assert_eq!(entry.spec.scenario_dir, absolute(&dir));
+        assert_eq!(entry.spec.scenario_dir, dir);
         assert_eq!(
             entry.spec.load_scenario().unwrap().name.as_deref(),
             Some("first")
@@ -1037,7 +1044,7 @@ mod tests {
         ] {
             std::fs::copy(examples.join(from), dir.join(to)).unwrap();
         }
-        for (file, text) in template::render(template::Variant::Full, "full", &dir, None) {
+        for (file, text) in template::render(template::Variant::Full, "full", None) {
             std::fs::write(dir.join(file), text).unwrap();
         }
         let entry = Store::at(dir.parent().unwrap()).load("full").unwrap();
@@ -1081,5 +1088,78 @@ mod tests {
         );
         let abs = std::env::temp_dir().join("elsewhere.yaml");
         assert_eq!(within(&area, &abs), abs);
+    }
+
+    /// Copy the folder `from` to `to`.
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&e.path(), &to.join(e.file_name()));
+            } else {
+                std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        }
+    }
+
+    /// A dynamic config file, in Temporal's format.
+    const DC: &str = "history.shardIOConcurrency:\n  - value: 2\n";
+
+    #[test]
+    fn a_profile_that_keeps_its_files_moves_with_its_folder() {
+        let a = Store::at(temp_dir("move-from"));
+        let dir = a.init("p", None).unwrap();
+        // the scenario reads a dynamic config file beside it
+        std::fs::write(dir.join("dc.yaml"), DC).unwrap();
+        let scenario = dir.join("scenario.yaml");
+        let text = std::fs::read_to_string(&scenario).unwrap().replace(
+            "# dynamic_config_files:\n#   - dynamicconfig.yaml",
+            "dynamic_config_files:\n  - dc.yaml",
+        );
+        assert!(text.contains("\ndynamic_config_files:\n  - dc.yaml"));
+        std::fs::write(&scenario, text).unwrap();
+        // copied to another store, under another name, and the original gone
+        let b = Store::at(temp_dir("move-to"));
+        copy_dir(&dir, &b.dir().join("q"));
+        std::fs::remove_dir_all(a.dir()).unwrap();
+        let entry = b.load("q").unwrap();
+        assert_eq!(entry.spec.scenario_dir, b.dir().join("q"));
+        runs(&entry.spec);
+        // a relative scenario_dir is taken from the profile's folder
+        let file = b.dir().join("q/profile.yaml");
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(
+            &file,
+            text.replace("# scenario_dir: .", "scenario_dir: shared"),
+        )
+        .unwrap();
+        assert_eq!(
+            b.load("q").unwrap().spec.scenario_dir,
+            b.dir().join("q/shared")
+        );
+    }
+
+    #[test]
+    fn save_names_the_scenarios_folder_only_when_it_refers_to_files() {
+        let src = temp_dir("refers");
+        let store = Store::at(src.join("store"));
+        let read = |name: &str| std::fs::read_to_string(store.dir().join(name).join(PROFILE_FILE));
+        // a scenario that refers to no file: the profile names no folder, and can move
+        let plain = RunSpec::for_scenario(&scenario_copy(&src));
+        store.save("plain", &plain, None, false).unwrap();
+        assert!(!read("plain").unwrap().contains("scenario_dir"));
+        // one that reads a file beside it: the profile reads it from there
+        std::fs::write(src.join("dc.yaml"), DC).unwrap();
+        let with = src.join("with-dc.yaml");
+        let text = std::fs::read_to_string(scenario_copy(&src)).unwrap();
+        std::fs::write(&with, format!("dynamic_config_files: [dc.yaml]\n{text}")).unwrap();
+        store
+            .save("refers", &RunSpec::for_scenario(&with), None, false)
+            .unwrap();
+        assert!(read("refers").unwrap().contains("scenario_dir"));
+        let entry = store.load("refers").unwrap();
+        assert_eq!(entry.spec.scenario_dir, absolute(&src));
+        runs(&entry.spec);
     }
 }

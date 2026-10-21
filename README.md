@@ -632,7 +632,12 @@ Profiles usually describe a real cluster, so they are kept private and outside a
   and its files likewise (`0600`).
 * **Standalone copies.** After saving, a profile runs even if the original files are deleted.
   Files the scenario itself refers to, such as Helm values or dynamic config files, are not
-  copied: they are still read from the scenario's original folder, and `profile show` lists them.
+  copied: they are still read from the scenario's original folder, which `profile.yaml` names as
+  `scenario_dir`, and `profile show` lists them.
+* **Moving profiles.** Without `scenario_dir`, the scenario's relative paths resolve in the
+  profile's own folder, and a relative `scenario_dir` is taken from it too. A profile that keeps
+  its files inside, as `profile init` makes them, can be copied to another machine or store
+  and runs there.
 * **Git warnings.** `profile save` warns when the store is inside a git working tree that doesn't
   ignore it. It also names any source file that is untracked and not ignored, so it could be
   committed by accident. For those, delete the file once the profile has its copy, or list it
