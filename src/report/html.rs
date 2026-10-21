@@ -713,12 +713,14 @@ pub fn render_run_doc(r: &RunResult, fragment: bool) -> String {
             true
         )
     );
+    // an enforced limiter holds runs back before their scheduling wait starts
+    let held_back = r.history.task_scheduler.mode == "on";
     let task_rows: Vec<Vec<String>> = r
         .history
         .tasks
         .iter()
         .map(|t| {
-            vec![
+            let mut row = vec![
                 t.task_type.clone(),
                 fmt_rate(t.per_s),
                 fmt_pct(t.noop_fraction),
@@ -727,29 +729,32 @@ pub fn render_run_doc(r: &RunResult, fragment: bool) -> String {
                 ms(t.processing.p99_ms),
                 ms(t.queue.p99_ms),
                 format!("{:.2}", t.mean_attempts),
-            ]
+            ];
+            if held_back {
+                row.insert(4, ms(t.held_back.p99_ms));
+            }
+            row
         })
         .collect();
+    let mut task_head = vec![
+        "task type",
+        "rate",
+        "no-op",
+        "load p99",
+        "schedule p99",
+        "processing p99",
+        "end-to-end p99",
+        "attempts",
+    ];
+    if held_back {
+        task_head.insert(4, "held back p99");
+    }
     let _ = write!(
         b,
         "<details><summary><span>History task queues · lock wait p99 {} · mutable-state cache hit {}</span></summary><div class=\"inner\">{}</div></details>",
         ms(r.history.lock_wait.p99_ms),
         fmt_pct(r.history.cache_hit_ratio),
-        table(
-            &[
-                "task type",
-                "rate",
-                "no-op",
-                "load p99",
-                "schedule p99",
-                "processing p99",
-                "end-to-end p99",
-                "attempts"
-            ],
-            1,
-            &task_rows,
-            true
-        )
+        table(&task_head, 1, &task_rows, true)
     );
     let mut parts: Vec<&PartitionResult> = r
         .matching

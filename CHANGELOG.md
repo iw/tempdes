@@ -369,6 +369,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The task scheduler's rate limiter is no longer taken for busy workers.** The scheduling
+  wait, `task_latency_schedule`, started before the limiter, so the time a task was held back in
+  the rescheduler counted as waiting for a scheduler worker: each task type the limiter held
+  back raised a busy-worker hotspot beside the limiter's own. Temporal sets a task's scheduled
+  time at every submission (`reader.go`, `rescheduler.go`) and records the wait at every run
+  (`Execute`). The wait now starts when the limiter admits the task, and retries record theirs
+  too, in the report and the `--prom` output alike. How long the limiter held tasks back is
+  measured on its own, per task type: the limiter's hotspot takes its evidence and severity
+  from it, and while the limiter is enforced the history task table shows it. In
+  `baseline.yaml` with `history.taskSchedulerGlobalNamespaceMaxQPS=600`, a 60s run had ten
+  critical hotspots, six of them waits of 31–35s for scheduler workers; it now has four, and
+  tasks held back 34.6s (p99).
+
 - **The backlog of a queue nothing polls.** Matching's metrics left out a partition that had
   been neither polled nor matched, so a task queue with no workers showed no
   `approximate_backlog_count` or `approximate_backlog_age_seconds` at all, however large its

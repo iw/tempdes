@@ -642,6 +642,11 @@ fn history_persistence_limit_follows_shard_ownership() {
 /// The history task scheduler's rate limiter at 900 tasks/s for the cluster, well below the
 /// baseline's history task rate.
 fn scheduler_limiter(shadow: bool) -> Overrides {
+    scheduler_limit("history.taskSchedulerGlobalMaxQPS", shadow)
+}
+
+/// The history task scheduler's rate limiter with `limit` at 900 tasks/s for the cluster.
+fn scheduler_limit(limit: &str, shadow: bool) -> Overrides {
     let mut ov = short();
     for (key, value) in [
         (
@@ -652,7 +657,7 @@ fn scheduler_limiter(shadow: bool) -> Overrides {
             "history.taskSchedulerEnableRateLimiterShadowMode",
             DcValue::Bool(shadow),
         ),
-        ("history.taskSchedulerGlobalMaxQPS", DcValue::Int(900)),
+        (limit, DcValue::Int(900)),
     ] {
         ov.dc.push((key.into(), value, Constraints::default()));
     }
@@ -691,13 +696,13 @@ fn task_scheduler_limiter_holds_tasks_back_outside_shadow_mode() {
     let ts = &r.history.task_scheduler;
     assert_eq!(ts.mode, "on");
     assert!(ts.throttled_per_s > 0.0);
-    let wait = r
+    let held = r
         .history
         .tasks
         .iter()
-        .map(|t| t.schedule.p99_ms)
+        .map(|t| t.held_back.p99_ms)
         .fold(0.0, f64::max);
-    assert!(wait > 1000.0, "scheduling wait p99 {wait} ms");
+    assert!(held > 1000.0, "held back p99 {held} ms");
     // a limiter inside the cluster ranks above the delays it causes
     let top = &r.hotspots[0];
     assert_eq!(
@@ -706,6 +711,70 @@ fn task_scheduler_limiter_holds_tasks_back_outside_shadow_mode() {
         "{:#?}",
         categories(&r)
     );
+}
+
+#[test]
+fn a_namespace_scheduler_limit_holds_tasks_back_without_busy_workers() {
+    // Temporal sets a task's scheduled time again when the rescheduler resubmits it, so its
+    // scheduling wait starts when the limiter admits it. The time held back before that is the
+    // limiter's, and no scheduler worker was waited for.
+    let r = simulate(
+        "baseline.yaml",
+        scheduler_limit("history.taskSchedulerGlobalNamespaceMaxQPS", false),
+    );
+    let limiter = r
+        .hotspots
+        .iter()
+        .find(|h| h.resource == "history.taskSchedulerGlobalNamespaceMaxQPS")
+        .unwrap_or_else(|| panic!("{:#?}", categories(&r)));
+    assert_eq!(limiter.category, "rate-limit");
+    assert_eq!(limiter.severity, Severity::Critical, "{limiter:#?}");
+    assert!(
+        limiter.evidence[0].starts_with("held back p99 "),
+        "{:?}",
+        limiter.evidence
+    );
+    assert!(
+        !r.hotspots
+            .iter()
+            .any(|h| h.title.contains("scheduler worker")),
+        "{:#?}",
+        categories(&r)
+    );
+    for t in &r.history.tasks {
+        assert!(t.held_back.p99_ms > 1000.0, "{t:?}");
+        assert!(t.schedule.p99_ms < 200.0, "{t:?}");
+    }
+    // the history task tables show the hold-back before the scheduling wait
+    let md = tempdes::report::markdown::render_run(&r, false);
+    assert!(md.contains("| load p99 | held back p99 | schedule p99 |"));
+    let text = tempdes::report::text::render(&r, false);
+    assert!(text.contains("load p99  held back p99  sched p99"));
+    let html = tempdes::report::html::render_run(&r);
+    assert!(html.contains("held back p99</th><th class=\"n\">schedule p99"));
+}
+
+#[test]
+fn busy_scheduler_workers_show_without_the_limiter() {
+    // two transfer workers per history pod, against hundreds of transfer tasks a second
+    let r = simulate(
+        "baseline.yaml",
+        with_dc(
+            short(),
+            "history.transferProcessorSchedulerWorkerCount",
+            DcValue::Int(2),
+        ),
+    );
+    assert_eq!(r.history.task_scheduler.mode, "off");
+    assert!(
+        r.hotspots.iter().any(|h| h.category == "history-queue"
+            && h.severity == Severity::Critical
+            && h.title.contains("for a transfer scheduler worker")),
+        "{:#?}",
+        categories(&r)
+    );
+    let md = tempdes::report::markdown::render_run(&r, false);
+    assert!(!md.contains("held back p99"));
 }
 
 #[test]

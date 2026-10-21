@@ -414,7 +414,9 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
         }
         o.push_str(&t.render(&st, 2));
     }
-    let mut t = Table::new(&[
+    // an enforced limiter holds runs back before their scheduling wait starts
+    let held_back = ts.mode == "on";
+    let mut head = vec![
         "history task",
         "rate",
         "no-op",
@@ -424,9 +426,13 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
         "e2e p99",
         "attempts",
         "retries busy/thr",
-    ]);
+    ];
+    if held_back {
+        head.insert(4, "held back p99");
+    }
+    let mut t = Table::new(&head);
     for tk in &h.tasks {
-        t.row(vec![
+        let mut row = vec![
             tk.task_type.clone(),
             fmt_rate(tk.per_s),
             fmt_pct(tk.noop_fraction),
@@ -436,7 +442,11 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
             ms(tk.queue.p99_ms),
             format!("{:.2}", tk.mean_attempts),
             format!("{}/{}", tk.busy_workflow_retries, tk.throttled_retries),
-        ]);
+        ];
+        if held_back {
+            row.insert(4, ms(tk.held_back.p99_ms));
+        }
+        t.row(row);
     }
     o.push_str(&t.render(&st, 2));
 

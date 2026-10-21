@@ -231,7 +231,12 @@ pub struct TaskResult {
     pub per_s: f64,
     pub noop_fraction: f64,
     pub load: Lat,
+    /// `task_latency_schedule`: every run's wait from the submission that got it into the
+    /// scheduler to its start
     pub schedule: Lat,
+    /// how long the task scheduler's rate limiter held submissions back before admitting them,
+    /// zero for those admitted at once (empty with the limiter off)
+    pub held_back: Lat,
     pub processing: Lat,
     pub queue: Lat,
     pub mean_attempts: f64,
@@ -832,6 +837,7 @@ pub fn analyze_window(
             noop_fraction: o.noop as f64 / o.count as f64,
             load: Lat::of(&o.load_latency),
             schedule: Lat::of(&o.schedule_latency),
+            held_back: Lat::of(&o.held_back),
             processing: Lat::of(&o.processing),
             queue: Lat::of(&o.queue_latency),
             mean_attempts: o.attempts.mean(),

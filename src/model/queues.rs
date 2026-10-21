@@ -325,6 +325,10 @@ enum RunPermit {
 /// * Every run goes through the host scheduler: its (namespace, priority) channel waits its
 ///   interleaved weighted round robin turn for a pool worker. A task of a workflow that has an
 ///   execution queue runs there instead of on a pool worker (`ExecutionAwareScheduler`).
+/// * Temporal resets a task's scheduled time at every submission (`reader.go`, `rescheduler.go`,
+///   `Nack`) and records the wait from it at every run (`Execute`). With the scheduler's rate
+///   limiter on, a run is first held back until the limiter admits it: that wait is counted on
+///   its own, and the scheduling wait starts at the admission.
 /// * A failure increments the attempt (`HandleErr`), and a throttling error also the throttle
 ///   count, which busy-workflow errors leave alone and any other error resets.
 /// * `Nack`: with the execution queue scheduler on, a busy-workflow failure moves the task to
@@ -359,7 +363,8 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
     let mut routed: Option<(PodId, Semaphore)> = None;
     loop {
         let owner = ctx.shard_owner(shard);
-        let enq = now();
+        // the submission that gets the run into the scheduler (`SetScheduledTime`)
+        let mut enq = now();
         let permit = match routed.take() {
             Some((pod, workers)) => RunPermit::Exec(workers.acquire().await, pod),
             None => {
@@ -373,6 +378,10 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
                 let Some(sched) = sched else { break };
                 if ctx.p.k.task_sched_enabled {
                     wait_for_scheduler_limiter(&ctx, owner, &task, prio, attempt).await;
+                    ctx.m.borrow_mut().tasks[task.kind.idx()]
+                        .held_back
+                        .record(now() - enq);
+                    enq = now();
                 }
                 let p = sched.acquire(channel, weight).await;
                 match exec_queue(&ctx, owner, c, exec_key, false) {
@@ -385,11 +394,9 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
             }
         };
         let start = now();
-        if attempt == 1 {
-            ctx.m.borrow_mut().tasks[task.kind.idx()]
-                .schedule_latency
-                .record(start - enq);
-        }
+        ctx.m.borrow_mut().tasks[task.kind.idx()]
+            .schedule_latency
+            .record(start - enq);
         let outcome = execute(&ctx, owner, shard, &task).await;
         match permit {
             RunPermit::Pool(p) => drop(p),

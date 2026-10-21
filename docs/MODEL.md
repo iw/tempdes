@@ -336,6 +336,10 @@ Transfer, timer and visibility queues follow `service/history/queues/`:
     (`history.taskSchedulerEnableRateLimiterShadowMode`, on by default) it runs anyway.
     Otherwise it goes to the rescheduler (`reader.go`, `rescheduler.go`): it waits the task
     backoff (1 s × 1.1ⁿ, up to 20% less), then retries every 2 s ± 50% until admitted.
+  * Every submission sets the task's scheduled time (`SetScheduledTime`), and every run records
+    `task_latency_schedule` from it (`Execute`). The scheduling wait therefore starts when the
+    limiter admits a task. The time it was held back before that is counted per task type on
+    its own, as tempdes's measure rather than a Temporal metric.
 * **Execution** (`executable.go`):
   * The task takes the workflow lock as a non-API caller, loads mutable state and does its work.
     Examples: `AddWorkflowTask`/`AddActivityTask` to matching, starting a child, firing a
@@ -606,6 +610,11 @@ knobs.
   critical. Both are configurable under `report:`.
 * **Rate limiters.** A limiter that rejects requests is a `rate-limit` hotspot. One that runs at
   70% or more of its limit on any pod is a `headroom` warning, raised before rejections start.
+  * The history task scheduler's limiter, enforced, is rated by how long it holds tasks back:
+    a p99 over 1 s for any task type is a warning, and over 5 s critical. In shadow mode it is
+    reported for information.
+  * A `history-queue` hotspot for a scheduler worker counts the wait from admission, so it
+    means the workers were busy, not the limiter.
 * **Throughput.** Two tests, each flagged only beyond a 3σ Poisson band:
   * *start shortfall*: accepted starts fall short of the offered rate, or more than 1% of
     starts fail;

@@ -9,8 +9,16 @@ use tempdes::report::prom::{self, Reading};
 use tempdes::run::{self, Overrides};
 
 fn baseline() -> Scenario {
-    Scenario::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scenarios/baseline.yaml"))
-        .expect("scenario loads")
+    example("baseline.yaml")
+}
+
+fn example(file: &str) -> Scenario {
+    Scenario::load(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/scenarios")
+            .join(file),
+    )
+    .expect("scenario loads")
 }
 
 fn short() -> Overrides {
@@ -200,6 +208,91 @@ fn a_finished_run_still_reads_its_window() {
     assert!(text.contains("window_seconds=20"));
     assert_eq!(text, prom::render_as(&out.ctx, Reading::Window));
     assert!(!samples(&text, "temporal_worker_task_slots_available").is_empty());
+}
+
+/// The sum over the count of the timer `metric` for history tasks of `task_type`, in seconds.
+fn task_mean(text: &str, metric: &str, task_type: &str) -> f64 {
+    let label = format!("task_type=\"{task_type}\"");
+    let total = |series: String| -> f64 {
+        samples(text, &series)
+            .iter()
+            .filter(|(l, _)| l.contains(&label))
+            .map(|(_, v)| v)
+            .sum()
+    };
+    total(format!("{metric}_sum")) / total(format!("{metric}_count"))
+}
+
+#[test]
+fn task_latency_schedule_starts_when_the_limiter_admits_a_task() {
+    // The task scheduler's rate limiter at 900 tasks/s for the namespace, well below the
+    // baseline's history task rate. Temporal sets a task's scheduled time at each submission,
+    // so task_latency_schedule leaves out the time the rescheduler held the task back, which
+    // task_latency_queue includes.
+    let mut ov = short();
+    for (key, value) in [
+        (
+            "history.taskSchedulerEnableRateLimiter",
+            DcValue::Bool(true),
+        ),
+        (
+            "history.taskSchedulerEnableRateLimiterShadowMode",
+            DcValue::Bool(false),
+        ),
+        (
+            "history.taskSchedulerGlobalNamespaceMaxQPS",
+            DcValue::Int(900),
+        ),
+    ] {
+        ov.dc.push((key.into(), value, Constraints::default()));
+    }
+    let out = run::run_params(run::prepare(&baseline(), &ov, None).expect("parameters resolve"));
+    let task = "TransferActiveTaskWorkflowTask";
+    let r = tempdes::report::analyze(&out.ctx, &out.info, None);
+    let held = r
+        .history
+        .tasks
+        .iter()
+        .find(|t| t.task_type == task)
+        .expect("workflow tasks")
+        .held_back
+        .p99_ms;
+    assert!(held > 1000.0, "held back p99 {held} ms");
+    let text = prom::render(&out.ctx);
+    let scheduled = task_mean(&text, "task_latency_schedule", task);
+    let queued = task_mean(&text, "task_latency_queue", task);
+    assert!(scheduled < 0.01, "task_latency_schedule mean {scheduled}s");
+    assert!(queued > 1.0, "task_latency_queue mean {queued}s");
+}
+
+#[test]
+fn task_latency_schedule_counts_every_run() {
+    // Temporal records it each time a task runs, so a task that fails on a busy workflow and
+    // runs again counts once per run
+    let sc = example("hot-entity.yaml");
+    let out = run::run_params(run::prepare(&sc, &short(), None).expect("parameters resolve"));
+    let r = tempdes::report::analyze(&out.ctx, &out.info, None);
+    let task = "TimerActiveTaskWorkflowTaskTimeout";
+    let t = r
+        .history
+        .tasks
+        .iter()
+        .find(|t| t.task_type == task)
+        .expect("workflow task timeouts");
+    let done = t.per_s * r.duration_s;
+    let failed = (t.busy_workflow_retries + t.throttled_retries + t.other_retries) as f64;
+    assert!(failed > 100.0, "{failed} failed runs");
+    let label = format!("task_type=\"{task}\"");
+    let runs: f64 = samples(&prom::render(&out.ctx), "task_latency_schedule_count")
+        .iter()
+        .filter(|(l, _)| l.contains(&label))
+        .map(|(_, v)| v)
+        .sum();
+    // the runs still going when the window closes make up the difference
+    assert!(
+        (runs - done - failed).abs() < 0.05 * failed,
+        "{runs} runs for {done} tasks done and {failed} failed runs"
+    );
 }
 
 #[test]

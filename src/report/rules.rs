@@ -1136,6 +1136,8 @@ fn locks(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     }
 }
 
+/// History task queues. A run's scheduling wait starts once the task scheduler's rate limiter
+/// admits it, so it is a wait for a scheduler worker; `task_scheduler` reports the hold-back.
 fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     let h = &c.r.history;
     for t in &h.tasks {
@@ -1256,7 +1258,8 @@ fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
 
 /// The history task scheduler's rate limiter. In shadow mode it only counts, so report what it
 /// would hold back, which is how the limits are sized. Enforced, a refused task waits in the
-/// rescheduler, which is the point of the limiter; the wait is what can become a problem.
+/// rescheduler, which is the point of the limiter; how long it holds tasks back is what can
+/// become a problem, and sets the severity.
 fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     let h = &c.r.history;
     let ts = &h.task_scheduler;
@@ -1310,9 +1313,15 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             ts.refused_by_namespace, ts.refused_by_pod
         ));
     }
+    let shadow = ts.mode == "shadow";
     for t in by_type.iter().take(3) {
+        let held = if shadow {
+            String::new()
+        } else {
+            format!(", held back p99 {}", ms(t.held_back.p99_ms))
+        };
         evidence.push(format!(
-            "{}: {:.0}/s refused of {:.0}/s run",
+            "{}: {:.0}/s refused of {:.0}/s run{held}",
             t.task_type, t.sched_throttled_per_s, t.per_s
         ));
     }
@@ -1330,7 +1339,7 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             "true counts refusals without holding tasks back",
         ),
     ];
-    if ts.mode == "shadow" {
+    if shadow {
         out.push(hs(
             Severity::Info,
             "history-queue",
@@ -1347,15 +1356,21 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
         ));
         return;
     }
-    let wait_p99 = h
+    // the wait in the rescheduler, which task_latency_schedule leaves out
+    let held = h
         .tasks
         .iter()
-        .map(|t| t.schedule.p99_ms)
-        .fold(0.0, f64::max);
-    evidence.insert(0, format!("task scheduling wait p99 {}", ms(wait_p99)));
-    let sev = if wait_p99 > 5000.0 {
+        .max_by(|a, b| a.held_back.p99_ms.total_cmp(&b.held_back.p99_ms));
+    let held_p99 = held.map_or(0.0, |t| t.held_back.p99_ms);
+    if let Some(t) = held {
+        evidence.insert(
+            0,
+            format!("held back p99 {} ({})", ms(held_p99), t.task_type),
+        );
+    }
+    let sev = if held_p99 > 5000.0 {
         Severity::Critical
-    } else if wait_p99 > 1000.0 {
+    } else if held_p99 > 1000.0 {
         Severity::Warning
     } else {
         Severity::Info
@@ -1368,11 +1383,11 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             "{resource}: tasks held back ({:.0} refusals/s, {:.2} per task run)",
             ts.throttled_per_s, ts.throttled_per_task
         ),
-        "The task scheduler's rate limiter: a refused task waits in the rescheduler (about 1s, then every 2s) until the limiter admits it. Some waiting is the point; a long wait delays dispatch, timers and retries.".into(),
+        "The task scheduler's rate limiter: a refused task waits in the rescheduler (about 1s, then every 2s) until the limiter admits it. Some waiting is the point; a long wait delays dispatch, timers and retries. As in Temporal, task_latency_schedule starts only once the limiter admits a task, so the wait shows in task_latency_queue and task_rescheduler_pending_tasks instead.".into(),
         evidence,
-        &["task_scheduler_throttled", "task_latency_schedule"],
+        &["task_scheduler_throttled", "task_rescheduler_pending_tasks", "task_latency_queue"],
         knobs,
-        40.0 + wait_p99 / 200.0,
+        40.0 + held_p99 / 200.0,
     ));
 }
 

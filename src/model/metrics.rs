@@ -42,7 +42,12 @@ pub struct TaskStats {
     pub count: u64,
     pub noop: u64,
     pub load_latency: Histogram,
+    /// every run's wait from the submission that got it into the scheduler to its start
+    /// (`task_latency_schedule`): the limiter's hold-back is left out, as in Temporal
     pub schedule_latency: Histogram,
+    /// how long the task scheduler's rate limiter held each submission back in the rescheduler,
+    /// zero when it admitted it at once (not a Temporal metric)
+    pub held_back: Histogram,
     pub processing: Histogram,
     pub queue_latency: Histogram,
     pub attempts: Histogram,
