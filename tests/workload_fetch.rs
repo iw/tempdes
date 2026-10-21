@@ -711,3 +711,59 @@ fn a_missing_cli_says_how_to_point_at_it() {
     assert!(err.contains("cannot run the Temporal CLI"), "{err}");
     assert!(err.contains("--cli PATH"), "{err}");
 }
+
+#[cfg(unix)]
+#[test]
+fn with_a_profile_histories_go_into_its_workload_folder() {
+    let base = fresh_dir("cli-profile");
+    let program = fake_cli(&base.join("bin"));
+    let store = base.join("store");
+    let tempdes = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tempdes"))
+            .args(args)
+            .env("TEMPDES_PROFILES", &store)
+            .output()
+            .unwrap()
+    };
+    assert!(tempdes(&["profile", "init", "p"]).status.success());
+    let out = tempdes(&[
+        "workload",
+        "fetch",
+        "--profile",
+        "p",
+        "--cli",
+        program.to_str().unwrap(),
+        "-n",
+        "orders",
+        "--end",
+        "2026-10-07T01:20:00Z",
+        "--window",
+        "15m",
+        "--slice",
+        "15m",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let histories = store.join("p/workload/histories");
+    assert!(histories.join("fetch.yaml").is_file());
+    assert!(histories.join("r-o1.json").is_file());
+    // import finds them there, and writes beside them
+    let out = tempdes(&[
+        "workload",
+        "import",
+        "--profile",
+        "p",
+        "--namespace",
+        "orders",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("from the 4 starts `workload fetch` counted over 15.0m"),
+        "{stderr}"
+    );
+    assert!(store.join("p/workload/workflows.yaml").is_file());
+}

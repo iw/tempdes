@@ -930,3 +930,66 @@ fn imported_workloads_simulate() {
         r.hotspots.iter().map(|h| &h.title).collect::<Vec<_>>()
     );
 }
+
+/// `tempdes` itself, its profile store in `store`.
+fn tempdes(store: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_tempdes"))
+        .args(args)
+        .env("TEMPDES_PROFILES", store)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn with_a_profile_import_reads_and_writes_its_workload_folder() {
+    let store = std::env::temp_dir().join(format!("tempdes-import-profile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&store);
+    assert!(tempdes(&store, &["profile", "init", "p"]).status.success());
+    let histories = store.join("p/workload/histories");
+    std::fs::create_dir_all(&histories).unwrap();
+    for i in 0..3 {
+        let text = order(f64::from(i) * 1000.0, 1, false, false);
+        std::fs::write(histories.join(format!("o{i}.json")), text).unwrap();
+    }
+    // its histories by default, into workflows.yaml rather than to standard output
+    let out = tempdes(
+        &store,
+        &[
+            "workload",
+            "import",
+            "--profile",
+            "p",
+            "--namespace",
+            "orders",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(out.stdout.is_empty());
+    let yaml = std::fs::read_to_string(store.join("p/workload/workflows.yaml")).unwrap();
+    assert!(
+        yaml.contains("workflows:") && yaml.contains("namespace: \"orders\""),
+        "{yaml}"
+    );
+    // relative paths are inside the folder
+    let out = tempdes(
+        &store,
+        &[
+            "workload",
+            "import",
+            "--profile",
+            "p",
+            "histories",
+            "-o",
+            "again.yaml",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(store.join("p/workload/again.yaml").is_file());
+    // without a profile, the histories must be given
+    assert!(!tempdes(&store, &["workload", "import"]).status.success());
+}

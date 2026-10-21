@@ -585,3 +585,72 @@ fn scan_says_what_there_is_when_the_range_is_empty() {
         assert!(e.contains(part), "{part}: {e}");
     }
 }
+
+/// `tempdes` itself, its profile store in `store`.
+fn tempdes(store: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_tempdes"))
+        .args(args)
+        .env("TEMPDES_PROFILES", store)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn with_a_profile_observations_go_into_its_metrics_folder() {
+    let store = std::env::temp_dir().join(format!("tempdes-fetch-profile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&store);
+    assert!(tempdes(&store, &["profile", "init", "p"]).status.success());
+    let url = prometheus(Exporter::Tally);
+    let fetch = |extra: &[&str]| {
+        let mut args = vec![
+            "metrics",
+            "fetch",
+            "--url",
+            &url,
+            "--end",
+            "2026-10-01T22:17:00Z",
+            "--profile",
+            "p",
+        ];
+        args.extend_from_slice(extra);
+        tempdes(&store, &args)
+    };
+    let out = fetch(&["--baseline-end", "2026-10-01 21:55"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let metrics = store.join("p/metrics");
+    assert!(metrics.join("observed.yaml").is_file(), "{stderr}");
+    assert!(metrics.join("baseline.yaml").is_file(), "{stderr}");
+    // the profile doesn't read it until it is listed
+    assert!(
+        stderr.contains("list it in its profile.yaml as `observed: [metrics/observed.yaml]`"),
+        "{stderr}"
+    );
+    let file = store.join("p/profile.yaml");
+    let profile = std::fs::read_to_string(&file).unwrap().replace(
+        "# observed:\n#   - metrics/observed.yaml",
+        "observed:\n  - metrics/observed.yaml",
+    );
+    std::fs::write(&file, profile).unwrap();
+    let out = fetch(&[]);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("list it"));
+    // a relative --output is inside the folder, an absolute one where it says
+    assert!(fetch(&["-o", "burst.yaml"]).status.success());
+    assert!(metrics.join("burst.yaml").is_file());
+    let elsewhere = store.join("elsewhere.yaml");
+    assert!(fetch(&["-o", elsewhere.to_str().unwrap()]).status.success());
+    assert!(elsewhere.is_file());
+    // a profile that doesn't exist says how to start one
+    let mut args = vec![
+        "metrics",
+        "fetch",
+        "--url",
+        &url,
+        "--end",
+        "2026-10-01T22:17:00Z",
+    ];
+    args.extend(["--profile", "nope"]);
+    let out = tempdes(&store, &args);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`tempdes profile init nope`"));
+}

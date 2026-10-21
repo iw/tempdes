@@ -9,6 +9,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`profile init`.** `tempdes profile init NAME` starts a profile from a prototype: a
+  `profile.yaml` and a `scenario.yaml` showing every setting, each commented, the optional ones
+  commented out with their defaults or an example. It runs as written. `--description` sets the
+  line `profile list` shows. A test switches every commented-out setting on and runs the
+  result, so the prototype stays valid as the settings change.
+
+- **Fetching into a profile.** With `--profile NAME`, `metrics fetch` writes into the profile's
+  `metrics` folder in the store (`observed.yaml`, and `baseline.yaml`), and `workload fetch`
+  into its `workload` folder (`histories/`). `workload import --profile NAME` reads
+  `workload/histories` and writes `workload/workflows.yaml` rather than printing it. Relative
+  paths are taken inside the folder, and absolute ones as given. `metrics fetch` says when the
+  profile doesn't read the file yet. `workload import -o` now writes its file readable only by
+  you, as it names your workflow and activity types and task queues. `profile save` now copies observed metrics into
+  `metrics/` too, rather than `observed/`; profiles saved before keep working as they are.
+
 - **`workload fetch` through the Temporal CLI.** `--cli` lists and fetches with the Temporal CLI
   (`temporal workflow list`, `workflow show` and `operator namespace describe`), run with its
   own configuration, for a frontend that only its gRPC port reaches. `--namespace` and

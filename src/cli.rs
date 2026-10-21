@@ -92,9 +92,13 @@ struct WorkloadFetchArgs {
     /// Histories to fetch of each type, spread over the window.
     #[arg(long, default_value_t = 300)]
     limit: usize,
-    /// Directory for the histories, created readable only by you.
-    #[arg(short, long, default_value = "histories")]
-    output: PathBuf,
+    /// Directory for the histories, created readable only by you [default: histories].
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Write into this profile's `workload` folder in the store: --output, when relative, is
+    /// inside it.
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
     /// Profile in Temporal's client config file [default: TEMPORAL_PROFILE, else `default`].
     #[arg(long, value_name = "NAME")]
     temporal_profile: Option<String>,
@@ -137,9 +141,14 @@ struct WorkloadFetchArgs {
 
 #[derive(Args)]
 struct ImportArgs {
-    /// History files, or directories of `*.json` history files.
-    #[arg(required = true)]
+    /// History files, or directories of `*.json` history files [default with --profile: its
+    /// workload/histories].
+    #[arg(required_unless_present = "profile")]
     paths: Vec<PathBuf>,
+    /// Read and write in this profile's `workload` folder in the store: the paths and --output,
+    /// when relative, are inside it, and the output is workflows.yaml unless --output says.
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
     /// Namespace of the imported workflow types.
     #[arg(long, default_value = "default")]
     namespace: String,
@@ -155,6 +164,40 @@ struct ImportArgs {
     /// Write the `workflows:` YAML here instead of to standard output.
     #[arg(long, short = 'o')]
     output: Option<PathBuf>,
+}
+
+/// When profile `name` doesn't read the observations in `file` yet, say how to make it.
+#[cfg(feature = "fetch")]
+fn observed_hint(name: &str, file: &std::path::Path) {
+    let same = |a: &std::path::Path| match (std::fs::canonicalize(a), std::fs::canonicalize(file)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == file,
+    };
+    let Ok(entry) = profile::Store::open().and_then(|s| s.load(name)) else {
+        return;
+    };
+    let listed = entry.spec.options.observed.iter().any(|f| same(f));
+    let calibrated = entry.spec.load_scenario().is_ok_and(|sc| {
+        sc.calibration
+            .as_ref()
+            .is_some_and(|c| c.observations.iter().any(|o| same(&sc.resolve_path(o))))
+    });
+    if !listed && !calibrated {
+        let rel = file.strip_prefix(&entry.path).unwrap_or(file);
+        eprintln!(
+            "profile {name} doesn't read it yet: list it in its profile.yaml as `observed: [{}]`",
+            rel.display()
+        );
+    }
+}
+
+/// The folder in profile `name` where its fetched and imported files go (`metrics` or
+/// `workload`), created private if it isn't there yet.
+fn profile_area(name: &str, sub: &str) -> anyhow::Result<PathBuf> {
+    let dir = profile::Store::open()?.folder(name)?.join(sub);
+    profile::create_private_dir(&dir)?;
+    eprintln!("using profile {name} ({})", dir.display());
+    Ok(dir)
 }
 
 fn parse_rate(s: &str) -> Result<f64, String> {
@@ -273,6 +316,15 @@ enum ProfileCmd {
     /// `tempdes profile save prod cluster.yaml -r history=4 -o observed.yaml`.
     /// With `--profile BASE` instead of a scenario, the new profile starts from BASE.
     Save(Box<SaveArgs>),
+    /// Start a profile from a commented prototype: a profile.yaml and a scenario.yaml to edit,
+    /// with folders for what `metrics fetch` and `workload fetch` / `import --profile` write.
+    Init {
+        /// Profile name: letters, digits, '-', '_' and '.'.
+        name: String,
+        /// One line describing the profile.
+        #[arg(long)]
+        description: Option<String>,
+    },
     /// List the saved profiles.
     List,
     /// Show a profile's options and files.
@@ -373,9 +425,13 @@ struct FetchArgs {
     /// Window length.
     #[arg(long, default_value = "15m")]
     window: String,
-    /// The observations file to write.
-    #[arg(short, long, default_value = "observed.yaml")]
-    output: PathBuf,
+    /// The observations file to write [default: observed.yaml].
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Write into this profile's `metrics` folder in the store: --output and --baseline-out,
+    /// when relative, are inside it.
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
     /// Also write the window ending here, such as the run's start.
     #[arg(long)]
     baseline_end: Option<String>,
@@ -528,19 +584,33 @@ pub fn main() -> anyhow::Result<ExitCode> {
             }
             #[cfg(feature = "fetch")]
             MetricsCmd::Fetch(a) => {
+                let output = a.output.unwrap_or_else(|| PathBuf::from("observed.yaml"));
+                let (output, baseline_out) = match &a.profile {
+                    Some(name) => {
+                        let area = profile_area(name, profile::METRICS_DIR)?;
+                        (
+                            profile::within(&area, &output),
+                            a.baseline_out.map(|b| profile::within(&area, &b)),
+                        )
+                    }
+                    None => (output, a.baseline_out),
+                };
                 crate::metrics::fetch::fetch(&crate::metrics::fetch::FetchArgs {
                     conn: conn(&a.prom),
                     end: a.end,
                     window: a.window,
-                    output: a.output,
+                    output: output.clone(),
                     baseline_end: a.baseline_end,
-                    baseline_out: a.baseline_out,
+                    baseline_out,
                     description: a.description,
                     rename: a.prom.rename,
                     cpu_selector: a.cpu_selector,
                     db_utilization: a.db_utilization,
                     db_utilization_query: a.db_utilization_query,
                 })?;
+                if let Some(name) = &a.profile {
+                    observed_hint(name, &output);
+                }
                 Ok(ExitCode::SUCCESS)
             }
             #[cfg(feature = "fetch")]
@@ -598,6 +668,11 @@ fn cmd_workload_fetch(a: WorkloadFetchArgs) -> anyhow::Result<ExitCode> {
             }
         }
     };
+    let output = a.output.unwrap_or_else(|| PathBuf::from("histories"));
+    let output = match &a.profile {
+        Some(name) => profile::within(&profile_area(name, profile::WORKLOAD_DIR)?, &output),
+        None => output,
+    };
     let summary = crate::histories::fetch::fetch(&crate::histories::fetch::FetchArgs {
         via,
         end: a.end,
@@ -606,7 +681,7 @@ fn cmd_workload_fetch(a: WorkloadFetchArgs) -> anyhow::Result<ExitCode> {
         types: a.types,
         query: a.query,
         limit: a.limit,
-        output: a.output,
+        output,
         timeout_s: a.timeout,
     })?;
     eprint!("{summary}");
@@ -624,11 +699,25 @@ fn cmd_import(a: ImportArgs) -> anyhow::Result<ExitCode> {
         min_path_share: a.min_path_share,
         ..Default::default()
     };
-    let program = crate::histories::import(&a.paths, &opts)?;
+    let (paths, output) = match &a.profile {
+        Some(name) => {
+            let area = profile_area(name, profile::WORKLOAD_DIR)?;
+            let paths = if a.paths.is_empty() {
+                vec![area.join("histories")]
+            } else {
+                a.paths.iter().map(|p| profile::within(&area, p)).collect()
+            };
+            let output = a.output.unwrap_or_else(|| PathBuf::from("workflows.yaml"));
+            (paths, Some(profile::within(&area, &output)))
+        }
+        None => (a.paths, a.output),
+    };
+    let program = crate::histories::import(&paths, &opts)?;
     eprint!("{}", program.summary);
-    match a.output {
+    match output {
         Some(f) => {
-            std::fs::write(&f, &program.yaml)?;
+            // it names your workflow types, activity types and task queues
+            profile::write_private(&f, program.yaml.as_bytes())?;
             eprintln!("wrote {}", f.display());
         }
         None => print!("{}", program.yaml),
@@ -755,6 +844,35 @@ fn cmd_profile(cmd: ProfileCmd) -> anyhow::Result<ExitCode> {
                 }
             }
             println!("run it with: tempdes run --profile {}", a.name);
+        }
+        ProfileCmd::Init { name, description } => {
+            let dir = store.init(&name, description.as_deref())?;
+            println!("created profile {name} in {}", dir.display());
+            for (file, what) in [
+                ("profile.yaml".to_string(), "the run's options".to_string()),
+                (
+                    "scenario.yaml".to_string(),
+                    "the cluster and its workload: an example to edit".to_string(),
+                ),
+                (
+                    format!("{}/", profile::METRICS_DIR),
+                    format!("what `tempdes metrics fetch --profile {name}` writes"),
+                ),
+                (
+                    format!("{}/", profile::WORKLOAD_DIR),
+                    format!("what `tempdes workload fetch` and `import --profile {name}` write"),
+                ),
+            ] {
+                println!("  {file:<15}{what}");
+            }
+            if let Some(root) = profile::untracked_in_git(store.dir()) {
+                eprintln!(
+                    "warning: the profile store is inside the git working tree {} and git doesn't ignore it, so `git add -A` would commit your profiles",
+                    root.display()
+                );
+            }
+            println!("check it with: tempdes profile show {name}");
+            println!("run it with:   tempdes run --profile {name}");
         }
         ProfileCmd::List => {
             let profiles = store.list()?;

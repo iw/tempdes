@@ -337,6 +337,9 @@ tempdes metrics scan --url https://prometheus.example \
 # the observations for the 15 minutes ending at --end, and for the 15 minutes before the run
 tempdes metrics fetch --url https://prometheus.example --end 2026-10-01T22:17Z --window 15m \
     -o observed.yaml --baseline-end 2026-10-01T21:55Z --rename orders-prod=orders
+# the same, into profile prod's metrics folder in the store
+tempdes metrics fetch --url https://prometheus.example --end 2026-10-01T22:17Z --window 15m \
+    --profile prod --baseline-end 2026-10-01T21:55Z --rename orders-prod=orders
 ```
 
 These commands work as follows:
@@ -556,6 +559,9 @@ keeps to some workflow types, and `--query` adds a visibility filter, such as
   1.3h, p99 1.4h, max 1.5h`. A window longer than 1,440 slices is listed in longer ones.
 * **Start rates.** `import` takes each type's start rate from `fetch.yaml`: the executions
   started in the window without a parent, over the window's length. `--rate` still wins.
+* **Into a profile.** `--profile NAME` fetches into that profile's `workload` folder in the
+  store, as `workload/histories`, and `workload import --profile NAME` reads them there (see
+  [Saved run profiles](#saved-run-profiles)).
 * **Privacy.** Payloads (inputs, results, details, memos, headers and search attribute values)
   and failures' messages and stack traces are dropped before anything is written, and the
   directory and its files are readable only by you. The files still name workflow types,
@@ -580,7 +586,13 @@ Options given on the command line apply on top of the profile.
 A scenario file placed in the store as `<name>.yaml` is a profile too: `--profile <name>` runs
 it, and `profile save NEW --profile <name> [options]` builds a saved profile on top of it.
 
+`profile init NAME` starts a profile from a prototype instead. Its `profile.yaml` and
+`scenario.yaml` show every setting, each commented. The ones that are optional are commented
+out, with their defaults or an example. It runs as written, as an example cluster and workload
+to edit into yours.
+
 ```bash
+tempdes profile init staging --description "staging, to fill in"   # a prototype to edit
 tempdes profile save prod my-cluster.yaml -r history=4 --client-lb round_robin -o observed.yaml \
     --description "production, weekday peak"
 tempdes run --profile prod                  # the saved run
@@ -597,9 +609,27 @@ Profiles usually describe a real cluster, so they are kept private and outside a
 * **Location.** The store is `~/.config/tempdes/profiles`, or `%APPDATA%\tempdes\profiles` on
   Windows. `$XDG_CONFIG_HOME/tempdes/profiles` or `$TEMPDES_PROFILES` override it, and
   `tempdes profile dir` prints it.
-* **Permissions.** Each profile is a directory holding `profile.yaml` and copies of the scenario
-  and the observed-metrics files, including the scrape files they refer to. On Unix, the store's
-  directories are created readable only by you (`0700`), and its files likewise (`0600`).
+* **Layout.** Each profile is a directory:
+
+  ```
+  prod/
+    profile.yaml     the run's options
+    scenario.yaml    the cluster and its workload
+    metrics/         observed metrics: what `metrics fetch --profile prod` writes, and the
+                     copies `profile save` makes, with the scrape files they refer to
+    workload/        histories/ from `workload fetch --profile prod`, and workflows.yaml
+                     from `workload import --profile prod`
+  ```
+
+* **Fetching into a profile.** With `--profile NAME`, `metrics fetch` writes
+  `metrics/observed.yaml` (and `metrics/baseline.yaml` with `--baseline-end`), and `workload
+  fetch` writes `workload/histories`. `workload import` then reads `workload/histories` and
+  writes `workload/workflows.yaml` instead of printing it. A relative `-o`, or a relative path
+  to import, is taken inside that folder, and an absolute one as given. `metrics fetch` says
+  when the profile doesn't read the file yet: list it under `observed:` in `profile.yaml`.
+  Paste the imported workflows into the scenario's `workflows:`.
+* **Permissions.** On Unix, the store's directories are created readable only by you (`0700`),
+  and its files likewise (`0600`).
 * **Standalone copies.** After saving, a profile runs even if the original files are deleted.
   Files the scenario itself refers to, such as Helm values or dynamic config files, are not
   copied: they are still read from the scenario's original folder, and `profile show` lists them.

@@ -1,0 +1,261 @@
+# tempdes scenario for profile __NAME__: a Temporal cluster and the load it runs, written by
+# `tempdes profile init` as an example to edit. `tempdes run --profile __NAME__` simulates it,
+# with the options in profile.yaml beside it.
+#
+# Units: durations "500us", "2ms", "1.5s", "5m", "2h" (a bare number is seconds); rates
+# "120/s", "3000/min", "10/h"; sizes "512", "4KiB", "2MiB". A duration distribution is one
+# duration ("30ms") or quantiles ({ p50: 30ms, p99: 250ms }).
+#
+# Every section refuses keys it doesn't know, so a misspelt key fails rather than being ignored.
+# Commented-out settings show their defaults or an example: uncomment to use them.
+
+name: __NAME_Q__                          # shown in reports
+description: >
+  Order processing in the orders namespace: what this cluster and workload model.
+seed: 1                               # the same seed reproduces a run exactly (default 1)
+warmup: 1m                            # simulated time run before measuring (default 30s)
+duration: 5m                          # simulated time measured (required)
+
+cluster:
+  # A temporalio/helm-charts values file. Where it sets them, its replica counts, CPU limits,
+  # numHistoryShards, store and SQL maxConns replace those below; its server.dynamicConfig only
+  # fills keys that dynamic_config below doesn't set. `-r` and `-d` on the command line win
+  # over both.
+#{off
+  helm_values: values.yaml
+#}off
+  num_history_shards: 512             # persistence.numHistoryShards: fixed when the cluster was made
+  replicas:                           # pods per service; frontend, history and matching need 1 or more
+    frontend: 3
+    history: 3
+    matching: 3
+    worker: 1                         # the internal worker service (default 1)
+  resources:                          # CPU cores per pod: its limit, which sets GOMAXPROCS
+    frontend: { cpu: 2 }              # defaults: frontend 2, history 4, matching 2, worker 1
+    history: { cpu: 4 }
+    matching: { cpu: 2 }
+    worker: { cpu: 1 }
+  # The ringpop member addresses (ip:port) per service, to reproduce a live cluster's exact
+  # shard and partition placement.
+#{off
+  member_addresses:
+    history: ["10.0.1.10:7234", "10.0.1.11:7234", "10.0.1.12:7234"]
+#}off
+  network:
+    client_rtt: 2ms                   # SDK clients and workers to the frontend (default 2ms)
+    internal_rtt: 0.5ms               # between Temporal pods (default 0.5ms)
+    # How clients and workers spread requests over the frontends: pinned (one connection per
+    # process through an L4 balancer, the default), round_robin (gRPC client-side balancing)
+    # or proxy (an L7 proxy, per request).
+    client_lb: pinned
+#{off
+    proxy_latency: 1ms                # proxy only: latency it adds per request (default 1ms)
+    proxy_discovery: 15s              # proxy only: until a new frontend pod gets traffic (default 15s)
+#}off
+  persistence:
+    store: postgresql                 # cassandra, mysql, postgresql or sqlite
+    max_conns:                        # SQL connection pool per pod, maxConns (default 20 each)
+      frontend: 20
+      history: 50
+      matching: 30
+      worker: 10
+    # Operations the database serves at once before requests queue: about vCPUs x 4 for
+    # Aurora. Calibration can infer it.
+    capacity: 160
+    latency:                          # service time per operation at low load; `default` for the rest
+      default: { p50: 2ms, p99: 10ms }
+      UpdateWorkflowExecution: { p50: 3ms, p99: 14ms }
+      CreateWorkflowExecution: { p50: 4ms, p99: 18ms }
+#{off
+    write_per_mib: 20ms               # time added per MiB of history written (default 20ms)
+    read_per_mib: 5ms                 # time added per MiB of history read (default 5ms)
+#}off
+  visibility:
+    store: elasticsearch              # elasticsearch (default), opensearch, postgresql or mysql
+#{off
+    capacity: 32
+    write_latency: { p50: 5ms, p99: 30ms }
+    read_latency: { p50: 10ms, p99: 60ms }
+    bulk_latency: { p50: 20ms, p99: 120ms }   # Elasticsearch bulk requests
+#}off
+
+# The cluster's dynamic config, in Temporal's own format: files first, then values inline,
+# which win. A value with constraints applies where they match, over the unconstrained one.
+# `tempdes dc search`, `dc explain` and `dc modeled` list the keys and what the simulator uses.
+#{off
+dynamic_config_files:
+  - dynamicconfig.yaml
+#}off
+dynamic_config:
+  history.shardIOConcurrency:
+    - value: 1
+  frontend.namespaceRPS:
+    - value: 2400
+#{off
+    - value: 4800
+      constraints: { namespace: orders }
+#}off
+
+# Namespaces come from the workers and workflows. List one here only to give its ID, which
+# matters only for exact shard placement of known workflow IDs.
+namespaces:
+  - name: orders
+#{off
+    id: 2f8a6c1e-5b7d-4e0a-9c3f-1d2e3f4a5b6c
+#}off
+
+# A fleet of worker processes for each namespace and task queue the workflows use. Defaults
+# follow the Go SDK; the Java SDK's are 5 pollers and 200 slots of each kind.
+workers:
+  - name: order-workers
+    namespace: orders                 # default: default
+    task_queue: orders
+    processes: 6                      # worker processes (pods); 0 is a fleet that is down (default 1)
+    workflow_pollers: 4               # MaxConcurrentWorkflowTaskPollers per process (default 2)
+    activity_pollers: 8               # MaxConcurrentActivityTaskPollers per process (default 2)
+    workflow_slots: 200               # MaxConcurrentWorkflowTaskExecutionSize (default 1000)
+    activity_slots: 200               # MaxConcurrentActivityExecutionSize (default 1000)
+    sticky_cache_size: 5000           # workflows cached per process (default 10000)
+#{off
+    sticky_schedule_to_start_timeout: 5s   # before a sticky task goes to the normal queue (default 5s)
+    cpu: 2                            # cores per process for workflow tasks (default unbounded)
+    task_queue_activities_per_second: 500  # the task queue's server-side dispatch limit
+    poll_timeout: 70s                 # the SDK's long-poll deadline (default 70s)
+    rpc_timeout: 10s                  # deadline of every other SDK call, retries included (default 10s)
+    eager_activities: false           # request eager activity execution (default false)
+#}off
+#{off
+  - name: heavy-workers               # a second fleet, for the activities sent to orders-heavy
+    namespace: orders
+    task_queue: orders-heavy
+    processes: 2
+#}off
+
+# The workflow types and their steps. `tempdes workload fetch --profile __NAME__` fetches
+# histories into workload/histories, and `tempdes workload import --profile __NAME__` infers
+# workflow types from them into workload/workflows.yaml: paste its entries in place of these.
+workflows:
+  - type: OrderWorkflow
+    namespace: orders                 # default: default
+    task_queue: orders                # a fleet must poll it
+    # Client starts. Omit it for a type started only as a child or by schedules; with
+    # calibration's workload on, it is scaled to the observed start rate.
+    start_rate: 50/s
+#{off
+    arrival: poisson                  # poisson (default) or uniform
+    ramp: { from: 0.2, over: 2m }     # rise from 20% of start_rate over the first 2m
+    starters: 4                       # client processes issuing starts (default 4)
+    start_with: start                 # start (default), signal (signal-with-start), update (update-with-start)
+    existing: 0.0                     # signal or update: the share of calls finding the workflow running
+    eager_start: false                # return the first workflow task with the start (default false)
+    await_result: false               # clients long-poll for the result (default false)
+    rpc_timeout: 10s                  # deadline of each start call (default 10s)
+    replay_per_event: 20us            # worker time per event replayed on a sticky cache miss (default 20us)
+    payload_bytes: 1KiB               # each input and result in the history (default 1KiB)
+#}off
+    wft_processing: { p50: 2ms, p99: 12ms }   # worker time per workflow task, cached (the default)
+    # The steps, in order. One workflow task starts each step.
+    steps:
+      - activity:                     # A: one activity, with every option
+          duration: { p50: 30ms, p99: 250ms }
+#{off
+          count: 1                    # activities started together (default 1)
+          parallel: true              # run together (default) or one after another
+          heartbeat: 5s               # interval of RecordActivityTaskHeartbeat
+#}off
+          # Failures: either failure_rate (the share of attempts that fail and are retried) or
+          # attempts per activity, with non_retryable for those that fail for good.
+#{alt
+          failure_rate: 0.01
+#}alt
+#{off
+          attempts: { 1: 0.969, 2: 0.03 }   # shares by attempts; or a count: `attempts: 3`
+          non_retryable: { 1: 0.001 }       # with attempts' shares, adds up to 1
+          failed_duration: 100ms      # how long a failing attempt runs (default: duration)
+          retry_initial: 1s           # retry policy; unset fields come from the namespace's
+          backoff_coefficient: 2.0    #   history.defaultActivityRetryPolicy
+          max_interval: 100s
+          max_attempts: 0             # 0 is unlimited
+          schedule_to_start_timeout: 1m
+          start_to_close_timeout: 30s
+          schedule_to_close_timeout: 5m
+          heartbeat_timeout: 10s      # default: twice heartbeat
+          on_failure: fail            # when it fails for good: fail the workflow (default) or continue
+          task_queue: orders-heavy    # another task queue, polled by a fleet in this namespace
+#}off
+      - activity: { count: 3, parallel: false, duration: { p50: 20ms, p99: 150ms } }   # B: three in turn
+      - local_activity: { duration: 5ms }                                                # C: inside the workflow task
+      - timer: 2s                                                                         # D: a sleep
+      - parallel:                     # E: started by one workflow task; ends when all have
+          - activity: { count: 10, duration: { p50: 40ms, p99: 300ms } }
+          - child_workflow: { workflow_type: ShipmentWorkflow, count: 2 }
+#{off
+      - wait_signal: { count: 1, timeout: 1h }   # F: wait for signals (load.signals sends them)
+#}off
+
+  - type: ShipmentWorkflow            # a child type: no start_rate
+    namespace: orders
+    task_queue: orders
+    steps:
+      - activity: { duration: { p50: 40ms, p99: 300ms } }
+
+# Load besides the starts.
+#{off
+load:
+  signals:
+    - workflow_type: OrderWorkflow
+      rate: 20/s
+      target: running                 # running (default): a random running workflow; hot: a few entities
+      hot_workflows: 1                # hot only: how many (default 1)
+      clients: 4                      # client processes (default 4)
+      rpc_timeout: 10s
+  queries:
+    - { workflow_type: OrderWorkflow, rate: 5/s }
+  describes:
+    - { workflow_type: OrderWorkflow, rate: 2/s }
+  visibility:
+    - { namespace: orders, rate: 1/s, op: list }   # list (default) or count
+#}off
+
+# Temporal Schedules, each starting workflow_type every interval.
+#{off
+schedules:
+  - namespace: orders
+    count: 100
+    interval: 1m
+    aligned: true                     # fire together, like cron (default); false spreads them out
+    workflow_type: ShipmentWorkflow
+#}off
+
+# Changes at a point in simulated time, counted from the start of the run, warm-up included.
+#{off
+events:
+  - at: 3m
+    label: scale out
+    replicas: { history: 6 }
+    dynamic_config: { history.shardIOConcurrency: 2 }
+    start_rate: { workflow_type: OrderWorkflow, rate: 100/s }
+    signal_rate: { workflow_type: OrderWorkflow, rate: 40/s }   # needs a signal load to the type
+#}off
+
+# Fit the model to observed metrics: a profile's `observed` files, or these. Each part runs
+# only when the observations hold what it needs.
+#{off
+calibration:
+  observations: [metrics/observed.yaml]   # relative to scenario_dir, the profile's folder
+  persistence_latency: true           # database service times from persistence_latency (default true)
+  cpu: true                           # CPU costs from observed CPU (default true)
+  workload: true                      # start and signal rates from the observed calls (default true)
+#}off
+
+# CPU per call, over the built-in costs: service, then operation.
+#{off
+costs:
+  history: { RespondWorkflowTaskCompleted: 900us }
+#}off
+
+report:
+  warn_utilization: 0.70              # utilisation flagged as a warning (default 0.70)
+  critical_utilization: 0.90          # and as critical (default 0.90)
+  api_p99_slo: 500ms                  # objective for client-facing API p99 (default 500ms)
+  top: 5                              # items listed per hotspot (default 5)

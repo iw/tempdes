@@ -8,18 +8,24 @@
 //! ```text
 //! ~/.config/tempdes/profiles/prod/
 //!   profile.yaml         the run options
-//!   scenario.yaml        a copy of the scenario
-//!   observed/1/…         copies of the observed-metrics files (and their scrape files)
+//!   scenario.yaml        the scenario: a copy, or the one `tempdes profile init` wrote
+//!   metrics/             observed metrics: what `tempdes metrics fetch --profile prod` writes,
+//!                        and the copies `profile save` makes (with their scrape files)
+//!   workload/            what `tempdes workload fetch` and `import --profile prod` write:
+//!                        histories/ and workflows.yaml
 //! ```
 //!
-//! A scenario file placed in the store as `<name>.yaml` is a profile too: the scenario is the
-//! whole run.
+//! `tempdes profile init` writes a profile to start from ([`template`]). A scenario file placed
+//! in the store as `<name>.yaml` is a profile too: the scenario is the whole run, and it has no
+//! folder for what is fetched.
 //!
 //! The store is `$TEMPDES_PROFILES`, else `$XDG_CONFIG_HOME/tempdes/profiles`, else
 //! `~/.config/tempdes/profiles` (`%APPDATA%\tempdes\profiles` on Windows). On Unix its
 //! directories are created `0700` and its files `0600`. Files the scenario itself refers to
 //! (Helm values, dynamic config files, calibration observations) are not copied: they still
 //! resolve against the scenario's original folder.
+
+pub mod template;
 
 use std::path::{Component, Path, PathBuf};
 
@@ -264,6 +270,14 @@ pub struct Store {
 /// The file inside each profile directory.
 const PROFILE_FILE: &str = "profile.yaml";
 
+/// Inside a profile's folder: the observed metrics, which `tempdes metrics fetch --profile`
+/// writes and `profile save` copies.
+pub const METRICS_DIR: &str = "metrics";
+
+/// Inside a profile's folder: the histories and the workflows inferred from them, which
+/// `tempdes workload fetch` and `import --profile` write.
+pub const WORKLOAD_DIR: &str = "workload";
+
 impl Store {
     /// The store at its default location (see the module docs). Nothing is created until a
     /// profile is saved.
@@ -448,6 +462,70 @@ impl Store {
         })
     }
 
+    /// Start profile `name` from the prototype ([`template`]): its folder, a commented
+    /// `profile.yaml` and `scenario.yaml`, and the `metrics` and `workload` folders.
+    pub fn init(&self, name: &str, description: Option<&str>) -> anyhow::Result<PathBuf> {
+        let target = self.profile_dir(name)?;
+        if let Some((_, path)) = self.locate(name)? {
+            bail!(
+                "profile {name:?} already exists ({}); remove it with `tempdes profile remove {name}`, or choose another name",
+                path.display()
+            );
+        }
+        if target.exists() {
+            bail!(
+                "{} already exists but isn't a profile; move it away, or choose another name",
+                target.display()
+            );
+        }
+        create_private_dir(&self.dir)?;
+        let staging = self
+            .dir
+            .join(format!(".{name}.initialising-{}", std::process::id()));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        let written = (|| -> anyhow::Result<()> {
+            create_private_dir(&staging)?;
+            // the files name the folder they will be in
+            let files = template::render(
+                template::Variant::Template,
+                name,
+                &absolute(&target),
+                description,
+            );
+            for (file, text) in files {
+                write_private(&staging.join(file), text.as_bytes())?;
+            }
+            create_private_dir(&staging.join(METRICS_DIR))?;
+            create_private_dir(&staging.join(WORKLOAD_DIR))
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        std::fs::rename(&staging, &target)
+            .with_context(|| format!("creating {}", target.display()))?;
+        Ok(target)
+    }
+
+    /// The folder of saved profile `name`, where `--profile NAME` puts what is fetched and
+    /// imported.
+    pub fn folder(&self, name: &str) -> anyhow::Result<PathBuf> {
+        match self.locate(name)? {
+            Some((Kind::Saved, dir)) => Ok(dir),
+            Some((Kind::Scenario, file)) => bail!(
+                "profile {name:?} is the scenario file {}, with no folder for what is fetched; \
+                 give it one with `tempdes profile save {name}-2 --profile {name}`",
+                file.display()
+            ),
+            None => bail!(
+                "no profile {name:?} in {}; `tempdes profile init {name}` starts one",
+                self.dir.display()
+            ),
+        }
+    }
+
     /// Delete profile `name`: a saved profile's directory, or a scenario profile's file.
     pub fn remove(&self, name: &str) -> anyhow::Result<PathBuf> {
         let Some((kind, path)) = self.locate(name)? else {
@@ -472,8 +550,8 @@ fn write_profile(
     copy_private(&spec.scenario, &dir.join("scenario.yaml"))?;
     let mut observed = Vec::new();
     for (i, f) in spec.options.observed.iter().enumerate() {
-        let sub = PathBuf::from("observed").join((i + 1).to_string());
-        create_private_dir(&dir.join("observed"))?;
+        let sub = PathBuf::from(METRICS_DIR).join((i + 1).to_string());
+        create_private_dir(&dir.join(METRICS_DIR))?;
         create_private_dir(&dir.join(&sub))?;
         let file_name = f
             .file_name()
@@ -561,6 +639,15 @@ pub fn check_name(name: &str) -> anyhow::Result<()> {
 
 fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// `path` inside `folder`, unless it is absolute.
+pub fn within(folder: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        folder.join(path)
+    }
 }
 
 /// Create `dir` (and missing parents), and make `dir` itself private to the user.
@@ -758,8 +845,8 @@ mod tests {
             .save("prod", &spec, Some("private cluster".into()), false)
             .unwrap();
         assert!(saved.dir.join("scenario.yaml").is_file());
-        assert!(saved.dir.join("observed/1/observed.yaml").is_file());
-        assert!(saved.dir.join("observed/1/scrape.prom").is_file());
+        assert!(saved.dir.join("metrics/1/observed.yaml").is_file());
+        assert!(saved.dir.join("metrics/1/scrape.prom").is_file());
         assert_eq!(saved.copied.len(), 3);
 
         #[cfg(unix)]
@@ -886,5 +973,113 @@ mod tests {
         spec.options.replicas = vec!["history".into()];
         assert!(store.save("bad", &spec, None, false).is_err());
         assert!(store.list().unwrap().is_empty());
+    }
+
+    /// Simulate `spec` for two seconds: it loads, and its settings hold together.
+    fn runs(spec: &RunSpec) {
+        let sc = spec.load_scenario().unwrap();
+        let mut ov = spec.options.overrides().unwrap();
+        ov.warmup_s = Some(0.0);
+        ov.duration_s = Some(2.0);
+        for f in &spec.options.observed {
+            Observations::load(f).unwrap();
+        }
+        let params = crate::run::prepare(&sc, &ov, None).unwrap();
+        crate::run::run_params(params);
+    }
+
+    #[test]
+    fn init_writes_a_private_prototype_that_runs() {
+        let store = Store::at(temp_dir("init"));
+        let dir = store.init("first", Some("a first try")).unwrap();
+        for f in ["profile.yaml", "scenario.yaml"] {
+            assert!(dir.join(f).is_file(), "{f}");
+        }
+        for d in [METRICS_DIR, WORKLOAD_DIR] {
+            assert!(dir.join(d).is_dir(), "{d}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir), 0o700);
+            assert_eq!(mode(&dir.join("profile.yaml")), 0o600);
+            assert_eq!(mode(&dir.join(METRICS_DIR)), 0o700);
+        }
+        let entry = store.load("first").unwrap();
+        assert_eq!(entry.kind, Kind::Saved);
+        assert_eq!(entry.description.as_deref(), Some("a first try"));
+        // the scenario's relative paths resolve in the profile's folder
+        assert_eq!(entry.spec.scenario_dir, absolute(&dir));
+        assert_eq!(
+            entry.spec.load_scenario().unwrap().name.as_deref(),
+            Some("first")
+        );
+        runs(&entry.spec);
+        // no staging folder is left behind
+        let names: Vec<String> = std::fs::read_dir(store.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["first"]);
+    }
+
+    #[test]
+    fn every_setting_in_the_prototype_is_valid() {
+        // the template with every commented-out setting switched on, beside the files they read
+        let dir = temp_dir("full").join("full");
+        create_private_dir(&dir.join(METRICS_DIR)).unwrap();
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        for (from, to) in [
+            ("helm/values-prod.yaml", "values.yaml"),
+            ("dynamicconfig/production.yaml", "dynamicconfig.yaml"),
+            ("metrics/observed.yaml", "metrics/observed.yaml"),
+        ] {
+            std::fs::copy(examples.join(from), dir.join(to)).unwrap();
+        }
+        for (file, text) in template::render(template::Variant::Full, "full", &dir, None) {
+            std::fs::write(dir.join(file), text).unwrap();
+        }
+        let entry = Store::at(dir.parent().unwrap()).load("full").unwrap();
+        assert!(!entry.spec.options.observed.is_empty());
+        assert!(!entry.spec.options.dc.is_empty());
+        let sc = entry.spec.load_scenario().unwrap();
+        assert!(sc.calibration.is_some() && !sc.events.is_empty() && !sc.schedules.is_empty());
+        runs(&entry.spec);
+    }
+
+    #[test]
+    fn init_never_overwrites() {
+        let store = Store::at(temp_dir("init-twice"));
+        store.init("p", None).unwrap();
+        let err = store.init("p", None).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        // nor a scenario file that is a profile, nor a folder that isn't one
+        std::fs::write(store.dir().join("q.yaml"), "duration: 1s\n").unwrap();
+        assert!(store.init("q", None).is_err());
+        std::fs::create_dir_all(store.dir().join("r")).unwrap();
+        let err = store.init("r", None).unwrap_err().to_string();
+        assert!(err.contains("isn't a profile"), "{err}");
+        assert!(store.init("../x", None).is_err());
+    }
+
+    #[test]
+    fn imports_go_into_a_saved_profiles_folder() {
+        let store = Store::at(temp_dir("folder"));
+        let dir = store.init("p", None).unwrap();
+        assert_eq!(store.folder("p").unwrap(), dir);
+        std::fs::copy(scenario_copy(store.dir()), store.dir().join("single.yaml")).unwrap();
+        let err = store.folder("single").unwrap_err().to_string();
+        assert!(err.contains("no folder"), "{err}");
+        let err = store.folder("nope").unwrap_err().to_string();
+        assert!(err.contains("`tempdes profile init nope`"), "{err}");
+        // relative paths are inside the folder, absolute ones as given
+        let area = dir.join(METRICS_DIR);
+        assert_eq!(
+            within(&area, Path::new("burst.yaml")),
+            area.join("burst.yaml")
+        );
+        let abs = std::env::temp_dir().join("elsewhere.yaml");
+        assert_eq!(within(&area, &abs), abs);
     }
 }
