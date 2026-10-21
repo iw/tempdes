@@ -9,10 +9,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempdes::envconfig::{Choice, Loaded, load_with};
-use tempdes::histories::fetch::{Cli, FetchArgs, Via, fetch};
+use tempdes::histories::fetch::{Cli, FetchArgs, Pace, Via, fetch};
 use tempdes::histories::{Options, import, read_manifest};
 
 /// A payload as the frontend sends it with `noPayloadShorthand`: `{"card":"4111"}`.
@@ -25,6 +26,8 @@ struct Request {
     params: BTreeMap<String, String>,
     /// lower-case names
     headers: BTreeMap<String, String>,
+    /// when it arrived
+    at: Instant,
 }
 
 fn decode(s: &str) -> String {
@@ -278,6 +281,19 @@ fn answer(path: &str, params: &BTreeMap<String, String>) -> (u16, &'static str, 
 
 /// A stand-in frontend; its base URL and the requests it served.
 fn frontend() -> (String, Arc<Mutex<Vec<Request>>>) {
+    stand_in(Trouble::default())
+}
+
+/// How a stand-in frontend misbehaves.
+#[derive(Default)]
+struct Trouble {
+    /// the first history requests it refuses, as its rate limiter would
+    refused_reads: usize,
+    /// how long it takes over the first listing
+    slow_listing: Duration,
+}
+
+fn stand_in(mut trouble: Trouble) -> (String, Arc<Mutex<Vec<Request>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let served = Arc::new(Mutex::new(Vec::new()));
@@ -308,11 +324,26 @@ fn frontend() -> (String, Arc<Mutex<Vec<Request>>>) {
                     (decode(k), decode(v))
                 })
                 .collect();
-            let (status, content_type, body) = answer(path, &params);
+            let at = Instant::now();
+            if path.ends_with("/workflows") {
+                std::thread::sleep(std::mem::take(&mut trouble.slow_listing));
+            }
+            let (status, content_type, body) =
+                if path.ends_with("/history") && trouble.refused_reads > 0 {
+                    trouble.refused_reads -= 1;
+                    (
+                        429,
+                        "application/json",
+                        json!({"code": 8, "message": "namespace rate limit exceeded"}),
+                    )
+                } else {
+                    answer(path, &params)
+                };
             log.lock().unwrap().push(Request {
                 path: path.to_string(),
                 params,
                 headers,
+                at,
             });
             let body = body.to_string();
             let _ = write!(
@@ -353,6 +384,15 @@ fn profile(dir: &Path) -> Loaded {
     .unwrap()
 }
 
+/// Fast enough for tests, which time their own.
+fn quick() -> Pace {
+    Pace {
+        list_per_s: 1000.0,
+        read_per_s: 1000.0,
+        first_wait: Duration::from_millis(10),
+    }
+}
+
 fn args(url: &str, profile: Loaded, output: PathBuf) -> FetchArgs {
     FetchArgs {
         via: Via::Http {
@@ -368,6 +408,7 @@ fn args(url: &str, profile: Loaded, output: PathBuf) -> FetchArgs {
         limit: 300,
         output,
         timeout_s: 10.0,
+        pace: quick(),
     }
 }
 
@@ -548,6 +589,111 @@ fn an_empty_window_says_how_long_the_namespace_keeps_executions() {
     assert!(!base.join("histories").exists());
 }
 
+#[test]
+fn requests_go_one_at_a_time_at_their_pace() {
+    let (url, served) = frontend();
+    let base = fresh_dir("paced");
+    let mut a = args(&url, profile(&base), base.join("histories"));
+    a.pace = Pace {
+        list_per_s: 20.0,
+        read_per_s: 40.0,
+        ..quick()
+    };
+    let summary = fetch(&a).unwrap();
+    let reqs = served.lock().unwrap().clone();
+    // each kind no faster than its pace, over the run: the stand-in stamps a request when it
+    // arrives, a little after it was sent, so one gap can look short but not the whole span
+    let gaps = |list: bool, gap: Duration| {
+        let times: Vec<Instant> = reqs
+            .iter()
+            .filter(|r| (r.path == "/api/v1/namespaces/orders/workflows") == list)
+            .map(|r| r.at)
+            .collect();
+        let n = times.len();
+        assert!(n > 3);
+        let span = times[n - 1] - times[0];
+        assert!(
+            span >= gap * (n as u32 - 1) - Duration::from_millis(10),
+            "{n} in {span:?}"
+        );
+        n
+    };
+    let lists = gaps(true, Duration::from_millis(50));
+    let reads = gaps(false, Duration::from_millis(25));
+    assert!(
+        summary.contains(&format!(
+            "{lists} listing and {reads} read requests, one at a time, at most 20/s and 40/s"
+        )),
+        "{summary}"
+    );
+}
+
+#[test]
+fn a_slow_answer_makes_the_next_request_wait_as_long() {
+    let (url, served) = stand_in(Trouble {
+        slow_listing: Duration::from_millis(200),
+        ..Default::default()
+    });
+    let base = fresh_dir("slow");
+    fetch(&args(&url, profile(&base), base.join("histories"))).unwrap();
+    let reqs = served.lock().unwrap().clone();
+    let lists: Vec<Instant> = reqs
+        .iter()
+        .filter(|r| r.path.ends_with("/workflows"))
+        .map(|r| r.at)
+        .collect();
+    // answered 200ms after it arrived, then 200ms more before the next, which was quick
+    assert!(
+        lists[1] - lists[0] >= Duration::from_millis(350),
+        "{:?}",
+        lists[1] - lists[0]
+    );
+    assert!(lists[2] - lists[1] < Duration::from_millis(200));
+}
+
+#[test]
+fn refusals_are_waited_out_and_slow_the_pace() {
+    // two refused, then answered: it goes on, slower
+    let (url, served) = stand_in(Trouble {
+        refused_reads: 2,
+        ..Default::default()
+    });
+    let base = fresh_dir("refused");
+    let mut a = args(&url, profile(&base), base.join("histories"));
+    a.pace.read_per_s = 100.0;
+    let summary = fetch(&a).unwrap();
+    assert!(
+        summary.contains("the frontend refused 2, and they ended at most 1000/s and 25/s"),
+        "{summary}"
+    );
+    // the refused read was asked again after the wait
+    let reqs = served.lock().unwrap().clone();
+    let reads: Vec<&Request> = reqs
+        .iter()
+        .filter(|r| r.path.ends_with("/history"))
+        .collect();
+    assert_eq!(reads[0].params, reads[2].params);
+    assert!(reads[2].at - reads[1].at >= Duration::from_millis(10));
+    assert!(base.join("histories/r-o1.json").is_file());
+
+    // refused over and over: it stops, and says so
+    let (url, _) = stand_in(Trouble {
+        refused_reads: usize::MAX,
+        ..Default::default()
+    });
+    let base = fresh_dir("refused-always");
+    let err = fetch(&args(&url, profile(&base), base.join("histories")))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("the frontend refused 6 requests in a row, the last HTTP 429"),
+        "{err}"
+    );
+    assert!(err.contains("Run the same command later"), "{err}");
+    // what was listed is kept, for the next run to finish
+    assert!(base.join("histories/fetch.yaml").is_file());
+}
+
 /// A stand-in Temporal CLI: a shell script answering `operator namespace describe`, `workflow
 /// list` and `workflow show` from files beside it, and logging each call's arguments.
 #[cfg(unix)]
@@ -564,6 +710,13 @@ case "$1 $2" in
 "operator namespace") cat "$dir/namespace.json" ;;
 "workflow list") cat "$dir/list.jsonl" ;;
 "workflow show")
+  # refusals left: the SDK in the CLI asks again until its deadline, then says only that
+  n=$(cat "$dir/refusals" 2>/dev/null || echo 0)
+  if [ "$n" -gt 0 ]; then
+    echo $((n - 1)) > "$dir/refusals"
+    echo 'time=2026-10-21T14:01:51.872 level=ERROR msg="failed reading history: context deadline exceeded"' >&2
+    exit 1
+  fi
   for a in "$@"; do case "$a" in --run-id=*) rid="${a#--run-id=}" ;; esac; done
   if [ -f "$dir/$rid.json" ]; then cat "$dir/$rid.json"
   else echo "Error: unable to show workflow: workflow execution not found" >&2; exit 1; fi ;;
@@ -603,6 +756,7 @@ fn cli_args(cli: Cli, slice: &str, output: PathBuf) -> FetchArgs {
         limit: 300,
         output,
         timeout_s: 10.0,
+        pace: quick(),
     }
 }
 
@@ -696,6 +850,33 @@ fn the_cli_lists_and_fetches_with_its_own_configuration() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn the_cli_is_asked_again_when_the_frontend_refuses() {
+    let base = fresh_dir("cli-refused");
+    let program = fake_cli(&base.join("bin"));
+    std::fs::write(base.join("bin/refusals"), "2").unwrap();
+    let cli = Cli {
+        program,
+        namespace: Some("orders".into()),
+        address: None,
+        args: Vec::new(),
+    };
+    let out = base.join("histories");
+    let summary = fetch(&cli_args(cli, "15m", out.clone())).unwrap();
+    assert!(summary.contains("the frontend refused 2"), "{summary}");
+    let log = std::fs::read_to_string(base.join("bin/calls.log")).unwrap();
+    let shows: Vec<&str> = log
+        .lines()
+        .filter(|c| c.starts_with("workflow show"))
+        .collect();
+    // the refused show twice more, then the others once each
+    assert_eq!(shows[0], shows[1]);
+    assert_eq!(shows[1], shows[2]);
+    assert_eq!(shows.len(), 2 + 6);
+    assert!(out.join("r-o1.json").is_file());
+}
+
 #[test]
 fn a_missing_cli_says_how_to_point_at_it() {
     let base = fresh_dir("nocli");
@@ -710,4 +891,169 @@ fn a_missing_cli_says_how_to_point_at_it() {
         .to_string();
     assert!(err.contains("cannot run the Temporal CLI"), "{err}");
     assert!(err.contains("--cli PATH"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn with_a_profile_histories_go_into_its_workload_folder() {
+    let base = fresh_dir("cli-profile");
+    let program = fake_cli(&base.join("bin"));
+    let store = base.join("store");
+    let tempdes = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tempdes"))
+            .args(args)
+            .env("TEMPDES_PROFILES", &store)
+            .output()
+            .unwrap()
+    };
+    assert!(tempdes(&["profile", "init", "p"]).status.success());
+    let out = tempdes(&[
+        "workload",
+        "fetch",
+        "--profile",
+        "p",
+        "--cli",
+        program.to_str().unwrap(),
+        "-n",
+        "orders",
+        "--end",
+        "2026-10-07T01:20:00Z",
+        "--window",
+        "15m",
+        "--slice",
+        "15m",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let histories = store.join("p/workload/histories");
+    assert!(histories.join("fetch.yaml").is_file());
+    assert!(histories.join("r-o1.json").is_file());
+    // import finds them there, and writes beside them
+    let out = tempdes(&[
+        "workload",
+        "import",
+        "--profile",
+        "p",
+        "--namespace",
+        "orders",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("from the 4 starts `workload fetch` counted over 15.0m"),
+        "{stderr}"
+    );
+    assert!(store.join("p/workload/workflows.yaml").is_file());
+
+    // a period of its own: its histories, its workflows, and a scenario named after it
+    let period = "202610070120";
+    let fetch_period = |extra: &[&str]| {
+        let mut args = vec![
+            "workload",
+            "fetch",
+            "--profile",
+            "p",
+            "--period",
+            period,
+            "--cli",
+            program.to_str().unwrap(),
+            "-n",
+            "orders",
+            "--end",
+            "2026-10-07T01:20:00Z",
+            "--window",
+            "15m",
+            "--slice",
+            "15m",
+        ];
+        args.extend_from_slice(extra);
+        tempdes(&args)
+    };
+    let out = fetch_period(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("one at a time, at most 1/s and 5/s"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "next: tempdes workload import --profile p --period {period} --namespace"
+        )),
+        "{stderr}"
+    );
+    let folder = store.join("p/workload").join(period);
+    assert!(folder.join("histories/r-o1.json").is_file());
+    let import = || {
+        tempdes(&[
+            "workload",
+            "import",
+            "--profile",
+            "p",
+            "--period",
+            period,
+            "--namespace",
+            "orders",
+        ])
+    };
+    let out = import();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(folder.join("workflows.yaml").is_file());
+    assert!(
+        stderr.contains(&format!(
+            "doesn't read it yet: set its scenario's `workflows: workload/{period}`"
+        )),
+        "{stderr}"
+    );
+    let scenario = format!(
+        "name: period\nwarmup: 2s\nduration: 3s\ncluster:\n  num_history_shards: 16\n  replicas: {{ frontend: 1, history: 1, matching: 1, worker: 1 }}\n  persistence: {{ store: postgresql }}\nnamespaces: [ {{ name: orders }} ]\nworkers:\n  - {{ name: w, namespace: orders, task_queue: orders, processes: 2 }}\nworkflows: workload/{period}\n"
+    );
+    std::fs::write(store.join(format!("p/{period}.yaml")), scenario).unwrap();
+    let profile_yaml = store.join("p/profile.yaml");
+    let text = std::fs::read_to_string(&profile_yaml).unwrap();
+    assert!(text.contains("\nscenario: scenario.yaml "), "{text}");
+    std::fs::write(
+        &profile_yaml,
+        text.replace(
+            "\nscenario: scenario.yaml ",
+            &format!("\nscenario: {period}.yaml "),
+        ),
+    )
+    .unwrap();
+    let out = tempdes(&["profile", "show", "p"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("reads") && l.ends_with(&format!("{period}{}workflows.yaml", '/'))),
+        "{stdout}"
+    );
+    let out = tempdes(&["run", "--profile", "p"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // imported again, it says what it replaces, and the scenario reads it already
+    let out = import();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("warning: replacing"), "{stderr}");
+    assert!(!stderr.contains("doesn't read it yet"), "{stderr}");
+    // the pace can be lowered, not raised; and a period is a name, not a path
+    let out = fetch_period(&["--list-rate", "2/s"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--list-rate can only lower the pace"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for bad in ["../elsewhere", "histories"] {
+        let out = tempdes(&["workload", "import", "--profile", "p", "--period", bad]);
+        assert!(!out.status.success(), "{bad}");
+    }
 }

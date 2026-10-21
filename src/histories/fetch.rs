@@ -15,7 +15,14 @@
 //!   - through the Temporal CLI itself (`temporal workflow list`, `workflow show` and `operator
 //!     namespace describe`), run once per call with the CLI's own configuration, for a frontend
 //!     only its gRPC port reaches.
+//!
+//! Either way the requests are paced ([`Pace`]): one at a time, at most a listing a second
+//! (the frontend allows a namespace 10 a second by default, shared with everyone listing) and
+//! five history reads a second, and after an answer no sooner than the answer took. When the
+//! frontend refuses one, resource exhausted or unavailable, the fetch waits before asking
+//! again, longer each time, and slows down; after six refusals in a row it stops.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Read};
@@ -61,6 +68,199 @@ pub struct FetchArgs {
     pub output: PathBuf,
     /// seconds allowed per request, or per Temporal CLI command
     pub timeout_s: f64,
+    pub pace: Pace,
+}
+
+/// How fast calls go. They go one at a time, never in parallel.
+#[derive(Clone, Debug)]
+pub struct Pace {
+    /// listing requests (`ListWorkflowExecutions`) a second at most
+    pub list_per_s: f64,
+    /// other requests a second at most: history pages (`GetWorkflowExecutionHistory`) and the
+    /// namespace's description
+    pub read_per_s: f64,
+    /// the wait after the frontend refuses a request; it doubles with each refusal in a row,
+    /// up to a minute
+    pub first_wait: Duration,
+}
+
+/// Listing requests a second at most: a tenth of what each frontend allows a namespace by
+/// default (`frontend.namespaceRPS.visibility`), which the Web UI and other clients share.
+pub const LIST_PER_S: f64 = 1.0;
+
+/// History reads a second at most.
+pub const READ_PER_S: f64 = 5.0;
+
+impl Default for Pace {
+    fn default() -> Self {
+        Pace {
+            list_per_s: LIST_PER_S,
+            read_per_s: READ_PER_S,
+            first_wait: Duration::from_secs(2),
+        }
+    }
+}
+
+/// Refusals in a row after which the fetch stops.
+const REFUSALS: u32 = 6;
+
+/// Events in a history page when the request doesn't say (`frontend.historyMaxPageSize`). The
+/// Temporal CLI pages inside one command, so its requests are counted from what it printed:
+/// histories by this, and listings by [`PAGE_SIZE`], the frontend's default as well as its most.
+const HISTORY_PAGE: usize = 256;
+
+/// What a request reads, which sets its pace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    List = 0,
+    Read = 1,
+}
+
+impl Kind {
+    fn noun(self) -> &'static str {
+        match self {
+            Kind::List => "listing",
+            Kind::Read => "read",
+        }
+    }
+}
+
+/// Requests one at a time, each kind no faster than its pace, and after an answer no sooner
+/// than the answer took, so that a slow frontend is asked more slowly: the fetch is never busy
+/// more than half the time. When the frontend refuses a request (resource exhausted,
+/// unavailable), it waits before asking again, longer after each refusal in a row, and halves
+/// that kind's pace for the rest of the fetch, down to a sixteenth; after [`REFUSALS`] in a
+/// row it gives up.
+struct Pacer {
+    base: [Duration; 2],
+    gap: [Cell<Duration>; 2],
+    next: [Cell<Instant>; 2],
+    started: [Cell<Instant>; 2],
+    first_wait: Duration,
+    in_a_row: Cell<u32>,
+    refused: Cell<u32>,
+    /// what is counted: requests, or Temporal CLI commands, which ask again inside when refused
+    unit: &'static str,
+    calls: [Cell<u64>; 2],
+}
+
+impl Pacer {
+    fn new(p: &Pace, unit: &'static str) -> anyhow::Result<Pacer> {
+        let gap = |per_s: f64, flag: &str| {
+            anyhow::ensure!(
+                per_s.is_finite() && per_s > 0.0,
+                "{flag} must be more than 0/s"
+            );
+            Ok(Duration::from_secs_f64(1.0 / per_s))
+        };
+        let base = [
+            gap(p.list_per_s, "--list-rate")?,
+            gap(p.read_per_s, "--history-rate")?,
+        ];
+        let now = Instant::now();
+        Ok(Pacer {
+            base,
+            gap: base.map(Cell::new),
+            next: [Cell::new(now), Cell::new(now)],
+            started: [Cell::new(now), Cell::new(now)],
+            first_wait: p.first_wait,
+            in_a_row: Cell::new(0),
+            refused: Cell::new(0),
+            unit,
+            calls: [Cell::new(0), Cell::new(0)],
+        })
+    }
+
+    /// Wait for a request of `kind`'s turn. Turns are counted from when requests start, so two
+    /// never start closer together than the pace allows, even after a late one.
+    fn start(&self, kind: Kind) {
+        let i = kind as usize;
+        let at = self.next[i].get();
+        let now = Instant::now();
+        if at > now {
+            std::thread::sleep(at - now);
+        }
+        let started = Instant::now();
+        self.next[i].set(started + self.gap[i].get());
+        self.started[i].set(started);
+        self.calls[i].set(self.calls[i].get() + 1);
+    }
+
+    /// The frontend answered a request of `kind`: the next waits as long as this one took.
+    fn answered(&self, kind: Kind) {
+        let i = kind as usize;
+        let now = Instant::now();
+        let took = now - self.started[i].get();
+        self.next[i].set(self.next[i].get().max(now + took));
+        self.in_a_row.set(0);
+    }
+
+    /// The answer took `pages` requests, as the Temporal CLI pages inside one command: the next
+    /// request waits for them all.
+    fn pages(&self, kind: Kind, pages: usize) {
+        let i = kind as usize;
+        let more = pages.saturating_sub(1) as u32;
+        self.next[i].set(self.next[i].get() + self.gap[i].get() * more);
+    }
+
+    /// The frontend refused a request of `kind` (`why`): wait before it is asked again, and
+    /// slow down, or give up.
+    fn refused(&self, kind: Kind, why: &str) -> anyhow::Result<()> {
+        let i = kind as usize;
+        let n = self.in_a_row.get() + 1;
+        self.in_a_row.set(n);
+        self.refused.set(self.refused.get() + 1);
+        if n >= REFUSALS {
+            bail!(
+                "the frontend refused {n} requests in a row, the last {why}: stopped rather than press it. \
+                 Run the same command later to go on; histories already written are kept"
+            );
+        }
+        let gap = (self.gap[i].get() * 2).min(self.base[i] * 16);
+        self.gap[i].set(gap);
+        let wait = (self.first_wait * 2u32.pow(n - 1)).min(Duration::from_secs(60));
+        self.next[i].set(Instant::now() + wait);
+        eprintln!(
+            "{}the frontend refused a {} ({why}): asking again in {}, and {}s at most {}",
+            if std::io::stderr().is_terminal() {
+                "\n"
+            } else {
+                ""
+            },
+            kind.noun(),
+            fmt_us(wait.as_secs_f64() * 1e6),
+            kind.noun(),
+            per_s(gap)
+        );
+        Ok(())
+    }
+
+    /// The requests made and their pace, for the summary.
+    fn report(&self) -> String {
+        let [list, read] = [0, 1].map(|i| self.calls[i].get());
+        let mut out = format!(
+            "{list} listing and {read} read {}, one at a time, at most {} and {}",
+            self.unit,
+            per_s(self.base[0]),
+            per_s(self.base[1])
+        );
+        let refused = self.refused.get();
+        if refused > 0 {
+            let _ = write!(
+                out,
+                "; the frontend refused {refused}, and they ended at most {} and {}",
+                per_s(self.gap[0].get()),
+                per_s(self.gap[1].get())
+            );
+        }
+        out
+    }
+}
+
+/// A gap between requests as a pace: `5/s`, `0.25/s`.
+fn per_s(gap: Duration) -> String {
+    let r = format!("{:.3}", 1.0 / gap.as_secs_f64());
+    format!("{}/s", r.trim_end_matches('0').trim_end_matches('.'))
 }
 
 /// How the frontend is reached.
@@ -113,7 +313,8 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
     let source: Box<dyn Source + '_> = match &a.via {
         Via::Http { profile, http_url } => {
             let p = &profile.profile;
-            let fe = Frontend::new(p, http_url.as_deref(), a.timeout_s)?;
+            let pacer = Pacer::new(&a.pace, "requests")?;
+            let fe = Frontend::new(p, http_url.as_deref(), a.timeout_s, pacer)?;
             if fe.base.starts_with("http://")
                 && fe.headers.iter().any(|(k, _)| k == "Authorization")
             {
@@ -129,6 +330,7 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
         Via::Cli(cli) => Box::new(CliSource {
             cli,
             timeout: Duration::from_secs_f64(a.timeout_s),
+            pacer: Pacer::new(&a.pace, "commands")?,
         }),
     };
     // the namespace exists, and its retention says whether the window's histories still do
@@ -346,6 +548,7 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
     for note in &notes {
         let _ = writeln!(out, "{note}");
     }
+    let _ = writeln!(out, "{}", source.pacer().report());
     let _ = write!(
         out,
         "wrote {} histories to {} with {MANIFEST}, readable only by you",
@@ -371,9 +574,7 @@ pub fn fetch(a: &FetchArgs) -> anyhow::Result<String> {
     }
     let _ = writeln!(
         out,
-        "the files name your workflow types, task queues and worker hosts: keep them private\n\
-         next: tempdes workload import {} --namespace <namespace in your scenario> -o workflows.yaml",
-        a.output.display()
+        "the files name your workflow types, task queues and worker hosts: keep them private"
     );
     Ok(out)
 }
@@ -673,6 +874,8 @@ trait Source {
     fn unaddressable(&self, _wid: &str) -> Option<&'static str> {
         None
     }
+    /// What paces the requests.
+    fn pacer(&self) -> &Pacer;
 }
 
 /// The frontend's HTTP API.
@@ -734,18 +937,81 @@ impl Source for HttpSource {
         wid.contains('/')
             .then_some("the HTTP API can't ask for workflow IDs containing '/'")
     }
+
+    fn pacer(&self) -> &Pacer {
+        &self.fe.pacer
+    }
 }
 
 /// The Temporal CLI, run once per call.
 struct CliSource<'a> {
     cli: &'a Cli,
     timeout: Duration,
+    pacer: Pacer,
+}
+
+/// How a Temporal CLI command ended.
+enum Ran {
+    /// its standard output
+    Out(Vec<u8>),
+    /// its standard error
+    Failed(String),
+    /// it took longer than `--timeout`
+    TimedOut,
+}
+
+/// Whether the CLI's error says the frontend refused the request or couldn't serve it. The SDK
+/// in the CLI asks again itself until the call's deadline, so refusals usually end as one.
+fn refusal(stderr: &str) -> bool {
+    let e = stderr.to_ascii_lowercase();
+    [
+        "resource exhausted",
+        "resourceexhausted",
+        "rate limit",
+        "too many",
+        "unavailable",
+        "deadline exceeded",
+    ]
+    .iter()
+    .any(|w| e.contains(w))
 }
 
 impl CliSource<'_> {
+    /// `temporal <args>`, on its turn, asked again while the frontend refuses: its standard
+    /// output, or, when it fails, its standard error.
+    fn call(
+        &self,
+        kind: Kind,
+        ns: Option<&str>,
+        args: &[String],
+    ) -> anyhow::Result<Result<Vec<u8>, String>> {
+        loop {
+            self.pacer.start(kind);
+            match self.run(ns, args)? {
+                Ran::Out(out) => {
+                    self.pacer.answered(kind);
+                    return Ok(Ok(out));
+                }
+                Ran::Failed(e) if refusal(&e) => self.pacer.refused(kind, &brief(&e))?,
+                Ran::Failed(e) => {
+                    self.pacer.answered(kind);
+                    return Ok(Err(e));
+                }
+                Ran::TimedOut => self.pacer.refused(
+                    kind,
+                    &format!(
+                        "`temporal {}` took longer than --timeout ({})",
+                        args[..2.min(args.len())].join(" "),
+                        fmt_us(self.timeout.as_secs_f64() * 1e6)
+                    ),
+                )?,
+            }
+        }
+    }
+
     /// Run `temporal <args>` with the namespace and address, then the arguments passed
-    /// through: its standard output, or, when it fails, its standard error.
-    fn run(&self, ns: Option<&str>, args: &[String]) -> anyhow::Result<Result<Vec<u8>, String>> {
+    /// through.
+    fn run(&self, ns: Option<&str>, args: &[String]) -> anyhow::Result<Ran> {
         let mut cmd = Command::new(&self.cli.program);
         cmd.args(args);
         if let Some(ns) = ns.or(self.cli.namespace.as_deref()) {
@@ -790,11 +1056,7 @@ impl CliSource<'_> {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!(
-                    "`temporal {}` took longer than --timeout ({})",
-                    args[..2.min(args.len())].join(" "),
-                    fmt_us(self.timeout.as_secs_f64() * 1e6)
-                );
+                return Ok(Ran::TimedOut);
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -802,14 +1064,18 @@ impl CliSource<'_> {
         let err = String::from_utf8_lossy(&err.join().unwrap_or_default())
             .trim()
             .to_string();
-        Ok(if status.success() { Ok(out) } else { Err(err) })
+        Ok(if status.success() {
+            Ran::Out(out)
+        } else {
+            Ran::Failed(err)
+        })
     }
 }
 
 impl Source for CliSource<'_> {
     fn namespace(&self) -> anyhow::Result<Namespace> {
         let args = ["operator", "namespace", "describe", "--output=json"].map(String::from);
-        let out = self.run(None, &args)?.map_err(|e| {
+        let out = self.call(Kind::Read, None, &args)?.map_err(|e| {
             anyhow!(
                 "the Temporal CLI couldn't describe the namespace: {}",
                 brief(&e)
@@ -847,10 +1113,13 @@ impl Source for CliSource<'_> {
             "--output=jsonl".into(),
         ];
         let out = self
-            .run(Some(ns), &args)?
+            .call(Kind::List, Some(ns), &args)?
             .map_err(|e| anyhow!("`temporal workflow list` failed: {}", brief(&e)))?;
-        for v in jsonl(&out).context("reading `temporal workflow list --output jsonl`")? {
-            each(&v);
+        let listed = jsonl(&out).context("reading `temporal workflow list --output jsonl`")?;
+        self.pacer
+            .pages(Kind::List, listed.len().div_ceil(PAGE_SIZE as usize));
+        for v in &listed {
+            each(v);
         }
         Ok(())
     }
@@ -868,7 +1137,7 @@ impl Source for CliSource<'_> {
             format!("--run-id={rid}"),
             "--output=json".into(),
         ];
-        let out = match self.run(Some(ns), &args)? {
+        let out = match self.call(Kind::Read, Some(ns), &args)? {
             Ok(out) => out,
             // deleted since it was listed
             Err(e) if e.to_ascii_lowercase().contains("not found") => return Ok(None),
@@ -880,6 +1149,8 @@ impl Source for CliSource<'_> {
             Some(Value::Array(a)) => a.clone(),
             _ => bail!("`temporal workflow show` for {wid} printed no events"),
         };
+        self.pacer
+            .pages(Kind::Read, events.len().div_ceil(HISTORY_PAGE));
         // the CLI may print payloads decoded, as plain JSON: drop them by their shape, and by
         // the fields that hold them
         for e in &mut events {
@@ -887,6 +1158,10 @@ impl Source for CliSource<'_> {
             strip(e, true);
         }
         Ok(Some((events, false)))
+    }
+
+    fn pacer(&self) -> &Pacer {
+        &self.pacer
     }
 }
 
@@ -954,6 +1229,7 @@ struct Frontend {
     /// `scheme://host:port`
     base: String,
     headers: Vec<(String, String)>,
+    pacer: Pacer,
 }
 
 /// What to say when the frontend can't be reached.
@@ -961,7 +1237,12 @@ const UNREACHABLE: &str = "the HTTP API is on the frontend's httpPort, 7243 unle
                            give --http-url if it is elsewhere";
 
 impl Frontend {
-    fn new(p: &Profile, http_url: Option<&str>, timeout_s: f64) -> anyhow::Result<Self> {
+    fn new(
+        p: &Profile,
+        http_url: Option<&str>,
+        timeout_s: f64,
+        pacer: Pacer,
+    ) -> anyhow::Result<Self> {
         let ep = endpoint(p, http_url)?;
         let agent = agent(p, &ep, timeout_s)?;
         let mut headers = Vec::new();
@@ -982,6 +1263,7 @@ impl Frontend {
             agent,
             base: ep.base,
             headers,
+            pacer,
         })
     }
 
@@ -1007,13 +1289,20 @@ impl Frontend {
         parts.join(", ")
     }
 
-    fn get(&self, path: &str, params: &[(&str, String)]) -> anyhow::Result<(Value, String)> {
+    /// A request of `kind`, on its turn, asked again while the frontend refuses it, and after
+    /// a timeout or a broken connection up to 3 times.
+    fn get(
+        &self,
+        kind: Kind,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> anyhow::Result<(Value, String)> {
         let url = format!("{}{path}", self.base);
         let mut wait = Duration::from_millis(500);
-        let mut attempt = 0;
+        let mut broken = 0;
         loop {
-            attempt += 1;
-            let last = attempt == 4;
+            let last = broken == 3;
+            self.pacer.start(kind);
             let mut req = self.agent.get(&url);
             for (k, v) in params {
                 req = req.query(*k, v);
@@ -1024,6 +1313,7 @@ impl Frontend {
             let mut resp = match req.call() {
                 Ok(r) => r,
                 Err(ureq::Error::Timeout(_) | ureq::Error::Io(_)) if !last => {
+                    broken += 1;
                     std::thread::sleep(wait);
                     wait *= 2;
                     continue;
@@ -1047,12 +1337,22 @@ impl Frontend {
                 }
             };
             let status = resp.status().as_u16();
-            // busy: try again
-            if matches!(status, 429 | 502 | 503 | 504) && !last {
-                std::thread::sleep(wait);
-                wait *= 2;
+            // resource exhausted, unavailable, or a proxy's gateway errors: wait, then ask again
+            if matches!(status, 429 | 502 | 503 | 504) {
+                let message = resp
+                    .body_mut()
+                    .read_to_string()
+                    .ok()
+                    .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+                    .and_then(|v| v["message"].as_str().map(str::to_string));
+                let why = match message {
+                    Some(m) => format!("HTTP {status}: {m}"),
+                    None => format!("HTTP {status}"),
+                };
+                self.pacer.refused(kind, &why)?;
                 continue;
             }
+            self.pacer.answered(kind);
             let content_type = resp
                 .headers()
                 .get("content-type")
@@ -1090,7 +1390,7 @@ impl Frontend {
     /// The namespace's retention (`DescribeNamespace`), in seconds.
     fn retention_s(&self, ns: &str) -> anyhow::Result<Option<f64>> {
         let (v, _) = self
-            .get(&format!("/api/v1/namespaces/{}", enc(ns)), &[])
+            .get(Kind::Read, &format!("/api/v1/namespaces/{}", enc(ns)), &[])
             .map_err(|e| match e.downcast_ref::<ApiError>() {
                 Some(x) if x.status == 404 => {
                     anyhow!("namespace {ns} doesn't exist at {}", self.base)
@@ -1116,6 +1416,7 @@ impl Frontend {
             params.push(("nextPageToken", t.to_string()));
         }
         let (v, _) = self.get(
+            Kind::List,
             &format!("/api/v1/namespaces/{}/workflows", enc(ns)),
             &params,
         )?;
@@ -1145,7 +1446,7 @@ impl Frontend {
             if let Some(t) = &token {
                 params.push(("nextPageToken", t.clone()));
             }
-            let (v, content_type) = self.get(&path, &params)?;
+            let (v, content_type) = self.get(Kind::Read, &path, &params)?;
             shorthand |= !content_type.contains("no-payload-shorthand");
             events.extend(
                 v["history"]["events"]

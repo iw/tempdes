@@ -337,6 +337,9 @@ tempdes metrics scan --url https://prometheus.example \
 # the observations for the 15 minutes ending at --end, and for the 15 minutes before the run
 tempdes metrics fetch --url https://prometheus.example --end 2026-10-01T22:17Z --window 15m \
     -o observed.yaml --baseline-end 2026-10-01T21:55Z --rename orders-prod=orders
+# the same, into profile prod's metrics folder in the store
+tempdes metrics fetch --url https://prometheus.example --end 2026-10-01T22:17Z --window 15m \
+    --profile prod --baseline-end 2026-10-01T21:55Z --rename orders-prod=orders
 ```
 
 These commands work as follows:
@@ -459,10 +462,11 @@ temporal workflow show --workflow-id <id> --output json > histories/<id>.json   
 tempdes workload import histories/ --namespace orders --rate 150/s -o workflows.yaml
 ```
 
-The importer prints a `workflows:` block to paste into a scenario, a commented `workers:`
-block to start the worker fleets from, and a summary of what it inferred. Both export spellings
-are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` and `ActivityTaskScheduled`, camelCase or
-snake_case keys).
+The importer prints a `workflows:` block, a commented `workers:` block to start the worker
+fleets from, and a summary of what it inferred. Paste the `workflows:` block into a scenario,
+or write it to a file with `-o` and name the file in the scenario: `workflows: workflows.yaml`.
+Both export spellings are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` and
+`ActivityTaskScheduled`, camelCase or snake_case keys).
 
 * **Steps.** The commands of one workflow task form a step: activities scheduled together run
   in parallel, `LocalActivity` markers are local activities run inside that task, a timer on its
@@ -504,10 +508,11 @@ snake_case keys).
   upserts, updates) may inflate it. Histories that don't record their size leave the default.
 * **Worker fleets are sketched.** Histories record which worker process started each task
   (its `identity`, `pid@host` by default), but not its pollers or slots. The `workers:` block
-  has a fleet for each task queue with the number of processes seen; uncomment it and set the
-  pollers and slots from your deployment. The count is low if the histories are a sample that
-  missed some processes, and high if processes were replaced while the histories ran (a deploy,
-  autoscaling). The summary lists the SDKs the workers report.
+  has a fleet for each task queue with the number of processes seen: copy it into the
+  scenario's `workers:`, uncommented, and set the pollers and slots from your deployment. A
+  scenario that names the file reads only its `workflows:`. The count is low if the histories
+  are a sample that missed some processes, and high if processes were replaced while the
+  histories ran (a deploy, autoscaling). The summary lists the SDKs the workers report.
 * **Privacy.** Payloads are never read, and worker identities, which name hosts, are counted
   but never written. The output does name your workflow and activity types and task queues:
   keep it with your private profiles, not in a repository.
@@ -548,6 +553,20 @@ keeps to some workflow types, and `--query` adds a visibility filter, such as
   to every command, such as `--cli-arg=--env=prod`. `--cli PATH` runs a CLI that isn't on your
   `PATH`, and `--timeout` limits each command. The connection line names the flags passed
   through, never their values.
+* **Pace.** Requests go one at a time, never in parallel. There is at most one listing a
+  second, as listings share each frontend's visibility limit for the namespace
+  (`frontend.namespaceRPS.visibility`, 10 a second by default) with the Web UI and other
+  clients, and at most five history reads a second, a page each. `--list-rate` and
+  `--history-rate` lower either. After each answer, the next request waits at least as long as
+  the answer took, so a frontend that slows down is asked more slowly, and the fetch is never
+  busy more than half the time. When the frontend refuses a request, as resource exhausted or
+  unavailable, `fetch` waits before asking again: 2s, then twice as long after each refusal in
+  a row. It also halves the pace of that kind of request for the rest of the fetch. After six
+  refusals in a row it stops and says so; run it again later to go on. The Temporal CLI asks
+  again by itself until its deadline, which shows as a slow answer. Through it, a command that
+  fails with a deadline exceeded, or takes longer than `--timeout`, counts as refused, and a
+  command that read several pages waits a turn for each. The summary counts the requests made,
+  or the CLI's commands.
 * **Over the window.** For each type, `fetch.yaml` counts the executions started in each slice
   (`started_by_slice`) and closed in each (`closed_by_slice`), how they stood when listed
   (`status`: `Running`, `Completed`, `Failed`, ...), and how long the closed ones ran
@@ -556,15 +575,19 @@ keeps to some workflow types, and `--query` adds a visibility filter, such as
   1.3h, p99 1.4h, max 1.5h`. A window longer than 1,440 slices is listed in longer ones.
 * **Start rates.** `import` takes each type's start rate from `fetch.yaml`: the executions
   started in the window without a parent, over the window's length. `--rate` still wins.
+* **Into a profile.** `--profile NAME` fetches into that profile's `workload` folder in the
+  store, as `workload/histories`, and `workload import --profile NAME` reads them there.
+  `--period PERIOD` keeps a period's in `workload/PERIOD` (see
+  [Saved run profiles](#saved-run-profiles)).
 * **Privacy.** Payloads (inputs, results, details, memos, headers and search attribute values)
   and failures' messages and stack traces are dropped before anything is written, and the
   directory and its files are readable only by you. The files still name workflow types,
   activity types, task queues and worker hosts, so keep them with your private profiles.
 * **Limits.** Histories last only as long as the namespace's retention, and `fetch` warns when
   the window ended longer ago than that. A workflow ID containing `/` can't be asked for over
-  the HTTP API, so it is counted but not fetched; the Temporal CLI fetches it. Run again into the same directory, `fetch`
-  fetches only the histories still missing; a different window or query needs another
-  directory.
+  the HTTP API, so it is counted but not fetched; the Temporal CLI fetches it. Run again into
+  the same directory, `fetch` fetches only the histories still missing; a different window or
+  query needs another directory, or another `--period`.
 
 ## Saved run profiles
 
@@ -580,7 +603,13 @@ Options given on the command line apply on top of the profile.
 A scenario file placed in the store as `<name>.yaml` is a profile too: `--profile <name>` runs
 it, and `profile save NEW --profile <name> [options]` builds a saved profile on top of it.
 
+`profile init NAME` starts a profile from a prototype instead. Its `profile.yaml` and
+`scenario.yaml` show every setting, each commented. The ones that are optional are commented
+out, with their defaults or an example. It runs as written, as an example cluster and workload
+to edit into yours.
+
 ```bash
+tempdes profile init staging --description "staging, to fill in"   # a prototype to edit
 tempdes profile save prod my-cluster.yaml -r history=4 --client-lb round_robin -o observed.yaml \
     --description "production, weekday peak"
 tempdes run --profile prod                  # the saved run
@@ -597,12 +626,55 @@ Profiles usually describe a real cluster, so they are kept private and outside a
 * **Location.** The store is `~/.config/tempdes/profiles`, or `%APPDATA%\tempdes\profiles` on
   Windows. `$XDG_CONFIG_HOME/tempdes/profiles` or `$TEMPDES_PROFILES` override it, and
   `tempdes profile dir` prints it.
-* **Permissions.** Each profile is a directory holding `profile.yaml` and copies of the scenario
-  and the observed-metrics files, including the scrape files they refer to. On Unix, the store's
-  directories are created readable only by you (`0700`), and its files likewise (`0600`).
+* **Layout.** Each profile is a directory:
+
+  ```
+  prod/
+    profile.yaml     the run's options
+    scenario.yaml    the cluster and its workload
+    metrics/         observed metrics: what `metrics fetch --profile prod` writes, and in
+                     saved/ the copies `profile save` makes, with the scrape files they refer to
+    workload/        histories/ from `workload fetch --profile prod`, and workflows.yaml
+                     from `workload import --profile prod`
+  ```
+
+* **Fetching into a profile.** With `--profile NAME`, `metrics fetch` writes
+  `metrics/observed.yaml` (and `metrics/baseline.yaml` with `--baseline-end`), and `workload
+  fetch` writes `workload/histories`. `workload import` then reads `workload/histories` and
+  writes `workload/workflows.yaml` instead of printing it. A relative `-o`, or a relative path
+  to import, is taken inside that folder, and an absolute one as given. `metrics fetch` says
+  when the profile doesn't read the file yet: list it under `observed:` in `profile.yaml`.
+  `workload import` says when the scenario doesn't read its workflows yet: name them in the
+  scenario as `workflows: workload`, which reads `workload/workflows.yaml`. It warns before
+  replacing the file, as edits made to it would be lost.
+* **Periods.** `--period PERIOD` on `metrics fetch`, `workload fetch` and `workload import`
+  keeps a period's files in folders of their own, so one profile can hold several load tests,
+  or several episodes of one. A period's name is letters, digits, `-` and `_`, such as its
+  start time; `histories` and `saved` are taken. With a scenario for each period beside
+  `profile.yaml`, a profile looks like this:
+
+  ```
+  prod/
+    profile.yaml                          scenario: 202610012217.yaml
+    202610012217.yaml                     workflows: workload/202610012217, and calibration:
+                                          { observations: [metrics/202610012217/observed.yaml] }
+    metrics/202610012217/observed.yaml    metrics fetch --profile prod --period 202610012217
+    workload/202610012217/histories/      workload fetch --profile prod --period 202610012217
+    workload/202610012217/workflows.yaml  workload import --profile prod --period 202610012217
+  ```
+
+  The period only names the folders: `--end` and `--window` still choose the time.
+  `profile.yaml` names one scenario, so to run another period, point `scenario:` at its file.
+* **Permissions.** On Unix, the store's directories are created readable only by you (`0700`),
+  and its files likewise (`0600`).
 * **Standalone copies.** After saving, a profile runs even if the original files are deleted.
   Files the scenario itself refers to, such as Helm values or dynamic config files, are not
-  copied: they are still read from the scenario's original folder, and `profile show` lists them.
+  copied: they are still read from the scenario's original folder, which `profile.yaml` names as
+  `scenario_dir`, and `profile show` lists them.
+* **Moving profiles.** Without `scenario_dir`, the scenario's relative paths resolve in the
+  profile's own folder, and a relative `scenario_dir` is taken from it too. A profile that keeps
+  its files inside, as `profile init` makes them, can be copied to another machine or store
+  and runs there.
 * **Git warnings.** `profile save` warns when the store is inside a git working tree that doesn't
   ignore it. It also names any source file that is untracked and not ignored, so it could be
   committed by accident. For those, delete the file once the profile has its copy, or list it
@@ -694,7 +766,7 @@ workers:                       # SDK worker fleets (Go SDK behaviour)
     # cpu: 2, task_queue_activities_per_second: 500, poll_timeout: 70s, eager_activities: false
     # rpc_timeout: 10s         # deadline of each respond/heartbeat/history call, retries included
 
-workflows:
+workflows:                     # or a file of them: workflows: workload/202610012217
   - type: OrderWorkflow
     namespace: orders
     task_queue: orders
@@ -752,6 +824,12 @@ report: { warn_utilization: 0.7, critical_utilization: 0.9, api_p99_slo: 500ms, 
 Durations and latencies accept a constant (`5ms`), `{ p50, p99 }` for a lognormal fit, a
 `quantiles` map, `{ dist: exp, mean }` and `{ dist: uniform, min, max }`. Rates accept `150/s`,
 `9000/m` or a bare number.
+
+**Workflows from a file.** Instead of listing the workflow types, `workflows:` can name a file
+holding them under its own `workflows:`, as `workload import` writes it, or the folder of a
+`workflows.yaml`. The path resolves as the scenario's other paths do, and `profile show` lists
+the file among those the scenario reads. Only its `workflows:` is read: worker fleets go in the
+scenario's `workers:`.
 
 **SDK calls.** As in the Go SDK, each call has one deadline, `rpc_timeout` (10s by default),
 and its retries happen inside it: a call still failing at the deadline returns

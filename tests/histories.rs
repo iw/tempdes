@@ -930,3 +930,145 @@ fn imported_workloads_simulate() {
         r.hotspots.iter().map(|h| &h.title).collect::<Vec<_>>()
     );
 }
+
+/// `tempdes` itself, its profile store in `store`.
+fn tempdes(store: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_tempdes"))
+        .args(args)
+        .env("TEMPDES_PROFILES", store)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn with_a_profile_import_reads_and_writes_its_workload_folder() {
+    let store = std::env::temp_dir().join(format!("tempdes-import-profile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&store);
+    assert!(tempdes(&store, &["profile", "init", "p"]).status.success());
+    let histories = store.join("p/workload/histories");
+    std::fs::create_dir_all(&histories).unwrap();
+    for i in 0..3 {
+        let text = order(f64::from(i) * 1000.0, 1, false, false);
+        std::fs::write(histories.join(format!("o{i}.json")), text).unwrap();
+    }
+    // its histories by default, into workflows.yaml rather than to standard output
+    let out = tempdes(
+        &store,
+        &[
+            "workload",
+            "import",
+            "--profile",
+            "p",
+            "--namespace",
+            "orders",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(out.stdout.is_empty());
+    let yaml = std::fs::read_to_string(store.join("p/workload/workflows.yaml")).unwrap();
+    assert!(
+        yaml.contains("workflows:") && yaml.contains("namespace: \"orders\""),
+        "{yaml}"
+    );
+    // relative paths are inside the folder
+    let out = tempdes(
+        &store,
+        &[
+            "workload",
+            "import",
+            "--profile",
+            "p",
+            "histories",
+            "-o",
+            "again.yaml",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(store.join("p/workload/again.yaml").is_file());
+    // without a profile, the histories must be given
+    assert!(!tempdes(&store, &["workload", "import"]).status.success());
+}
+
+#[test]
+fn a_scenario_takes_its_workflows_from_a_file_or_a_folder() {
+    let dir = std::env::temp_dir().join(format!("tempdes-workflows-file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let period = dir.join("workload/202610012217");
+    std::fs::create_dir_all(&period).unwrap();
+    let histories = dir.join("histories");
+    std::fs::create_dir_all(&histories).unwrap();
+    for i in 0..3 {
+        let text = order(f64::from(i) * 1000.0, 1, false, false);
+        std::fs::write(histories.join(format!("o{i}.json")), text).unwrap();
+    }
+    let p = tempdes::histories::import(
+        std::slice::from_ref(&histories),
+        &Options {
+            namespace: "orders".into(),
+            rate: Some(20.0),
+            ..Default::default()
+        },
+    )
+    .expect("imports");
+    // as `workload import` writes it, with its commented workers block
+    std::fs::write(period.join("workflows.yaml"), &p.yaml).unwrap();
+    let scenario = |workflows: &str| {
+        let file = dir.join("scenario.yaml");
+        std::fs::write(
+            &file,
+            format!(
+                "name: from-a-file\nduration: 5s\ncluster:\n  num_history_shards: 16\n  replicas: {{ frontend: 1, history: 1, matching: 1, worker: 1 }}\n  persistence: {{ store: postgresql }}\nnamespaces: [ {{ name: orders }} ]\nworkers:\n  - {{ name: w, namespace: orders, task_queue: orders, processes: 2 }}\n{workflows}"
+            ),
+        )
+        .unwrap();
+        Scenario::load(&file)
+    };
+    let types = |sc: &Scenario| -> Vec<String> {
+        sc.workflows.iter().map(|w| w.type_name.clone()).collect()
+    };
+
+    // the folder reads its workflows.yaml, relative to the scenario
+    let sc = scenario("workflows: workload/202610012217\n").unwrap();
+    assert_eq!(types(&sc), ["OrderWorkflow", "ShipmentWorkflow"]);
+    assert_eq!(
+        sc.referenced_files(),
+        ["workload/202610012217/workflows.yaml"]
+    );
+    let params = run::prepare(&sc, &Overrides::default(), None).expect("parameters resolve");
+    assert_eq!(params.wf_types.len(), 2);
+    // the file itself
+    let sc = scenario("workflows: workload/202610012217/workflows.yaml\n").unwrap();
+    assert_eq!(types(&sc), ["OrderWorkflow", "ShipmentWorkflow"]);
+    // nothing there yet
+    let err = scenario("workflows: workload/202610012218\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("doesn't exist"), "{err}");
+    assert!(err.contains("tempdes workload import"), "{err}");
+    // only its workflows are read, so fleets put there would be lost
+    let uncommented = p
+        .yaml
+        .replace("# workers:", "workers:")
+        .replace("#   ", "  ");
+    std::fs::write(period.join("workflows.yaml"), uncommented).unwrap();
+    let err = scenario("workflows: workload/202610012217\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("move its `workers:` into the scenario"),
+        "{err}"
+    );
+    // written in the scenario, a mistyped key is still named
+    let err = scenario(
+        "workflows:\n  - type: OrderWorkflow\n    namespace: orders\n    task_queue: orders\n    stpes: []\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("stpes"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
