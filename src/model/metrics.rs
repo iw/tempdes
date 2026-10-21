@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::sim::executor::Time;
 use crate::sim::stats::Histogram;
 
 use super::types::*;
@@ -40,13 +41,17 @@ impl OpStats {
 #[derive(Clone, Debug, Default)]
 pub struct TaskStats {
     pub count: u64,
+    /// runs, completed or failed (`task_requests`, one per `Execute`)
+    pub runs: u64,
     pub noop: u64,
     pub load_latency: Histogram,
-    /// every run's wait from the submission that got it into the scheduler to its start
-    /// (`task_latency_schedule`): the limiter's hold-back is left out, as in Temporal
+    /// each run's wait from the submission that got it into the scheduler to its start
+    /// (`task_latency_schedule`), recorded as the run ends, as `Execute` records it: the
+    /// limiter's hold-back is left out, as in Temporal
     pub schedule_latency: Histogram,
-    /// how long the task scheduler's rate limiter held each submission back in the rescheduler,
-    /// zero when it admitted it at once (not a Temporal metric)
+    /// how long the enforced task scheduler rate limiter held each submission back, zero when it
+    /// admitted it at once (not a Temporal metric). Holds still open are in
+    /// [`Metrics::open_holds`].
     pub held_back: Histogram,
     pub processing: Histogram,
     pub queue_latency: Histogram,
@@ -160,6 +165,13 @@ pub struct Metrics {
     pub vis_persist: Vec<OpStats>,
     pub tasks: Vec<TaskStats>,
     pub tasks_by_pod: Vec<u64>,
+    /// the enforced task scheduler limiter's holds per namespace, as [`TaskStats::held_back`]
+    pub held_back_ns: Vec<Histogram>,
+    /// the task scheduler limiter's refusals per namespace (would-be refusals in shadow mode)
+    pub sched_throttled_ns: Vec<u64>,
+    /// submissions the limiter is holding back now, counted by (task type, namespace, held
+    /// since). Kept through the warm-up reset: they are still held.
+    pub open_holds: BTreeMap<(usize, usize, Time), u32>,
     pub lock_wait: Histogram,
     pub lock_timeouts: u64,
     pub lock_hold: Histogram,
@@ -241,6 +253,36 @@ impl Metrics {
         self.tasks_by_pod[pod] += 1;
     }
 
+    /// The task scheduler limiter refused a submission of task type `kind` in namespace `ns`.
+    pub fn limiter_refused(&mut self, kind: usize, ns: usize) {
+        self.tasks[kind].sched_throttled += 1;
+        if self.sched_throttled_ns.len() <= ns {
+            self.sched_throttled_ns.resize(ns + 1, 0);
+        }
+        self.sched_throttled_ns[ns] += 1;
+    }
+
+    /// The enforced limiter starts holding back a submission made at `since`.
+    pub fn hold_opened(&mut self, kind: usize, ns: usize, since: Time) {
+        *self.open_holds.entry((kind, ns, since)).or_default() += 1;
+    }
+
+    /// The enforced limiter let a submission made at `since` through `held` later, after
+    /// holding it back if `opened`.
+    pub fn hold_closed(&mut self, kind: usize, ns: usize, since: Time, opened: bool, held: Time) {
+        if opened && let Some(n) = self.open_holds.get_mut(&(kind, ns, since)) {
+            *n -= 1;
+            if *n == 0 {
+                self.open_holds.remove(&(kind, ns, since));
+            }
+        }
+        self.tasks[kind].held_back.record(held);
+        if self.held_back_ns.len() <= ns {
+            self.held_back_ns.resize_with(ns + 1, Histogram::default);
+        }
+        self.held_back_ns[ns].record(held);
+    }
+
     /// Worker process `wk`'s SDK counts.
     pub fn worker(&mut self, wk: usize) -> &mut WorkerStats {
         if self.workers.len() <= wk {
@@ -261,9 +303,11 @@ impl Metrics {
         let n = self.wf.len();
         let notes = std::mem::take(&mut self.notes);
         let samples = std::mem::take(&mut self.samples);
+        let open_holds = std::mem::take(&mut self.open_holds);
         *self = Metrics::new(n);
         self.notes = notes;
         self.samples = samples;
+        self.open_holds = open_holds;
     }
 
     pub fn fe_total(&self, api: Api) -> OpStats {

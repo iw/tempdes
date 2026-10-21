@@ -334,12 +334,22 @@ Transfer, timer and visibility queues follow `service/history/queues/`:
     same way from the `Namespace` settings, else it is the pod rate.
   * A refused task counts as `task_scheduler_throttled`. In shadow mode
     (`history.taskSchedulerEnableRateLimiterShadowMode`, on by default) it runs anyway.
-    Otherwise it goes to the rescheduler (`reader.go`, `rescheduler.go`): it waits the task
-    backoff (1 s × 1.1ⁿ, up to 20% less), then retries every 2 s ± 50% until admitted.
+    Otherwise it goes to the rescheduler, for a first wait that depends on what submitted it,
+    then retries every 2 s ± 50% (`taskChanFullBackoff`) until admitted:
+    * the queue reader, at the task's fire time: the task backoff, 1 s × 1.1ⁿ⁻¹ for attempt n
+      up to 3 minutes, less up to 20% (`reader.go`, `Reschedule`);
+    * a failed run resubmitted at once: `backoffDuration` for its error, as in **Retries**
+      below (`Nack`);
+    * the rescheduler, for a run after its backoff or a timer read ahead of its fire time: 2 s
+      ± 50%, as the task stays at the head of its queue (`rescheduler.go`).
   * Every submission sets the task's scheduled time (`SetScheduledTime`), and every run records
-    `task_latency_schedule` from it (`Execute`). The scheduling wait therefore starts when the
-    limiter admits a task. The time it was held back before that is counted per task type on
-    its own, as tempdes's measure rather than a Temporal metric.
+    `task_latency_schedule` from it as the run ends, with `task_requests` (`Execute`). The
+    scheduling wait therefore starts when the limiter admits a task. A run on a workflow's
+    execution queue meets no limiter (`HandleBusyWorkflow`).
+  * How long the enforced limiter held submissions back is tempdes's measure, not a Temporal
+    metric. It is counted per task type and per namespace. Submissions still held when the
+    window closes count as held until then, and a task type the limiter refused shows even if
+    it ran nothing.
 * **Execution** (`executable.go`):
   * The task takes the workflow lock as a non-API caller, loads mutable state and does its work.
     Examples: `AddWorkflowTask`/`AddActivityTask` to matching, starting a child, firing a
@@ -611,10 +621,11 @@ knobs.
 * **Rate limiters.** A limiter that rejects requests is a `rate-limit` hotspot. One that runs at
   70% or more of its limit on any pod is a `headroom` warning, raised before rejections start.
   * The history task scheduler's limiter, enforced, is rated by how long it holds tasks back:
-    a p99 over 1 s for any task type is a warning, and over 5 s critical. In shadow mode it is
-    reported for information.
-  * A `history-queue` hotspot for a scheduler worker counts the wait from admission, so it
-    means the workers were busy, not the limiter.
+    a p99 over 1 s for any task type or any namespace is a warning, and over 5 s critical. In
+    shadow mode it is reported for information.
+  * A `history-queue` hotspot for a scheduler worker is rated by the pool's own wait for a
+    worker, on the busiest history pod, so it means the workers were busy. It leaves out the
+    limiter's hold-back, and the waits of runs on workflows' execution queues.
 * **Throughput.** Two tests, each flagged only beyond a 3σ Poisson band:
   * *start shortfall*: accepted starts fall short of the offered rate, or more than 1% of
     starts fail;

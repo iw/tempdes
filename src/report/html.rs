@@ -714,7 +714,7 @@ pub fn render_run_doc(r: &RunResult, fragment: bool) -> String {
         )
     );
     // an enforced limiter holds runs back before their scheduling wait starts
-    let held_back = r.history.task_scheduler.mode == "on";
+    let held_back = r.history.task_scheduler.enforced();
     let task_rows: Vec<Vec<String>> = r
         .history
         .tasks

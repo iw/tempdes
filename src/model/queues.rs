@@ -299,7 +299,7 @@ async fn timer_reader(ctx: Ctx, shard: ShardId, my_seq: u64, wake_at: Time) {
                 if task.fire_at > now() {
                     sleep_until(task.fire_at).await;
                 }
-                run_task(c2, shard, task, loaded_at.max(task.fire_at)).await;
+                run_task(c2, shard, task, loaded_at).await;
             });
         }
     }
@@ -310,6 +310,49 @@ enum Outcome {
     Noop,
     Retry(Err),
     Drop,
+}
+
+/// How a run is submitted to the host scheduler, which sets how long the task scheduler's rate
+/// limiter holds it back after first refusing it.
+#[derive(Clone, Copy, Debug)]
+enum Submission {
+    /// by the queue reader at the task's fire time: a refused task is rescheduled after the
+    /// task backoff (`reader.go`, `Reschedule`, `backoffDuration(nil)`)
+    Reader,
+    /// at once after a failed run (`Nack`): a refused task waits `backoffDuration(err)`
+    Nack { throttled: bool, throttles: u32 },
+    /// by the rescheduler, after a backoff or for a timer read ahead of its fire time: a refused
+    /// task stays at the head of its queue, tried again in 2s ± 50% (`rescheduler.go`)
+    Rescheduler,
+}
+
+/// `backoffDuration`: the task backoff 1s·1.1ⁿ⁻¹ for attempt n, up to 3 minutes, or for a
+/// throttling error the larger of that and 3s·1.5ᵐ⁻¹, up to 5 minutes, for the m-th in a row.
+fn task_backoff(ctx: &Ctx, attempt: u32, throttled: bool, throttles: u32) -> Time {
+    let delay = backoff(ctx, 1_000_000, 1.1, 180_000_000, attempt);
+    if throttled {
+        delay.max(backoff(ctx, 3_000_000, 1.5, 300_000_000, throttles))
+    } else {
+        delay
+    }
+}
+
+/// The rescheduler's wait before trying a refused task again (`taskChanFullBackoff`, 2s
+/// ± 50%).
+fn chan_full_backoff(ctx: &Ctx) -> Time {
+    (2e6 * (0.5 + ctx.rand())) as Time
+}
+
+/// How long the limiter holds a run back after first refusing it, by how it was submitted.
+fn refused_delay(ctx: &Ctx, submission: Submission, attempt: u32) -> Time {
+    match submission {
+        Submission::Reader => task_backoff(ctx, attempt, false, 0),
+        Submission::Nack {
+            throttled,
+            throttles,
+        } => task_backoff(ctx, attempt, throttled, throttles),
+        Submission::Rescheduler => chan_full_backoff(ctx),
+    }
 }
 
 /// How a task's next run gets a worker.
@@ -326,9 +369,10 @@ enum RunPermit {
 ///   interleaved weighted round robin turn for a pool worker. A task of a workflow that has an
 ///   execution queue runs there instead of on a pool worker (`ExecutionAwareScheduler`).
 /// * Temporal resets a task's scheduled time at every submission (`reader.go`, `rescheduler.go`,
-///   `Nack`) and records the wait from it at every run (`Execute`). With the scheduler's rate
-///   limiter on, a run is first held back until the limiter admits it: that wait is counted on
-///   its own, and the scheduling wait starts at the admission.
+///   `Nack`) and records the wait from it as each run ends (`Execute`). With the scheduler's
+///   rate limiter enforced, a run on the pool is first held back until the limiter admits it:
+///   that wait is counted on its own, and the scheduling wait starts at the admission. A run
+///   on a workflow's execution queue meets no limiter (`HandleBusyWorkflow`).
 /// * A failure increments the attempt (`HandleErr`), and a throttling error also the throttle
 ///   count, which busy-workflow errors leave alone and any other error resets.
 /// * `Nack`: with the execution queue scheduler on, a busy-workflow failure moves the task to
@@ -361,6 +405,12 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
     let exec_key = (task.wf, task.wf_gen);
     // set when a busy-workflow failure moved the task to its workflow's execution queue
     let mut routed: Option<(PodId, Semaphore)> = None;
+    // a timer read ahead of its fire time waits in the rescheduler, which submits it when due
+    let mut submission = if loaded_at < task.fire_at {
+        Submission::Rescheduler
+    } else {
+        Submission::Reader
+    };
     loop {
         let owner = ctx.shard_owner(shard);
         // the submission that gets the run into the scheduler (`SetScheduledTime`)
@@ -377,11 +427,10 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
                 };
                 let Some(sched) = sched else { break };
                 if ctx.p.k.task_sched_enabled {
-                    wait_for_scheduler_limiter(&ctx, owner, &task, prio, attempt).await;
-                    ctx.m.borrow_mut().tasks[task.kind.idx()]
-                        .held_back
-                        .record(now() - enq);
-                    enq = now();
+                    enq = wait_for_scheduler_limiter(
+                        &ctx, owner, &task, prio, ns, attempt, submission,
+                    )
+                    .await;
                 }
                 let p = sched.acquire(channel, weight).await;
                 match exec_queue(&ctx, owner, c, exec_key, false) {
@@ -394,9 +443,6 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
             }
         };
         let start = now();
-        ctx.m.borrow_mut().tasks[task.kind.idx()]
-            .schedule_latency
-            .record(start - enq);
         let outcome = execute(&ctx, owner, shard, &task).await;
         match permit {
             RunPermit::Pool(p) => drop(p),
@@ -410,8 +456,11 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
         }
         let proc_time = now() - start;
         {
+            // as the run ends, as `Execute`'s deferred metrics are
             let mut m = ctx.m.borrow_mut();
             let ts = &mut m.tasks[task.kind.idx()];
+            ts.runs += 1;
+            ts.schedule_latency.record(start - enq);
             ts.processing.record(proc_time);
             m.task_pod(owner);
         }
@@ -462,13 +511,14 @@ async fn run_task(ctx: Ctx, shard: ShardId, task: HistTask, loaded_at: Time) {
             continue;
         }
         if resubmits(attempt, throttles, e) {
+            submission = Submission::Nack {
+                throttled,
+                throttles,
+            };
             continue;
         }
-        let mut delay = backoff(&ctx, 1_000_000, 1.1, 180_000_000, attempt);
-        if throttled {
-            delay = delay.max(backoff(&ctx, 3_000_000, 1.5, 300_000_000, throttles));
-        }
-        sleep(delay).await;
+        sleep(task_backoff(&ctx, attempt, throttled, throttles)).await;
+        submission = Submission::Rescheduler;
     }
     // completion bookkeeping & checkpointing
     let checkpoint = {
@@ -528,59 +578,72 @@ fn exec_queue(
     )
 }
 
-/// The task scheduler's rate limiter, which the queue reader meets in `TrySubmit`
+/// The task scheduler's rate limiter, which every submission meets in `TrySubmit`
 /// (`common/tasks/rate_limited_scheduler.go`). A refused task counts as
 /// `task_scheduler_throttled`. In shadow mode it runs anyway. Otherwise it goes to the
-/// rescheduler: first for the task backoff (1s × 1.1ⁿ, up to 20% less), then every 2s ± 50%
-/// (`taskChanFullBackoff`) until the limiter admits it.
+/// rescheduler: first for as long as its [`Submission`] sets, then every 2s ± 50% until the
+/// limiter admits it. Returns the time it let the run through.
 async fn wait_for_scheduler_limiter(
     ctx: &Ctx,
     pod: PodId,
     task: &HistTask,
     prio: Prio,
+    ns: usize,
     attempt: u32,
-) {
+    submission: Submission,
+) -> Time {
     let k = &ctx.p.k;
     let level = match prio {
         Prio::High => 0,
         Prio::Low => 1,
     };
-    let ns = ctx
-        .wfs
-        .borrow()
-        .get(task.wf, task.wf_gen)
-        .map_or(0, |w| w.ns);
+    let kind = task.kind.idx();
+    let since = now();
     let mut refusals = 0u32;
     loop {
-        let admitted = {
+        let refused = {
             let mut pods = ctx.pods.borrow_mut();
-            let Some(h) = pods[pod].hist.as_mut() else {
-                return;
-            };
-            if now() < h.started_at + k.task_sched_startup_delay {
-                return;
+            match pods[pod].hist.as_mut() {
+                // the pod is gone, or its limiter has yet to start: nothing holds the run back
+                None => false,
+                Some(h) if now() < h.started_at + k.task_sched_startup_delay => false,
+                Some(h) => {
+                    let refused = !h.sched_limiter.allow(level, ns);
+                    if refused {
+                        h.sched_throttled += 1;
+                    }
+                    refused
+                }
             }
-            let ok = h.sched_limiter.allow(level, ns);
-            if !ok {
-                h.sched_throttled += 1;
-            }
-            ok
         };
-        if admitted {
-            return;
+        if !refused {
+            break;
         }
-        ctx.m.borrow_mut().tasks[task.kind.idx()].sched_throttled += 1;
-        if k.task_sched_shadow {
-            return;
+        {
+            let mut m = ctx.m.borrow_mut();
+            m.limiter_refused(kind, ns);
+            if k.task_sched_shadow {
+                return now();
+            }
+            if refusals == 0 {
+                m.hold_opened(kind, ns, since);
+            }
         }
         let delay = if refusals == 0 {
-            1e6 * 1.1f64.powi(attempt as i32 - 1) * (0.8 + 0.2 * ctx.rand())
+            refused_delay(ctx, submission, attempt)
         } else {
-            2e6 * (0.5 + ctx.rand())
+            chan_full_backoff(ctx)
         };
         refusals += 1;
-        sleep(delay as Time).await;
+        sleep(delay).await;
     }
+    let t = now();
+    if !k.task_sched_shadow {
+        ctx.m
+            .borrow_mut()
+            .hold_closed(kind, ns, since, refusals > 0, t - since);
+    }
+    t
 }
 
 async fn checkpoint_shard(ctx: &Ctx, shard: ShardId, c: Category) {
@@ -1365,6 +1428,38 @@ mod tests {
     use std::cell::RefCell;
     use std::path::Path;
     use std::rc::Rc;
+
+    #[test]
+    fn a_refused_runs_wait_depends_on_how_it_was_submitted() {
+        let sc = Scenario::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scenarios/baseline.yaml"),
+        )
+        .expect("scenario loads");
+        let p = run::prepare(&sc, &Overrides::default(), None).expect("parameters resolve");
+        let (ctx, _ex) = build::build(p);
+        let s = |t: Time| t as f64 / 1e6;
+        for _ in 0..200 {
+            // the reader's refusal: the task backoff for its first attempt
+            let d = s(refused_delay(&ctx, Submission::Reader, 1));
+            assert!((0.8..=1.0).contains(&d), "reader {d}s");
+            // the rescheduler's: 2s ± 50%, whatever the attempt
+            let d = s(refused_delay(&ctx, Submission::Rescheduler, 30));
+            assert!((1.0..=3.0).contains(&d), "rescheduler {d}s");
+            // a failed run resubmitted at once: backoffDuration(err) for its attempt, capped
+            let nack = |throttled, throttles| Submission::Nack {
+                throttled,
+                throttles,
+            };
+            let d = s(refused_delay(&ctx, nack(false, 0), 21));
+            let full = 1.1f64.powi(20);
+            assert!((0.8 * full..=full).contains(&d), "nack {d}s");
+            let d = s(refused_delay(&ctx, nack(false, 0), 100));
+            assert!((144.0..=180.0).contains(&d), "capped nack {d}s");
+            // and for a throttling error, at least its own backoff: 3s·1.5 for the second
+            let d = s(refused_delay(&ctx, nack(true, 2), 2));
+            assert!((3.6..=4.5).contains(&d), "throttled nack {d}s");
+        }
+    }
 
     #[test]
     fn start_child_holds_the_parent_and_reuses_its_child() {

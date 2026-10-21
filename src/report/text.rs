@@ -365,19 +365,19 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
     if ts.mode != "off" {
         let _ = writeln!(
             o,
-            "  task scheduler limiter {} · pod limit {:.0}–{:.0} tasks/s · {:.0}/s {} ({:.2} per task run)",
-            if ts.mode == "shadow" {
-                "in shadow mode (counts only)"
-            } else {
+            "  task scheduler limiter {} · pod limit {:.0}–{:.0} tasks/s · {:.0} {}/s ({:.2} per task run)",
+            if ts.enforced() {
                 "on"
+            } else {
+                "in shadow mode (counts only)"
             },
             ts.pod_qps_min,
             ts.pod_qps_max,
             ts.throttled_per_s,
-            if ts.mode == "shadow" {
-                "would be held back"
+            if ts.enforced() {
+                "refusals"
             } else {
-                "held back"
+                "would-be refusals"
             },
             ts.throttled_per_task
         );
@@ -415,7 +415,7 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
         o.push_str(&t.render(&st, 2));
     }
     // an enforced limiter holds runs back before their scheduling wait starts
-    let held_back = ts.mode == "on";
+    let held_back = ts.enforced();
     let mut head = vec![
         "history task",
         "rate",

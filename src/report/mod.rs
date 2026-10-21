@@ -234,8 +234,9 @@ pub struct TaskResult {
     /// `task_latency_schedule`: every run's wait from the submission that got it into the
     /// scheduler to its start
     pub schedule: Lat,
-    /// how long the task scheduler's rate limiter held submissions back before admitting them,
-    /// zero for those admitted at once (empty with the limiter off)
+    /// how long the enforced task scheduler rate limiter held submissions back, zero for those
+    /// admitted at once, with those still held counted as held until the window's end (all
+    /// zero unless the limiter is enforced)
     pub held_back: Lat,
     pub processing: Lat,
     pub queue: Lat,
@@ -280,6 +281,26 @@ pub struct TaskSchedulerResult {
     pub refused_by_pod: u64,
     /// the history pod with the most refusals, and its refusals per second
     pub busiest_pod: Option<(String, f64)>,
+    /// each namespace the limiter refused, with how long it held the namespace's tasks back
+    pub namespaces: Vec<NamespaceHoldResult>,
+    /// submissions still held back when the window closed, in `held_back` as held until then
+    pub held_at_end: u64,
+}
+
+impl TaskSchedulerResult {
+    /// The limiter holds refused tasks back, rather than only counting them in shadow mode.
+    pub fn enforced(&self) -> bool {
+        self.mode == "on"
+    }
+}
+
+/// A namespace's tasks refused by the task scheduler limiter.
+#[derive(Clone, Debug, Serialize)]
+pub struct NamespaceHoldResult {
+    pub namespace: String,
+    pub refused_per_s: f64,
+    /// as [`TaskResult::held_back`], over the namespace's submissions
+    pub held_back: Lat,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -825,19 +846,42 @@ pub fn analyze_window(
         .fold((0u64, 0u64), |a, h| {
             (a.0 + h.cache.hits, a.1 + h.cache.misses)
         });
+    // the limiter's holds still open, as held until the window's end
+    let end = info.end;
+    let mut open_by_type = vec![Histogram::default(); TaskType::ALL.len()];
+    let mut open_by_ns = vec![Histogram::default(); p.namespaces.len()];
+    let mut held_at_end = 0u64;
+    for (&(kind, ns, since), &n) in &m.open_holds {
+        let held = end.saturating_sub(since);
+        for _ in 0..n {
+            open_by_type[kind].record(held);
+            if let Some(h) = open_by_ns.get_mut(ns) {
+                h.record(held);
+            }
+        }
+        held_at_end += u64::from(n);
+    }
     let mut tasks = Vec::new();
     for t in TaskType::ALL {
         let o = &m.tasks[t.idx()];
-        if o.count == 0 {
+        let open = &open_by_type[t.idx()];
+        // a type the limiter refused shows, though it finished nothing
+        if o.runs == 0 && o.sched_throttled == 0 && open.is_empty() {
             continue;
         }
+        let mut held = o.held_back.clone();
+        held.merge(open);
         tasks.push(TaskResult {
             task_type: t.as_str().into(),
             per_s: o.count as f64 / dur,
-            noop_fraction: o.noop as f64 / o.count as f64,
+            noop_fraction: if o.count > 0 {
+                o.noop as f64 / o.count as f64
+            } else {
+                0.0
+            },
             load: Lat::of(&o.load_latency),
             schedule: Lat::of(&o.schedule_latency),
-            held_back: Lat::of(&o.held_back),
+            held_back: Lat::of(&held),
             processing: Lat::of(&o.processing),
             queue: Lat::of(&o.queue_latency),
             mean_attempts: o.attempts.mean(),
@@ -867,7 +911,7 @@ pub fn analyze_window(
             .filter_map(|p| p.hist.as_ref().map(|h| (p, h)))
             .collect();
         let throttled: u64 = m.tasks.iter().map(|t| t.sched_throttled).sum();
-        let runs: u64 = m.tasks.iter().map(|t| t.count).sum();
+        let runs: u64 = m.tasks.iter().map(|t| t.runs).sum();
         let qps = hist.iter().map(|(_, h)| h.sched_limiter.host_rate());
         TaskSchedulerResult {
             mode: match (p.k.task_sched_enabled, p.k.task_sched_shadow) {
@@ -891,6 +935,22 @@ pub fn analyze_window(
                 .max_by_key(|(_, h)| h.sched_throttled)
                 .filter(|(_, h)| h.sched_throttled > 0)
                 .map(|(p, h)| (p.addr.clone(), h.sched_throttled as f64 / dur)),
+            namespaces: p
+                .namespaces
+                .iter()
+                .enumerate()
+                .filter_map(|(i, n)| {
+                    let refused = m.sched_throttled_ns.get(i).copied().unwrap_or(0);
+                    let mut held = m.held_back_ns.get(i).cloned().unwrap_or_default();
+                    held.merge(&open_by_ns[i]);
+                    (refused > 0).then(|| NamespaceHoldResult {
+                        namespace: n.name.clone(),
+                        refused_per_s: refused as f64 / dur,
+                        held_back: Lat::of(&held),
+                    })
+                })
+                .collect(),
+            held_at_end,
         }
     };
     let exec_queues = p.k.eqs_enabled.then(|| {
