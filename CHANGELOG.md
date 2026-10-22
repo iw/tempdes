@@ -369,6 +369,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The task scheduler's rate limiter is no longer taken for busy workers.** The scheduling
+  wait, `task_latency_schedule`, started before the limiter, so the time a task was held back in
+  the rescheduler counted as waiting for a scheduler worker: each task type the limiter held
+  back raised a busy-worker hotspot beside the limiter's own. Temporal sets a task's scheduled
+  time at every submission (`reader.go`, `rescheduler.go`) and records the wait as each run
+  ends (`Execute`). The wait now starts when the limiter admits the task, and every run records
+  its own, failed runs included.
+  - **The pool's own wait.** The busy-worker hotspot is now rated by each run's wait for a
+    worker of the pool, so the waits of runs on workflows' execution queues aren't put down to
+    busy workers either.
+  - **The hold-back.** How long the enforced limiter held tasks back is measured on its own,
+    per task type and per namespace, and the limiter's hotspot takes its evidence and severity
+    from it. While the limiter is enforced, the history task table shows it.
+    - A small namespace held back by its own limit now rates the hotspot, though its tasks are
+      too few to show in any task type's tail.
+    - Submissions still held when the window closes count as held until then.
+    - A task type the limiter refused shows in the history task table and in the `--prom`
+      output even if it ran nothing, such as low-priority timeouts kept out all window.
+  - **Waits after a refusal.** A task the limiter refuses first waits as long as Temporal would,
+    given how it was submitted:
+    - from the queue reader, the task backoff;
+    - for a failed run resubmitted at once, `backoffDuration`;
+    - from the rescheduler, 2s ± 50%.
+
+    Before, a retry that had already backed off was held back the task backoff again, with no
+    3-minute cap.
+  - **`task_requests` per run.** The `--prom` output counts a history task request per run, as
+    Temporal does, rather than per task completed, so it agrees with
+    `task_latency_schedule_count`.
+
+  Take `baseline.yaml` with `history.taskSchedulerGlobalNamespaceMaxQPS=600`, run with
+  `--warmup 8 --duration 60`. It had ten critical hotspots, six of them waits of 31–35s for
+  scheduler workers. It now has four, the limiter's own among them. The timeout timers it kept
+  out all window show as held back 1.0m (p99).
+
 - **The backlog of a queue nothing polls.** Matching's metrics left out a partition that had
   been neither polled nor matched, so a task queue with no workers showed no
   `approximate_backlog_count` or `approximate_backlog_age_seconds` at all, however large its

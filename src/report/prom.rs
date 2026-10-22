@@ -289,17 +289,18 @@ pub fn render_as(ctx: &Ctx, reading: Reading) -> String {
         }
     }
 
-    // history tasks
+    // history tasks: one request per run, recorded with its latencies as in `Execute`; a type
+    // the limiter refused shows, though it ran nothing
     for t in TaskType::ALL {
         let o = &m.tasks[t.idx()];
-        if o.count == 0 {
+        if o.runs == 0 && o.sched_throttled == 0 {
             continue;
         }
         let l = [
             ("task_type", t.as_str().to_string()),
             ("operation", t.as_str().to_string()),
         ];
-        w.counter("task_requests", &l, o.count as f64);
+        w.counter("task_requests", &l, o.runs as f64);
         w.timer("task_latency_load", &l, &o.load_latency);
         w.timer("task_latency_schedule", &l, &o.schedule_latency);
         w.timer("task_latency_processing", &l, &o.processing);

@@ -1136,6 +1136,10 @@ fn locks(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     }
 }
 
+/// History task queues. A run's scheduling wait (`task_latency_schedule`) starts once the task
+/// scheduler's rate limiter admits it (`task_scheduler` reports the hold-back), and a run on a
+/// workflow's execution queue waits for that queue's workers rather than the pool's. So a
+/// wait is put down to busy scheduler workers by the runs' wait for a pool worker alone.
 fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     let h = &c.r.history;
     for t in &h.tasks {
@@ -1146,25 +1150,33 @@ fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
         } else {
             "visibility"
         };
-        if t.schedule.p99_ms > 200.0 {
-            let sev = if t.schedule.p99_ms > 2000.0 {
+        let wait = t.pool_wait.p99_ms;
+        if wait > 200.0 {
+            let sev = if wait > 2000.0 {
                 Severity::Critical
             } else {
                 Severity::Warning
             };
+            let mut evidence = vec![format!("processing p99 {}", ms(t.processing.p99_ms))];
+            if t.schedule.p99_ms > wait && t.exec_queue_runs_per_s > 0.0 {
+                evidence.push(format!(
+                    "scheduling wait p99 {}, with waits for workflows' execution queues",
+                    ms(t.schedule.p99_ms)
+                ));
+            }
             out.push(hs(
                 sev,
                 "history-queue",
                 t.task_type.clone(),
-                format!("{}: waits {} (p99) for a {cat} scheduler worker", t.task_type, ms(t.schedule.p99_ms)),
+                format!("{}: waits {} (p99) for a {cat} scheduler worker", t.task_type, ms(wait)),
                 format!("The host-level {cat} task scheduler is saturated: all workers are busy (tasks hold a worker through lock waits, persistence and — for transfer tasks — the matching AddTask round trip including RecordTaskStarted on sync match)."),
-                vec![format!("processing p99 {}", ms(t.processing.p99_ms))],
+                evidence,
                 &["task_latency_schedule", "task_latency_processing", "dynamic_worker_pool_scheduler_active_workers"],
                 vec![
                     c.knob(&format!("history.{cat}ProcessorSchedulerWorkerCount"), "more workers per host"),
                     c.replicas("history", "spread shards over more hosts"),
                 ],
-                30.0 + t.schedule.p99_ms / 100.0,
+                30.0 + wait / 100.0,
             ));
         }
         if t.load.p99_ms > 1000.0 && cat != "timer" {
@@ -1256,7 +1268,8 @@ fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
 
 /// The history task scheduler's rate limiter. In shadow mode it only counts, so report what it
 /// would hold back, which is how the limits are sized. Enforced, a refused task waits in the
-/// rescheduler, which is the point of the limiter; the wait is what can become a problem.
+/// rescheduler, which is the point of the limiter; how long it holds tasks back is what can
+/// become a problem, and sets the severity.
 fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     let h = &c.r.history;
     let ts = &h.task_scheduler;
@@ -1310,9 +1323,15 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             ts.refused_by_namespace, ts.refused_by_pod
         ));
     }
+    let enforced = ts.enforced();
     for t in by_type.iter().take(3) {
+        let held = if enforced {
+            format!(", held back p99 {}", ms(t.held_back.p99_ms))
+        } else {
+            String::new()
+        };
         evidence.push(format!(
-            "{}: {:.0}/s refused of {:.0}/s run",
+            "{}: {:.0}/s refused of {:.0}/s run{held}",
             t.task_type, t.sched_throttled_per_s, t.per_s
         ));
     }
@@ -1330,7 +1349,7 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             "true counts refusals without holding tasks back",
         ),
     ];
-    if ts.mode == "shadow" {
+    if !enforced {
         out.push(hs(
             Severity::Info,
             "history-queue",
@@ -1339,7 +1358,7 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 "task scheduler limiter (shadow mode) would hold back {:.0} task runs/s ({:.2} per task run)",
                 ts.throttled_per_s, ts.throttled_per_task
             ),
-            "Shadow mode counts task_scheduler_throttled but holds nothing back. Out of shadow mode, each refused task would wait in the rescheduler (about 1s, then every 2s) until the limiter admits it. Size the limits from this count before turning shadow mode off.".into(),
+            "Shadow mode counts task_scheduler_throttled but holds nothing back. Out of shadow mode, each refused task would wait in the rescheduler (about 1s at first, a retry its backoff, then every 2s) until the limiter admits it. Size the limits from this count before turning shadow mode off.".into(),
             evidence,
             &["task_scheduler_throttled", "task_requests"],
             knobs,
@@ -1347,15 +1366,55 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
         ));
         return;
     }
-    let wait_p99 = h
+    // How long it held submissions back, which task_latency_schedule leaves out: per task type,
+    // and per namespace, as a small namespace's own limit can hold it back without showing in
+    // any type's tail. Only a type it held back is named, the most refused among equals.
+    let worst_type = h
         .tasks
         .iter()
-        .map(|t| t.schedule.p99_ms)
-        .fold(0.0, f64::max);
-    evidence.insert(0, format!("task scheduling wait p99 {}", ms(wait_p99)));
-    let sev = if wait_p99 > 5000.0 {
+        .filter(|t| t.held_back.p99_ms > 0.0)
+        .max_by(|a, b| {
+            a.held_back
+                .p99_ms
+                .total_cmp(&b.held_back.p99_ms)
+                .then(a.sched_throttled_per_s.total_cmp(&b.sched_throttled_per_s))
+        });
+    let worst_ns = ts
+        .namespaces
+        .iter()
+        .filter(|n| n.held_back.p99_ms > 0.0)
+        .max_by(|a, b| a.held_back.p99_ms.total_cmp(&b.held_back.p99_ms));
+    let held_p99 = worst_type
+        .map_or(0.0, |t| t.held_back.p99_ms)
+        .max(worst_ns.map_or(0.0, |n| n.held_back.p99_ms));
+    let mut head = Vec::new();
+    if let Some(t) = worst_type {
+        head.push(format!(
+            "held back p99 {} ({})",
+            ms(t.held_back.p99_ms),
+            t.task_type
+        ));
+    }
+    if namespaces.len() > 1
+        && let Some(n) = worst_ns
+    {
+        head.push(format!(
+            "namespace {}: held back p99 {}, {:.0} refusals/s",
+            n.namespace,
+            ms(n.held_back.p99_ms),
+            n.refused_per_s
+        ));
+    }
+    if ts.held_at_end > 0 {
+        head.push(format!(
+            "{} still held back when the window closed, counted as held until then",
+            ts.held_at_end
+        ));
+    }
+    evidence.splice(0..0, head);
+    let sev = if held_p99 > 5000.0 {
         Severity::Critical
-    } else if wait_p99 > 1000.0 {
+    } else if held_p99 > 1000.0 {
         Severity::Warning
     } else {
         Severity::Info
@@ -1368,11 +1427,11 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             "{resource}: tasks held back ({:.0} refusals/s, {:.2} per task run)",
             ts.throttled_per_s, ts.throttled_per_task
         ),
-        "The task scheduler's rate limiter: a refused task waits in the rescheduler (about 1s, then every 2s) until the limiter admits it. Some waiting is the point; a long wait delays dispatch, timers and retries.".into(),
+        "The task scheduler's rate limiter: a refused task waits in the rescheduler (about 1s at first, a retry its backoff, then every 2s) until the limiter admits it. Some waiting is the point; a long wait delays dispatch, timers and retries. As in Temporal, task_latency_schedule starts only once the limiter admits a task, so the wait shows in task_latency_queue and task_rescheduler_pending_tasks instead.".into(),
         evidence,
-        &["task_scheduler_throttled", "task_latency_schedule"],
+        &["task_scheduler_throttled", "task_rescheduler_pending_tasks", "task_latency_queue"],
         knobs,
-        40.0 + wait_p99 / 200.0,
+        40.0 + held_p99 / 200.0,
     ));
 }
 

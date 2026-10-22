@@ -6,7 +6,7 @@ use std::path::Path;
 
 use tempdes::config::dynamic::{Constraints, DcValue};
 use tempdes::config::scenario::{ClientLb, Scenario};
-use tempdes::model::types::{Api, HistApi, PersistOp};
+use tempdes::model::types::{Api, HistApi, PersistOp, TaskType};
 use tempdes::report::{self, RunResult, Severity};
 use tempdes::run::{self, Overrides};
 use tempdes::util::units::Dur;
@@ -115,7 +115,7 @@ fn simulation_is_deterministic() {
 
 #[test]
 fn hot_entities_saturate_their_workflow_lock() {
-    let r = simulate("hot-entity.yaml", short());
+    let (r, out) = simulate_with_ctx(&scenario("hot-entity.yaml"), short());
     assert!(
         has(&r, "workflow-lock", Severity::Critical),
         "{:#?}",
@@ -130,6 +130,15 @@ fn hot_entities_saturate_their_workflow_lock() {
     assert!(r.history.lock_timeouts > 0);
     let hot = &r.history.hot_workflows[0];
     assert!(hot.util > 0.9, "hot workflow lock {}", hot.util);
+    // each run of a task, failed ones too, counts once in task_requests and with its scheduling
+    // wait, as Temporal's `Execute` records them as the run ends
+    let m = out.ctx.m.borrow();
+    let t = &m.tasks[TaskType::TimerWorkflowTaskTimeout.idx()];
+    let failed = t.busy_errors + t.throttled_errors + t.other_errors;
+    assert!(failed > 100, "{failed} failed runs");
+    assert_eq!(t.runs, t.count + failed);
+    assert_eq!(t.schedule_latency.count(), t.runs);
+    assert_eq!(t.processing.count(), t.runs);
 }
 
 #[test]
@@ -642,21 +651,22 @@ fn history_persistence_limit_follows_shard_ownership() {
 /// The history task scheduler's rate limiter at 900 tasks/s for the cluster, well below the
 /// baseline's history task rate.
 fn scheduler_limiter(shadow: bool) -> Overrides {
-    let mut ov = short();
-    for (key, value) in [
-        (
-            "history.taskSchedulerEnableRateLimiter",
-            DcValue::Bool(true),
-        ),
-        (
-            "history.taskSchedulerEnableRateLimiterShadowMode",
-            DcValue::Bool(shadow),
-        ),
-        ("history.taskSchedulerGlobalMaxQPS", DcValue::Int(900)),
-    ] {
-        ov.dc.push((key.into(), value, Constraints::default()));
-    }
-    ov
+    scheduler_limit("history.taskSchedulerGlobalMaxQPS", 900, shadow)
+}
+
+/// The history task scheduler's rate limiter, with its `limit` setting at `qps` tasks/s.
+fn scheduler_limit(limit: &str, qps: i64, shadow: bool) -> Overrides {
+    let ov = with_dc(
+        short(),
+        "history.taskSchedulerEnableRateLimiter",
+        DcValue::Bool(true),
+    );
+    let ov = with_dc(
+        ov,
+        "history.taskSchedulerEnableRateLimiterShadowMode",
+        DcValue::Bool(shadow),
+    );
+    with_dc(ov, limit, DcValue::Int(qps))
 }
 
 #[test]
@@ -691,18 +701,232 @@ fn task_scheduler_limiter_holds_tasks_back_outside_shadow_mode() {
     let ts = &r.history.task_scheduler;
     assert_eq!(ts.mode, "on");
     assert!(ts.throttled_per_s > 0.0);
-    let wait = r
+    let held = r
         .history
         .tasks
         .iter()
-        .map(|t| t.schedule.p99_ms)
+        .map(|t| t.held_back.p99_ms)
         .fold(0.0, f64::max);
-    assert!(wait > 1000.0, "scheduling wait p99 {wait} ms");
+    assert!(held > 1000.0, "held back p99 {held} ms");
     // a limiter inside the cluster ranks above the delays it causes
     let top = &r.hotspots[0];
     assert_eq!(
         (top.category.as_str(), top.resource.as_str()),
         ("rate-limit", "history.taskSchedulerGlobalMaxQPS"),
+        "{:#?}",
+        categories(&r)
+    );
+}
+
+#[test]
+fn a_namespace_scheduler_limit_holds_tasks_back_without_busy_workers() {
+    // Temporal sets a task's scheduled time again when the rescheduler resubmits it, so its
+    // scheduling wait starts when the limiter admits it. The time held back before that is the
+    // limiter's, and no scheduler worker was waited for.
+    let (r, out) = simulate_with_ctx(
+        &scenario("baseline.yaml"),
+        scheduler_limit("history.taskSchedulerGlobalNamespaceMaxQPS", 900, false),
+    );
+    let limiter = r
+        .hotspots
+        .iter()
+        .find(|h| h.resource == "history.taskSchedulerGlobalNamespaceMaxQPS")
+        .unwrap_or_else(|| panic!("{:#?}", categories(&r)));
+    assert_eq!(limiter.category, "rate-limit");
+    assert_eq!(limiter.severity, Severity::Critical, "{limiter:#?}");
+    assert!(
+        limiter.evidence[0].starts_with("held back p99 "),
+        "{:?}",
+        limiter.evidence
+    );
+    // the holds open when the window closes count as held until then
+    assert!(r.history.task_scheduler.held_at_end > 0);
+    assert!(
+        limiter
+            .evidence
+            .iter()
+            .any(|e| e.contains("still held back when the window closed")),
+        "{:?}",
+        limiter.evidence
+    );
+    assert!(
+        !r.hotspots
+            .iter()
+            .any(|h| h.title.contains("scheduler worker")),
+        "{:#?}",
+        categories(&r)
+    );
+    for t in &r.history.tasks {
+        assert!(t.held_back.p99_ms > 1000.0, "{t:?}");
+    }
+    // the low-priority timeouts, refused all window, show though they finish little or nothing
+    let timeouts = r
+        .history
+        .tasks
+        .iter()
+        .find(|t| t.task_type == "TimerActiveTaskWorkflowTaskTimeout")
+        .expect("held-back timeouts");
+    assert!(timeouts.sched_throttled_per_s > 0.0);
+    let text = tempdes::report::prom::render(&out.ctx);
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("task_scheduler_throttled{")
+                && l.contains("TimerActiveTaskWorkflowTaskTimeout")),
+        "no task_scheduler_throttled for the timeouts"
+    );
+    // task_latency_schedule leaves the hold-back out; task_latency_queue, from the fire time,
+    // keeps it
+    let m = out.ctx.m.borrow();
+    let wft = &m.tasks[TaskType::TransferWorkflowTask.idx()];
+    let (scheduled, queued) = (wft.schedule_latency.mean(), wft.queue_latency.mean());
+    assert!(
+        scheduled < 10_000.0,
+        "task_latency_schedule mean {scheduled}µs"
+    );
+    assert!(queued > 1_000_000.0, "task_latency_queue mean {queued}µs");
+    // the history task tables show the hold-back before the scheduling wait
+    let md = tempdes::report::markdown::render_run(&r, false);
+    assert!(md.contains("| load p99 | held back p99 | schedule p99 |"));
+    let text = tempdes::report::text::render(&r, false);
+    assert!(text.contains("load p99  held back p99  sched p99"));
+    let html = tempdes::report::html::render_run(&r);
+    assert!(html.contains("held back p99</th><th class=\"n\">schedule p99"));
+}
+
+#[test]
+fn a_namespace_held_back_shows_though_its_tasks_are_few() {
+    // A limit on a small namespace holds its tasks back long, while they are too few to show
+    // in any task type's tail: the hold-back is rated by namespace too.
+    let sc = Scenario::parse_str(
+        &TENANTS
+            .replace("start_rate: 50/s", "start_rate: 1/s")
+            .replace(
+                "LIMIT",
+                "history.taskSchedulerEnableRateLimiter: [{ value: true }]
+  history.taskSchedulerEnableRateLimiterShadowMode: [{ value: false }]
+  history.taskSchedulerGlobalNamespaceMaxQPS: [{ value: 3, constraints: { namespace: orders } }]",
+            ),
+    )
+    .expect("scenario parses");
+    let r = simulate_scenario(&sc, short());
+    for t in &r.history.tasks {
+        assert!(t.held_back.p99_ms < 1000.0, "{t:?}");
+    }
+    let orders = r
+        .history
+        .task_scheduler
+        .namespaces
+        .iter()
+        .find(|n| n.namespace == "orders")
+        .expect("orders held back");
+    assert!(orders.held_back.p99_ms > 5000.0, "{orders:?}");
+    let limiter = r
+        .hotspots
+        .iter()
+        .find(|h| h.category == "rate-limit")
+        .unwrap_or_else(|| panic!("{:#?}", categories(&r)));
+    assert_eq!(limiter.severity, Severity::Critical, "{limiter:#?}");
+    assert!(
+        limiter
+            .evidence
+            .iter()
+            .any(|e| e.starts_with("namespace orders: held back p99 ")),
+        "{:?}",
+        limiter.evidence
+    );
+    // and no task type is named as held back
+    assert!(
+        !limiter.evidence[0].starts_with("held back p99 "),
+        "{:?}",
+        limiter.evidence
+    );
+}
+
+#[test]
+fn busy_scheduler_workers_show_without_the_limiter() {
+    // two transfer workers per history pod, against hundreds of transfer tasks a second
+    let r = simulate(
+        "baseline.yaml",
+        with_dc(
+            short(),
+            "history.transferProcessorSchedulerWorkerCount",
+            DcValue::Int(2),
+        ),
+    );
+    assert_eq!(r.history.task_scheduler.mode, "off");
+    assert!(
+        r.hotspots.iter().any(|h| h.category == "history-queue"
+            && h.severity == Severity::Critical
+            && h.title.contains("for a transfer scheduler worker")),
+        "{:#?}",
+        categories(&r)
+    );
+    let md = tempdes::report::markdown::render_run(&r, false);
+    assert!(!md.contains("held back p99"));
+}
+
+#[test]
+fn busy_scheduler_workers_show_with_the_limiter_enforced() {
+    // The limiter holds the low-priority timeouts back, and the transfer tasks it admits still
+    // wait for the two workers: the wait after admission counts as scheduling wait.
+    let r = simulate(
+        "baseline.yaml",
+        with_dc(
+            scheduler_limit("history.taskSchedulerGlobalNamespaceMaxQPS", 1200, false),
+            "history.transferProcessorSchedulerWorkerCount",
+            DcValue::Int(2),
+        ),
+    );
+    assert!(r.history.task_scheduler.enforced());
+    let task = |name: &str| {
+        r.history
+            .tasks
+            .iter()
+            .find(|t| t.task_type == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let timeouts = task("TimerActiveTaskWorkflowTaskTimeout");
+    assert!(timeouts.held_back.p99_ms > 1000.0, "{timeouts:?}");
+    let wft = task("TransferActiveTaskWorkflowTask");
+    assert!(wft.schedule.p99_ms > 2000.0, "{wft:?}");
+    assert!(
+        r.hotspots.iter().any(|h| h.category == "history-queue"
+            && h.severity == Severity::Critical
+            && h.title.contains("for a transfer scheduler worker")),
+        "{:#?}",
+        categories(&r)
+    );
+}
+
+#[test]
+fn execution_queue_waits_are_not_put_down_to_scheduler_workers() {
+    // Busy-workflow retries moved to a workflow's execution queue wait for that queue's one
+    // worker, not the shared pool's, which stays free.
+    let r = simulate(
+        "hot-entity.yaml",
+        with_dc(
+            with_dc(
+                short(),
+                "history.taskSchedulerEnableExecutionQueueScheduler",
+                DcValue::Bool(true),
+            ),
+            "history.taskSchedulerExecutionQueueSchedulerQueueConcurrency",
+            DcValue::Int(1),
+        ),
+    );
+    let timeouts = r
+        .history
+        .tasks
+        .iter()
+        .find(|t| t.task_type == "TimerActiveTaskWorkflowTaskTimeout")
+        .expect("workflow task timeouts");
+    assert!(timeouts.exec_queue_runs_per_s > 0.0, "{timeouts:?}");
+    assert!(timeouts.schedule.p99_ms > 200.0, "{timeouts:?}");
+    assert!(timeouts.pool_wait.p99_ms < 200.0, "{timeouts:?}");
+    assert!(
+        !r.hotspots
+            .iter()
+            .any(|h| h.title.contains("scheduler worker")),
         "{:#?}",
         categories(&r)
     );

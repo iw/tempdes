@@ -200,6 +200,18 @@ fn a_finished_run_still_reads_its_window() {
     assert!(text.contains("window_seconds=20"));
     assert_eq!(text, prom::render_as(&out.ctx, Reading::Window));
     assert!(!samples(&text, "temporal_worker_task_slots_available").is_empty());
+    // a history task request per run, recorded with the run's scheduling wait, as Temporal's
+    // `Execute` records both
+    let requests = samples(&text, "task_requests");
+    assert!(!requests.is_empty());
+    for (labels, n) in requests {
+        let waits = samples(&text, "task_latency_schedule_count");
+        let (_, waited) = waits
+            .iter()
+            .find(|(l, _)| *l == labels)
+            .unwrap_or_else(|| panic!("no task_latency_schedule for {labels}"));
+        assert_eq!(n, *waited, "{labels}");
+    }
 }
 
 #[test]
