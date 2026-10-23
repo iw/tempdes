@@ -366,6 +366,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with the number of processes seen, to uncomment once its pollers and slots, which histories
   don't record, are set. The summary lists the SDKs the workers report. Identities, which name
   hosts, are counted but never written.
+- **`workload import` says when runs started and reached their children.** Two things the
+  imported steps don't carry can make a simulation start children well before the recorded
+  executions did. The summary now shows both.
+  - **When histories started.** Each type gets a line such as `histories started 10:12–10:34
+    UTC, half by 10:20`, and so does each path when a type has several. A path that ran in only
+    part of the window still gets an even share of the start rate, so a simulation spreads it
+    over the whole run.
+  - **When children started.** A path that starts children gets a line such as `first child
+    started 21.3m after the run's start (p50; p99 24.9m); waits in the cluster before it, which
+    the import leaves out: 20.9m (p50)`. The waits are the workflow tasks' schedule-to-start,
+    and in each step the longest first attempt's. Left out of the steps, they bring a simulated
+    run to its children that much sooner, unless the scenario's cluster makes it wait as long.
 
 ### Fixed
 

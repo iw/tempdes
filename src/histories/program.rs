@@ -364,6 +364,9 @@ fn workflow_type(
             fmt_us(quantile(&mut run_times, 0.99))
         );
     }
+    if let Some(span) = started(runs) {
+        let _ = writeln!(summary, "  histories {span}");
+    }
     let mut act_wait: Vec<f64> = runs
         .iter()
         .flat_map(|t| t.activity_queue_wait_us.iter().map(|&v| v as f64))
@@ -460,6 +463,15 @@ fn workflow_type(
                 sig.join(" → ")
             }
         );
+        // a path the start rate shares out evenly may have run in only part of the window
+        if kept > 1
+            && let Some(span) = started(path_runs)
+        {
+            let _ = writeln!(summary, "    {span}");
+        }
+        if let Some(timing) = first_child(path_runs) {
+            let _ = writeln!(summary, "    {timing}");
+        }
         entry(
             &type_name,
             path_runs,
@@ -1066,6 +1078,55 @@ fn dur(us: f64) -> String {
 }
 
 /// Seconds between the first and the last start.
+/// When `runs` started, UTC, as `started 10:12–10:34 UTC, half by 10:20`: to the second when
+/// they span less than two minutes.
+fn started(runs: &[&Trace]) -> Option<String> {
+    let mut starts: Vec<i64> = runs.iter().map(|t| t.start_us).collect();
+    starts.sort_unstable();
+    let (first, last) = (*starts.first()?, *starts.last()?);
+    let seconds = last - first < 120_000_000;
+    let clock = |us: i64| {
+        let s = us.div_euclid(1_000_000).rem_euclid(86_400);
+        if seconds {
+            format!("{:02}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+        } else {
+            format!("{:02}:{:02}", s / 3600, s % 3600 / 60)
+        }
+    };
+    let (a, b) = (clock(first), clock(last));
+    if a == b {
+        return Some(format!("started {a} UTC"));
+    }
+    Some(format!(
+        "started {a}–{b} UTC, half by {}",
+        clock(starts[(starts.len() - 1) / 2])
+    ))
+}
+
+/// How long after their start `runs` started their first child, and the waits in the cluster
+/// before it, which the import leaves out: a simulated run reaches its children sooner by
+/// about that much.
+fn first_child(runs: &[&Trace]) -> Option<String> {
+    let with: Vec<&&Trace> = runs.iter().filter(|t| t.first_child_us.is_some()).collect();
+    if with.is_empty() {
+        return None;
+    }
+    let mut after: Vec<f64> = with
+        .iter()
+        .filter_map(|t| t.first_child_us.map(|c| (c - t.start_us).max(0) as f64))
+        .collect();
+    let mut waits: Vec<f64> = with
+        .iter()
+        .map(|t| t.waits_before_child_us as f64)
+        .collect();
+    Some(format!(
+        "first child started {} after the run's start (p50; p99 {}); waits in the cluster before it, which the import leaves out: {} (p50)",
+        fmt_us(quantile(&mut after, 0.5)),
+        fmt_us(quantile(&mut after, 0.99)),
+        fmt_us(quantile(&mut waits, 0.5))
+    ))
+}
+
 fn start_span_s(runs: &[&&Trace]) -> f64 {
     let (a, b) = runs.iter().fold((i64::MAX, i64::MIN), |(a, b), t| {
         (a.min(t.start_us), b.max(t.start_us))

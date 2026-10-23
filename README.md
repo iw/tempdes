@@ -497,6 +497,14 @@ Both export spellings are read (`EVENT_TYPE_ACTIVITY_TASK_SCHEDULED` and
 * **Paths.** Executions of a type that took the same steps are pooled. A path taken by at least
   5% of them (`--min-path-share`) becomes a workflow type of its own (`OrderWorkflow~2`) with its
   share of the start rate; rarer paths are folded into the most common.
+* **When they ran.** The summary says when each type's histories started (UTC, and by when half
+  had), and each path's when a type has several. A path that ran in only part of the window
+  still gets an even share of the start rate, so a simulation runs it throughout.
+* **When children started.** For a path that starts children, the summary gives how long after
+  a run's start its first child started, and how much of that was waiting in the cluster: the
+  workflow tasks' schedule-to-start, and in each step the longest first attempt's
+  schedule-to-start. Those waits are left out of the steps, so a simulated run reaches its
+  children sooner by about that much, unless the scenario's cluster makes them wait as long.
 * **Start rate.** `--rate` sets it. Otherwise it comes from the counts in a `workload fetch`
   directory, or is estimated from the start times, which is right only if the export holds
   every execution in that time. Calibrating with observed `service_requests` (`-o`) also sets
