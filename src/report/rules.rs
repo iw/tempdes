@@ -12,6 +12,9 @@ struct Ctx2<'a> {
     r: &'a RunResult,
     warn: f64,
     crit: f64,
+    /// symptoms the task scheduler limiter's hold-back accounts for, with the severity each
+    /// would have had: their rules leave them to the limiter's hotspot, which lists them
+    held_symptoms: std::cell::RefCell<Vec<(Severity, String)>>,
 }
 
 impl Ctx2<'_> {
@@ -154,6 +157,7 @@ pub fn detect(ctx: &Ctx, r: &RunResult) -> Vec<Hotspot> {
         r,
         warn: ctx.p.report.warn_utilization,
         crit: ctx.p.report.critical_utilization,
+        held_symptoms: Default::default(),
     };
     let mut out = Vec::new();
     throughput(&c, &mut out);
@@ -163,13 +167,14 @@ pub fn detect(ctx: &Ctx, r: &RunResult) -> Vec<Hotspot> {
     shards(&c, &mut out);
     locks(&c, &mut out);
     queues(&c, &mut out);
+    schedules(&c, &mut out);
+    // after every rule that leaves a symptom to it
     task_scheduler(&c, &mut out);
     matching(&c, &mut out);
     limits(&c, &mut out);
     headroom(&c, &mut out);
     caches(&c, &mut out);
     history_size(&c, &mut out);
-    schedules(&c, &mut out);
     api_latency(&c, &mut out);
     movement(&c, &mut out);
     causal(&c, &mut out);
@@ -410,7 +415,16 @@ fn sample_quantile(sorted: &[f64], q: f64) -> f64 {
 }
 
 fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
+    use crate::model::types::TaskType;
+    // the history tasks that hand a workflow's tasks to matching, which the task scheduler
+    // limiter can hold back: a first activity attempt's transfer task, a retry's timer
+    let wft_tasks = [TaskType::TransferWorkflowTask.as_str()];
+    let activity_tasks = [
+        TaskType::TransferActivityTask.as_str(),
+        TaskType::TimerActivityRetryTimer.as_str(),
+    ];
     for (i, w) in c.r.workflows.iter().enumerate() {
+        let ns = Some(w.namespace.as_str());
         // not keeping up: workflows close (complete, fail or are terminated) more slowly than a
         // healthy cluster would close them, given how long they run by themselves
         if w.started_per_s > 0.0
@@ -446,6 +460,7 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                         fmt_rate(g)
                     ));
                 }
+                let held = held_back(c, &[wft_tasks[0], activity_tasks[0], activity_tasks[1]], ns);
                 out.push(hs(
                     if frac > 0.2 {
                         Severity::Critical
@@ -461,7 +476,7 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                         fmt_rate(expected),
                         fmt_rate(short)
                     ),
-                    "Workflows start faster than they finish, so the number running grows for as long as the load lasts. The expected rate allows for the workflow's own run time, sampled from its steps with their retries and the warm-up, so the shortfall is time spent waiting in the cluster: see the rate-limit and saturation hotspots for where.".to_string(),
+                    format!("{}Workflows start faster than they finish, so the number running grows for as long as the load lasts. The expected rate allows for the workflow's own run time, sampled from its steps with their retries and the warm-up, so the shortfall is time spent waiting in the cluster: see the rate-limit and saturation hotspots for where.", held_pointer(c, held, 1000.0)),
                     evidence,
                     &[
                         "workflow_success, workflow_failed (per workflow type)",
@@ -511,7 +526,7 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                 "workflow-tasks",
                 w.workflow_type.clone(),
                 format!("{} workflow task timeouts ({})", w.workflow_type, fmt_rate(rate)),
-                "Workflow tasks timed out: sticky schedule-to-start expired (worker's sticky queue not polled fast enough) or a started task was never completed (RecordWorkflowTaskStarted succeeded but the poll response was lost / too slow). Each timeout adds history events and a retry on the normal queue.".into(),
+                format!("{}Workflow tasks timed out: sticky schedule-to-start expired (worker's sticky queue not polled fast enough) or a started task was never completed (RecordWorkflowTaskStarted succeeded but the poll response was lost / too slow). Each timeout adds history events and a retry on the normal queue.", held_pointer(c, held_back(c, &wft_tasks, ns), 1000.0)),
                 vec![format!(
                     "workflow task schedule-to-start p99 {}",
                     ms(w.wft_schedule_to_start.p99_ms)
@@ -525,65 +540,81 @@ fn throughput(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             ));
         }
         let s2s = w.wft_schedule_to_start.p99_ms;
+        let held = held_back(c, &wft_tasks, ns);
         if s2s > 1000.0 {
             let sev = if s2s > 5000.0 {
                 Severity::Critical
             } else {
                 Severity::Warning
             };
-            out.push(hs(
-                sev,
-                "workers",
-                w.workflow_type.clone(),
-                format!("{}: workflow task schedule-to-start p99 {}", w.workflow_type, ms(s2s)),
-                "Workflow tasks start late. Measured from the scheduled time, as in the SDK, so this includes history handing the task to matching (a throttled transfer task backs off 3s or more) as well as the wait in matching (workers short of pollers or slots, backlogged partitions, forwarding). Compare the history task table with the matching partition table.".into(),
-                vec![
-                    format!("activity schedule-to-start p99 {}", ms(w.activity_schedule_to_start.p99_ms)),
-                    format!("sticky cache hit {}", fmt_pct(w.sticky_hit_ratio)),
-                ],
-                &[
-                    "temporal_workflow_task_schedule_to_start_latency (SDK)",
-                    "task_errors_throttled",
-                    "asyncmatch_latency",
-                    "approximate_backlog_count",
-                ],
-                if w.workflow_type == crate::model::params::SCHEDULER_WF_TYPE {
+            let what = format!(
+                "{}'s workflow task schedule-to-start p99 {}",
+                w.workflow_type,
+                ms(s2s)
+            );
+            if !accounted(c, held, sev, s2s, 1000.0, what) {
+                out.push(hs(
+                    sev,
+                    "workers",
+                    w.workflow_type.clone(),
+                    format!("{}: workflow task schedule-to-start p99 {}", w.workflow_type, ms(s2s)),
+                    format!("{}Workflow tasks start late. Measured from the scheduled time, as in the SDK, so this includes history handing the task to matching (a throttled transfer task backs off 3s or more) as well as the wait in matching (workers short of pollers or slots, backlogged partitions, forwarding). Compare the history task table with the matching partition table.", held_pointer(c, held, 1000.0)),
                     vec![
-                        c.knob("worker.perNamespaceWorkerCount", "run the namespace's system worker on more worker-service pods"),
-                        c.knob("worker.perNamespaceWorkerOptions", "SDK options (pollers/slots) of the per-namespace worker"),
-                        c.replicas("worker", "worker-service pods hosting per-namespace workers"),
-                    ]
-                } else {
-                    vec![
-                        c.infra("workers.*.workflow_pollers / workflow_slots", "scenario".into(), "SDK MaxConcurrentWorkflowTaskPollers / ExecutionSize"),
-                        c.knob("matching.numTaskqueueReadPartitions", "more partitions spread polls across matching hosts"),
-                    ]
-                },
-                40.0 + s2s / 100.0,
-            ));
+                        format!("activity schedule-to-start p99 {}", ms(w.activity_schedule_to_start.p99_ms)),
+                        format!("sticky cache hit {}", fmt_pct(w.sticky_hit_ratio)),
+                    ],
+                    &[
+                        "temporal_workflow_task_schedule_to_start_latency (SDK)",
+                        "task_errors_throttled",
+                        "asyncmatch_latency",
+                        "approximate_backlog_count",
+                    ],
+                    if w.workflow_type == crate::model::params::SCHEDULER_WF_TYPE {
+                        vec![
+                            c.knob("worker.perNamespaceWorkerCount", "run the namespace's system worker on more worker-service pods"),
+                            c.knob("worker.perNamespaceWorkerOptions", "SDK options (pollers/slots) of the per-namespace worker"),
+                            c.replicas("worker", "worker-service pods hosting per-namespace workers"),
+                        ]
+                    } else {
+                        vec![
+                            c.infra("workers.*.workflow_pollers / workflow_slots", "scenario".into(), "SDK MaxConcurrentWorkflowTaskPollers / ExecutionSize"),
+                            c.knob("matching.numTaskqueueReadPartitions", "more partitions spread polls across matching hosts"),
+                        ]
+                    },
+                    40.0 + s2s / 100.0,
+                ));
+            }
         }
         let as2s = w.activity_schedule_to_start.p99_ms;
+        let held = held_back(c, &activity_tasks, ns);
         if as2s > 1000.0 {
             let sev = if as2s > 10_000.0 {
                 Severity::Critical
             } else {
                 Severity::Warning
             };
-            out.push(hs(
-                sev,
-                "workers",
-                w.workflow_type.clone(),
-                format!("{}: activity schedule-to-start p99 {}", w.workflow_type, ms(as2s)),
-                "Activity tasks start late. Measured from the attempt's scheduled time, as in the SDK, so this includes history handing the task to matching (a throttled transfer or retry task backs off 3s or more) as well as the wait in matching (activity workers short of pollers or slots, or dispatch limited per partition).".into(),
-                vec![],
-                &[
-                    "temporal_activity_schedule_to_start_latency (SDK)",
-                    "task_errors_throttled",
-                    "approximate_backlog_count{task_type=\"Activity\"}",
-                ],
-                vec![c.infra("workers.*.activity_pollers / activity_slots", "scenario".into(), "SDK MaxConcurrentActivityTaskPollers / ExecutionSize")],
-                35.0 + as2s / 200.0,
-            ));
+            let what = format!(
+                "{}'s activity schedule-to-start p99 {}",
+                w.workflow_type,
+                ms(as2s)
+            );
+            if !accounted(c, held, sev, as2s, 1000.0, what) {
+                out.push(hs(
+                    sev,
+                    "workers",
+                    w.workflow_type.clone(),
+                    format!("{}: activity schedule-to-start p99 {}", w.workflow_type, ms(as2s)),
+                    format!("{}Activity tasks start late. Measured from the attempt's scheduled time, as in the SDK, so this includes history handing the task to matching (a throttled transfer or retry task backs off 3s or more) as well as the wait in matching (activity workers short of pollers or slots, or dispatch limited per partition).", held_pointer(c, held, 1000.0)),
+                    vec![],
+                    &[
+                        "temporal_activity_schedule_to_start_latency (SDK)",
+                        "task_errors_throttled",
+                        "approximate_backlog_count{task_type=\"Activity\"}",
+                    ],
+                    vec![c.infra("workers.*.activity_pollers / activity_slots", "scenario".into(), "SDK MaxConcurrentActivityTaskPollers / ExecutionSize")],
+                    35.0 + as2s / 200.0,
+                ));
+            }
         }
     }
 }
@@ -1248,12 +1279,18 @@ fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
         .find(|t| t.task_type.starts_with("Visibility"))
         && vis.queue.p99_ms > 5000.0
     {
+        // the queue's latency runs from the task's creation, so it includes any hold-back
+        let held = held_back(c, &[vis.task_type.as_str()], None);
+        let what = format!("the visibility lag p99 {}", ms(vis.queue.p99_ms));
+        if accounted(c, held, Severity::Warning, vis.queue.p99_ms, 5000.0, what) {
+            return;
+        }
         out.push(hs(
                 Severity::Warning,
                 "visibility",
                 "visibility queue".into(),
                 format!("visibility updates lag {} (p99)", ms(vis.queue.p99_ms)),
-                "List/Count results trail the workflow state; the visibility queue or the Elasticsearch bulk processor is saturated.".into(),
+                format!("{}List/Count results trail the workflow state; the visibility queue or the Elasticsearch bulk processor is saturated.", held_pointer(c, held, 5000.0)),
                 vec![],
                 &["task_latency_queue{task_type=~\"Visibility.*\"}", "elasticsearch_bulk_processor_request_latency"],
                 vec![
@@ -1266,15 +1303,27 @@ fn queues(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     }
 }
 
-/// The history task scheduler's rate limiter. In shadow mode it only counts, so report what it
-/// would hold back, which is how the limits are sized. Enforced, a refused task waits in the
-/// rescheduler, which is the point of the limiter; how long it holds tasks back is what can
-/// become a problem, and sets the severity.
-fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
-    let h = &c.r.history;
-    let ts = &h.task_scheduler;
+/// The history task scheduler's rate limiter as its hotspot rates it.
+struct SchedLimiter<'a> {
+    /// the setting that does the refusing
+    resource: &'static str,
+    /// a namespace limit is set
+    ns_limit: bool,
+    /// it holds refused tasks back, rather than only counting them in shadow mode
+    enforced: bool,
+    /// the task type it held back longest, the most refused among equals, and the namespace
+    worst_type: Option<&'a TaskResult>,
+    worst_ns: Option<&'a NamespaceHoldResult>,
+    /// the longer of their hold-backs' p99, in ms, and the severity that sets
+    held_p99_ms: f64,
+    severity: Severity,
+}
+
+/// The task scheduler's rate limiter, or `None` when it is off or refused nothing.
+fn sched_limiter<'a>(c: &Ctx2<'a>) -> Option<SchedLimiter<'a>> {
+    let ts = &c.r.history.task_scheduler;
     if ts.mode == "off" || ts.throttled_per_s <= 0.0 {
-        return;
+        return None;
     }
     let (k, namespaces) = (&c.ctx.p.k, &c.ctx.p.namespaces);
     // Without a namespace limit the namespace bucket runs at the pod rate and, being checked
@@ -1296,6 +1345,132 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
     } else {
         "history.taskSchedulerMaxQPS"
     };
+    // How long it held submissions back, which task_latency_schedule leaves out: per task type,
+    // and per namespace, as a small namespace's own limit can hold it back without showing in
+    // any type's tail. Only a type it held back is named, the most refused among equals. All
+    // zero in shadow mode.
+    let worst_type =
+        c.r.history
+            .tasks
+            .iter()
+            .filter(|t| t.held_back.p99_ms > 0.0)
+            .max_by(|a, b| {
+                a.held_back
+                    .p99_ms
+                    .total_cmp(&b.held_back.p99_ms)
+                    .then(a.sched_throttled_per_s.total_cmp(&b.sched_throttled_per_s))
+            });
+    let worst_ns = ts
+        .namespaces
+        .iter()
+        .filter(|n| n.held_back.p99_ms > 0.0)
+        .max_by(|a, b| a.held_back.p99_ms.total_cmp(&b.held_back.p99_ms));
+    let held_p99_ms = worst_type
+        .map_or(0.0, |t| t.held_back.p99_ms)
+        .max(worst_ns.map_or(0.0, |n| n.held_back.p99_ms));
+    let severity = if held_p99_ms > 5000.0 {
+        Severity::Critical
+    } else if held_p99_ms > 1000.0 {
+        Severity::Warning
+    } else {
+        Severity::Info
+    };
+    Some(SchedLimiter {
+        resource,
+        ns_limit,
+        enforced: ts.enforced(),
+        worst_type,
+        worst_ns,
+        held_p99_ms,
+        severity,
+    })
+}
+
+/// How long the enforced task scheduler limiter held back the history tasks behind a symptom:
+/// the longest p99 hold-back among `types`, in ms, with that type. `None` unless the limiter
+/// held tasks back long enough to rate a warning: a shorter hold-back explains no symptom. With
+/// several namespaces, a namespace's symptom is held back no longer than the namespace's tasks
+/// were, which also keeps another namespace's hold-back out of it.
+fn held_back<'a>(c: &Ctx2<'a>, types: &[&str], ns: Option<&str>) -> Option<(f64, &'a str)> {
+    let l = sched_limiter(c)?;
+    if !l.enforced || l.severity == Severity::Info {
+        return None;
+    }
+    let (p99, task_type) =
+        c.r.history
+            .tasks
+            .iter()
+            .filter(|t| types.contains(&t.task_type.as_str()))
+            .map(|t| (t.held_back.p99_ms, t.task_type.as_str()))
+            .max_by(|a, b| a.0.total_cmp(&b.0))?;
+    let p99 = match ns {
+        Some(ns) if c.ctx.p.namespaces.len() > 1 => {
+            let held =
+                c.r.history
+                    .task_scheduler
+                    .namespaces
+                    .iter()
+                    .find(|n| n.namespace == ns)?;
+            p99.min(held.held_back.p99_ms)
+        }
+        _ => p99,
+    };
+    (p99 > 0.0).then_some((p99, task_type))
+}
+
+/// Whether the hold-back accounts for a symptom: without it, what is left of the symptom's p99
+/// is under the threshold that raises it. The symptom's rule then leaves it to the limiter's
+/// hotspot, which lists `what` and takes on its severity.
+fn accounted(
+    c: &Ctx2<'_>,
+    held: Option<(f64, &str)>,
+    severity: Severity,
+    p99_ms: f64,
+    threshold_ms: f64,
+    what: String,
+) -> bool {
+    match held {
+        Some((held, task_type)) if p99_ms - held <= threshold_ms => {
+            c.held_symptoms.borrow_mut().push((
+                severity,
+                format!(
+                    "accounts for {what} ({task_type} held back p99 {})",
+                    ms(held)
+                ),
+            ));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// How a symptom that the hold-back explains only in part points at the limiter: an opening
+/// for its detail. Empty unless the hold-back is at least `threshold_ms`, the symptom's own
+/// threshold, as a shorter one can't be what raised it.
+fn held_pointer(c: &Ctx2<'_>, held: Option<(f64, &str)>, threshold_ms: f64) -> String {
+    match (held, sched_limiter(c)) {
+        (Some((held, task_type)), Some(l)) if held >= threshold_ms => format!(
+            "Partly caused by tasks held back ({}: {task_type} held back p99 {}): see that hotspot first. ",
+            l.resource,
+            ms(held)
+        ),
+        _ => String::new(),
+    }
+}
+
+/// The history task scheduler's rate limiter. In shadow mode it only counts, so report what it
+/// would hold back, which is how the limits are sized. Enforced, a refused task waits in the
+/// rescheduler, which is the point of the limiter; how long it holds tasks back is what can
+/// become a problem, and sets the severity. The symptoms it accounts for are listed here rather
+/// than reported apart, and a critical one makes this hotspot critical.
+fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
+    let Some(l) = sched_limiter(c) else {
+        return;
+    };
+    let h = &c.r.history;
+    let ts = &h.task_scheduler;
+    let (k, namespaces) = (&c.ctx.p.k, &c.ctx.p.namespaces);
+    let (resource, ns_limit) = (l.resource, l.ns_limit);
     let mut by_type: Vec<&TaskResult> = h
         .tasks
         .iter()
@@ -1323,7 +1498,7 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             ts.refused_by_namespace, ts.refused_by_pod
         ));
     }
-    let enforced = ts.enforced();
+    let enforced = l.enforced;
     for t in by_type.iter().take(3) {
         let held = if enforced {
             format!(", held back p99 {}", ms(t.held_back.p99_ms))
@@ -1366,27 +1541,7 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
         ));
         return;
     }
-    // How long it held submissions back, which task_latency_schedule leaves out: per task type,
-    // and per namespace, as a small namespace's own limit can hold it back without showing in
-    // any type's tail. Only a type it held back is named, the most refused among equals.
-    let worst_type = h
-        .tasks
-        .iter()
-        .filter(|t| t.held_back.p99_ms > 0.0)
-        .max_by(|a, b| {
-            a.held_back
-                .p99_ms
-                .total_cmp(&b.held_back.p99_ms)
-                .then(a.sched_throttled_per_s.total_cmp(&b.sched_throttled_per_s))
-        });
-    let worst_ns = ts
-        .namespaces
-        .iter()
-        .filter(|n| n.held_back.p99_ms > 0.0)
-        .max_by(|a, b| a.held_back.p99_ms.total_cmp(&b.held_back.p99_ms));
-    let held_p99 = worst_type
-        .map_or(0.0, |t| t.held_back.p99_ms)
-        .max(worst_ns.map_or(0.0, |n| n.held_back.p99_ms));
+    let (worst_type, worst_ns, held_p99) = (l.worst_type, l.worst_ns, l.held_p99_ms);
     let mut head = Vec::new();
     if let Some(t) = worst_type {
         head.push(format!(
@@ -1411,14 +1566,14 @@ fn task_scheduler(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
             ts.held_at_end
         ));
     }
+    // the symptoms it accounts for, which their rules leave to it, at their severity
+    let held_symptoms = c.held_symptoms.borrow();
+    head.extend(held_symptoms.iter().map(|(_, what)| what.clone()));
     evidence.splice(0..0, head);
-    let sev = if held_p99 > 5000.0 {
-        Severity::Critical
-    } else if held_p99 > 1000.0 {
-        Severity::Warning
-    } else {
-        Severity::Info
-    };
+    let sev = held_symptoms
+        .iter()
+        .map(|(s, _)| *s)
+        .fold(l.severity, Severity::min);
     out.push(hs(
         sev,
         "rate-limit",
@@ -1776,6 +1931,7 @@ fn history_size(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
 }
 
 fn schedules(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
+    use crate::model::types::TaskType;
     if let Some(s) = &c.r.schedules
         && (s.rate_limited > 0 || s.action_delay.p99_ms > 5000.0)
     {
@@ -1784,6 +1940,26 @@ fn schedules(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
         } else {
             Severity::Warning
         };
+        // An action waits for its scheduler workflow's timer, then for the workflow task that
+        // starts it: both history tasks the task scheduler limiter can hold back.
+        let tasks = [
+            TaskType::TimerUserTimer.as_str(),
+            TaskType::TransferWorkflowTask.as_str(),
+        ];
+        let held =
+            c.r.workflows
+                .iter()
+                .filter(|w| w.workflow_type == crate::model::params::SCHEDULER_WF_TYPE)
+                .filter_map(|w| held_back(c, &tasks, Some(&w.namespace)))
+                .max_by(|a, b| a.0.total_cmp(&b.0));
+        // actions the start-rate limiter delayed have that cause too
+        let what = format!(
+            "the schedule actions' delay p99 {}",
+            ms(s.action_delay.p99_ms)
+        );
+        if s.rate_limited == 0 && accounted(c, held, sev, s.action_delay.p99_ms, 5000.0, what) {
+            return;
+        }
         out.push(hs(
                 sev,
                 "schedules",
@@ -1793,8 +1969,8 @@ fn schedules(c: &Ctx2<'_>, out: &mut Vec<Hotspot>) {
                     ms(s.action_delay.p99_ms),
                     s.rate_limited
                 ),
-                "Schedules in a namespace share one start-rate token bucket per worker-service host (worker.schedulerNamespaceStartWorkflowRPS × host share). All per-namespace system work runs on worker.perNamespaceWorkerCount hosts, so aligned schedules (e.g. all at :00) queue behind each other.".into(),
-                vec![format!("{} actions/s", fmt_rate(s.actions_per_s))],
+                format!("{}Schedules in a namespace share one start-rate token bucket per worker-service host (worker.schedulerNamespaceStartWorkflowRPS × host share). All per-namespace system work runs on worker.perNamespaceWorkerCount hosts, so aligned schedules (e.g. all at :00) queue behind each other.", held_pointer(c, held, 5000.0)),
+                vec![format!("actions at {}", fmt_rate(s.actions_per_s))],
                 &["schedule_action_delay", "schedule_rate_limited", "schedule_action_success"],
                 vec![
                     c.knob("worker.schedulerNamespaceStartWorkflowRPS", "per-namespace start rate"),
@@ -2259,21 +2435,29 @@ fn lift_above(h: &mut Hotspot, symptom_max: f64) {
     h.score = h.score.max(symptom_max + 1.0 + h.score / 1_000.0);
 }
 
-/// Limiters inside the cluster: history and matching host RPS, persistence QPS, and the history
-/// task scheduler's rate limiter (whose hotspot is a rate limit only when it is enforced).
+/// Limiters inside the cluster that reject calls: history and matching host RPS, and
+/// persistence QPS.
 fn is_internal_limiter(resource: &str) -> bool {
-    resource == "history.rps"
-        || resource == "matching.rps"
-        || resource.contains(".persistence")
-        || resource.starts_with("history.taskScheduler")
+    resource == "history.rps" || resource == "matching.rps" || resource.contains(".persistence")
+}
+
+/// The history task scheduler's rate limiter, whose hotspot is a rate limit when it is
+/// enforced. It holds tasks back rather than rejecting calls, and only a hold-back that rates a
+/// warning or worse is taken as a cause.
+fn holds_tasks_back(h: &Hotspot) -> bool {
+    h.category == "rate-limit"
+        && h.resource.starts_with("history.taskScheduler")
+        && h.severity <= Severity::Warning
 }
 
 /// When `history.rps`, `matching.rps` or a persistence limit rejects calls, the retries and
 /// backoffs that follow show up as schedule-to-start latency, matching backlog, workflow task
 /// timeouts, throttled queue tasks and slow or failing API calls. Rank the limiter above those
-/// symptoms (within its severity) and point the symptoms at it.
+/// symptoms (within its severity) and point the symptoms at it. The task scheduler's limiter
+/// ranks above them too when it held tasks back; the rules that raise its symptoms point them
+/// at it, or leave them to it.
 fn rank_internal_limiters(out: &mut [Hotspot]) {
-    const SYMPTOMS: [&str; 8] = [
+    const SYMPTOMS: [&str; 10] = [
         "workers",
         "matching-backlog",
         "workflow-tasks",
@@ -2282,13 +2466,13 @@ fn rank_internal_limiters(out: &mut [Hotspot]) {
         "api-errors",
         "throughput",
         "activity-timeouts",
+        "visibility",
+        "schedules",
     ];
-    let limiters: Vec<String> = out
-        .iter()
-        .filter(|h| h.category == "rate-limit" && is_internal_limiter(&h.resource))
-        .map(|h| h.resource.clone())
-        .collect();
-    if limiters.is_empty() {
+    let lifted = |h: &Hotspot| {
+        h.category == "rate-limit" && is_internal_limiter(&h.resource) || holds_tasks_back(h)
+    };
+    if !out.iter().any(lifted) {
         return;
     }
     let symptom_max = out
@@ -2296,11 +2480,16 @@ fn rank_internal_limiters(out: &mut [Hotspot]) {
         .filter(|h| SYMPTOMS.contains(&h.category.as_str()))
         .map(|h| h.score)
         .fold(0.0, f64::max);
-    for h in out
-        .iter_mut()
-        .filter(|h| h.category == "rate-limit" && is_internal_limiter(&h.resource))
-    {
+    for h in out.iter_mut().filter(|h| lifted(h)) {
         lift_above(h, symptom_max);
+    }
+    let limiters: Vec<String> = out
+        .iter()
+        .filter(|h| h.category == "rate-limit" && is_internal_limiter(&h.resource))
+        .map(|h| h.resource.clone())
+        .collect();
+    if limiters.is_empty() {
+        return;
     }
     for h in out.iter_mut().filter(|h| {
         matches!(
@@ -2546,6 +2735,48 @@ mod tests {
         ];
         rank_internal_limiters(&mut out);
         assert_eq!(out[1].score, 60.0);
+    }
+
+    #[test]
+    fn the_task_scheduler_limiter_is_a_cause_only_when_it_held_tasks_back() {
+        let scheduler = "history.taskSchedulerGlobalNamespaceMaxQPS";
+        // a hold-back too short to rate a warning: neither ranked above the symptoms nor named
+        let mut out = vec![
+            hotspot(Severity::Critical, "workers", "OrderWorkflow", 80.0),
+            hotspot(Severity::Critical, "matching-backlog", "orders", 70.0),
+            hotspot(Severity::Info, "rate-limit", scheduler, 40.0),
+        ];
+        rank_internal_limiters(&mut out);
+        assert_eq!(out[2].score, 40.0);
+        assert!(out.iter().all(|h| h.detail == "detail"), "{out:#?}");
+
+        // a long one ranks above them, and the rules that raise them point at it: it rejects no
+        // calls, so nothing here names it
+        let mut out = vec![
+            hotspot(Severity::Warning, "workers", "OrderWorkflow", 80.0),
+            hotspot(Severity::Warning, "visibility", "visibility queue", 90.0),
+            hotspot(Severity::Warning, "rate-limit", scheduler, 45.0),
+        ];
+        rank_internal_limiters(&mut out);
+        let score = |cat: &str| out.iter().find(|h| h.category == cat).unwrap().score;
+        assert!(score("rate-limit") > score("visibility"));
+        assert!(score("rate-limit") > score("workers"));
+        assert!(out.iter().all(|h| h.detail == "detail"), "{out:#?}");
+
+        // beside a limiter that rejects calls, the symptoms name that one alone
+        let mut out = vec![
+            hotspot(Severity::Critical, "workers", "OrderWorkflow", 80.0),
+            hotspot(Severity::Critical, "rate-limit", "history.rps", 60.0),
+            hotspot(Severity::Critical, "rate-limit", scheduler, 50.0),
+        ];
+        rank_internal_limiters(&mut out);
+        assert!(
+            out[0].detail.starts_with(
+                "Likely caused by rejected calls (history.rps): see that hotspot first."
+            ),
+            "{}",
+            out[0].detail
+        );
     }
 
     #[test]

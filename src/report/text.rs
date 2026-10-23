@@ -518,7 +518,7 @@ pub fn render(r: &RunResult, verbose: bool) -> String {
     if let Some(s) = &r.schedules {
         let _ = writeln!(
             o,
-            "\n{}  {} actions/s · delay p50 {} p99 {} · rate-limited {}",
+            "\n{}  actions at {} · delay p50 {} p99 {} · rate-limited {}",
             st.bold("SCHEDULES"),
             fmt_rate(s.actions_per_s),
             ms(s.action_delay.p50_ms),

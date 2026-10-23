@@ -693,7 +693,9 @@ The report opens with a headline, followed by ranked hotspots. Each hotspot has:
 
 A causal pass moves root causes above their symptoms. For example, a saturated database ranks
 above the backlog and schedule-to-start latency it causes. A hot shard is attributed to the
-single hot workflow writing to it.
+single hot workflow writing to it. When the history task scheduler's rate limiter holds tasks
+back, the schedule-to-start and visibility lag its hold-back accounts for are listed in its
+hotspot rather than reported apart.
 
 | Category | Meaning |
 |---|---|

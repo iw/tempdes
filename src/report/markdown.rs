@@ -494,7 +494,7 @@ pub fn render_run(r: &RunResult, verbose: bool) -> String {
         o.push_str("## Schedules\n\n");
         let _ = writeln!(
             o,
-            "{} actions/s. Action delay p50 {}, p99 {}. {} rate-limited.\n",
+            "Actions at {}. Action delay p50 {}, p99 {}. {} rate-limited.\n",
             fmt_rate(s.actions_per_s),
             ms(s.action_delay.p50_ms),
             ms(s.action_delay.p99_ms),
