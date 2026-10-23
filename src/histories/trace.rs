@@ -304,6 +304,12 @@ pub struct Trace {
     /// waits in the cluster: first attempts' activity schedule-to-start, and workflow tasks'
     pub activity_queue_wait_us: Vec<u64>,
     pub wft_queue_wait_us: Vec<u64>,
+    /// when it started its first child workflow, if it started one
+    pub first_child_us: Option<i64>,
+    /// the waits in the cluster before then: the schedule-to-start of the workflow tasks that
+    /// started by then, and in each step before it the longest first attempt's among its
+    /// activities
+    pub waits_before_child_us: u64,
     /// event kinds the importer doesn't model, with counts
     pub skipped: BTreeMap<String, u32>,
     pub notes: Vec<String>,
@@ -351,6 +357,8 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
         wft_timeouts: 0,
         activity_queue_wait_us: Vec::new(),
         wft_queue_wait_us: Vec::new(),
+        first_child_us: None,
+        waits_before_child_us: 0,
         skipped: BTreeMap::new(),
         notes: Vec::new(),
         size: None,
@@ -370,6 +378,10 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
     // closed them (none yet: still running)
     let mut activity_closed: HashMap<i64, i64> = HashMap::new();
     let mut child_closed: HashMap<i64, i64> = HashMap::new();
+    // workflow tasks' schedule-to-start by when they started, and the batch that started the
+    // first child, for the waits before it
+    let mut wft_waits: Vec<(i64, u64)> = Vec::new();
+    let mut first_child_batch: Option<usize> = None;
     // signals and payload-carrying events so far, for workflow tasks' `historySizeBytes`
     let (mut signals_seen, mut payloads_seen, mut unmodelled_seen) = (0, 0, 0);
     for e in events {
@@ -415,8 +427,9 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
                         .insert(w);
                 }
                 if let Some(s) = id_of(e, "scheduledEventId").and_then(|s| wft_scheduled.get(&s)) {
-                    t.wft_queue_wait_us
-                        .push(e.time_us.saturating_sub(*s).max(0) as u64);
+                    let wait = e.time_us.saturating_sub(*s).max(0) as u64;
+                    t.wft_queue_wait_us.push(wait);
+                    wft_waits.push((e.time_us, wait));
                 }
             }
             Kind::WftCompleted => {
@@ -575,10 +588,13 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
             Kind::ChildInitiated => {
                 child_closed.insert(e.id, i64::MAX);
                 let child = name(&e.attrs, "workflowType").unwrap_or_else(|| "child".into());
-                if let Some(&b) =
-                    id_of(e, "workflowTaskCompletedEventId").and_then(|w| batch_of.get(&w))
-                {
+                let batch = id_of(e, "workflowTaskCompletedEventId").and_then(|w| batch_of.get(&w));
+                if let Some(&b) = batch {
                     batches[b].children.push(child);
+                }
+                if t.first_child_us.is_none() {
+                    t.first_child_us = Some(e.time_us);
+                    first_child_batch = batch.copied();
                 }
             }
             Kind::Signaled => signals.push(e.id),
@@ -617,6 +633,28 @@ pub fn trace(events: &[Event]) -> Result<Trace, String> {
         }
     }
     wft_scheduled_ids.sort_unstable();
+    if let Some(at) = t.first_child_us {
+        let wft: u64 = wft_waits
+            .iter()
+            .filter(|(started, _)| *started <= at)
+            .map(|(_, wait)| wait)
+            .sum();
+        // activities started together wait in their queues at the same time; those started
+        // with the child wait after it
+        let steps: u64 = batches[..first_child_batch.unwrap_or(0)]
+            .iter()
+            .map(|b| {
+                b.activities
+                    .iter()
+                    .filter_map(|id| activities.get(id))
+                    .filter(|a| a.attempts == 1)
+                    .filter_map(Activity::start_gap_us)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .sum();
+        t.waits_before_child_us = wft + steps;
+    }
 
     // whether activities or children issued before `at` were still running then
     let busy_at = |at: i64| {

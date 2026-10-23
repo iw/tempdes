@@ -629,6 +629,66 @@ fn timeouts_are_told_apart() {
 }
 
 #[test]
+fn the_summary_says_when_runs_started_and_reached_their_children() {
+    // six orders a second apart, two with a lookup that took four attempts, then one that
+    // skipped the sleep, a path of its own
+    let mut histories: Vec<String> = (0..6)
+        .map(|i| order(i as f64 * 1000.0, if i < 2 { 4 } else { 1 }, true, false))
+        .collect();
+    histories.push(order(6000.0, 1, false, false));
+    let p = import(&histories);
+    for want in [
+        "  histories started 10:00:00–10:00:06 UTC, half by 10:00:03\n",
+        // each path's own, as the start rate shares them out over the whole window
+        "    started 10:00:00–10:00:05 UTC, half by 10:00:02\n",
+        "    started 10:00:06 UTC\n",
+        // The lookups' retries put two orders' children later, which the steps keep. Left out
+        // are two steps' 20ms in their queues, and 1ms for each workflow task that started
+        // before the child: six, or four without the sleep, when the child starts before the
+        // check's workflow task.
+        "    first child started 2.40s after the run's start (p50; p99 9.76s); waits in the cluster before it, which the import leaves out: 46.0ms (p50)\n",
+        "    first child started 398ms after the run's start (p50; p99 398ms); waits in the cluster before it, which the import leaves out: 44.0ms (p50)\n",
+    ] {
+        assert!(p.summary.contains(want), "{want}\n{}", p.summary);
+    }
+
+    // a fan-out that came 30s after the start, because its workflow task waited 30s for a
+    // worker: the simulation reaches it about 30s sooner
+    let mut h = History::new("BatchWorkflow", 0.0, false);
+    let s = h.event("WorkflowTaskScheduled", 0.0, json!({}));
+    let st = h.event(
+        "WorkflowTaskStarted",
+        30_000.0,
+        json!({"scheduledEventId": s.to_string()}),
+    );
+    let w = h.event(
+        "WorkflowTaskCompleted",
+        30_005.0,
+        json!({"scheduledEventId": s.to_string(), "startedEventId": st.to_string()}),
+    );
+    let child = h.event(
+        "StartChildWorkflowExecutionInitiated",
+        30_005.0,
+        json!({"workflowType": {"name": "ItemWorkflow"}, "taskQueue": {"name": "orders"}, "workflowTaskCompletedEventId": w.to_string()}),
+    );
+    h.event(
+        "ChildWorkflowExecutionCompleted",
+        30_500.0,
+        json!({"initiatedEventId": child.to_string()}),
+    );
+    h.wft(30_500.0, 3.0);
+    h.event("WorkflowExecutionCompleted", 30_504.0, json!({}));
+    let p = import(&[h.json()]);
+    assert!(
+        p.summary.contains(
+            "    first child started 30.00s after the run's start (p50; p99 30.00s); waits in the cluster before it, which the import leaves out: 30.00s (p50)\n"
+        ),
+        "{}",
+        p.summary
+    );
+}
+
+#[test]
 fn activities_and_children_started_together_become_a_parallel_step() {
     // a booking reserves two seats and starts its payment and notification children in the
     // same workflow task, then completes when all four are done
