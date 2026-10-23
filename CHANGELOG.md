@@ -404,6 +404,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scheduler workers. It now has four, the limiter's own among them. The timeout timers it kept
   out all window show as held back 1.0m (p99).
 
+- **One hotspot for what the task scheduler's limiter holds back.** The limiter's hold-back
+  still raised hotspots of its own elsewhere, each with advice that didn't fit: schedule-to-start
+  pointed at pollers and slots, the visibility lag at Elasticsearch, and delayed schedule
+  actions at their start rate.
+  - **Listed with the limiter.** A symptom the hold-back accounts for is now listed in the
+    limiter's hotspot ("accounts for OrderWorkflow's workflow task schedule-to-start p99
+    34.60s"), which takes on its severity. The hold-back accounts for it when, without the
+    hold-back of the history tasks behind it, its p99 would be under the threshold that raises
+    it.
+  - **Pointing at it.** A symptom it accounts for only in part opens "Partly caused by tasks
+    held back", with the setting and the hold-back of its tasks, as do workflow task timeouts and
+    *not keeping up*. It no longer reads "rejected calls": the limiter rejects none.
+  - **Only when it held tasks back.** The limiter is a cause only when its hold-back rates a
+    warning, and the hold-back of the symptom's own tasks reaches the symptom's threshold. Before,
+    an enforced limiter that held almost nothing back headed every busy-worker, backlog and
+    workflow task hotspot. A matching backlog no longer points at it, as tasks are held back
+    before they reach matching.
+
+  `baseline.yaml` with `history.taskSchedulerGlobalNamespaceMaxQPS=600`, run with `--warmup 8
+  --duration 60`, had four critical hotspots and a warning. It now has two: the limiter's,
+  which lists both schedule-to-start figures and the visibility lag, and *not keeping up*,
+  which points at it.
+
+- **Schedule action rates.** The schedules section and hotspot gave the action rate as
+  "20.2/s actions/s"; they now read "actions at 20.2/s".
+
 - **The backlog of a queue nothing polls.** Matching's metrics left out a partition that had
   been neither polled nor matched, so a task queue with no workers showed no
   `approximate_backlog_count` or `approximate_backlog_age_seconds` at all, however large its

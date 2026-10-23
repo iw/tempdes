@@ -899,6 +899,147 @@ fn busy_scheduler_workers_show_with_the_limiter_enforced() {
 }
 
 #[test]
+fn the_symptoms_of_a_hold_back_are_listed_with_the_limiter() {
+    // The limiter holds every task type back longer than anything else delays it, so the
+    // schedule-to-start and visibility lag it causes are listed in its hotspot, rather than
+    // reported apart with advice about pollers, slots and Elasticsearch.
+    let r = simulate(
+        "baseline.yaml",
+        scheduler_limit("history.taskSchedulerGlobalNamespaceMaxQPS", 600, false),
+    );
+    let limiter = r
+        .hotspots
+        .iter()
+        .find(|h| h.category == "rate-limit")
+        .unwrap_or_else(|| panic!("{:#?}", categories(&r)));
+    assert_eq!(limiter.severity, Severity::Critical, "{limiter:#?}");
+    for symptom in [
+        "OrderWorkflow's workflow task schedule-to-start",
+        "OrderWorkflow's activity schedule-to-start",
+        "the visibility lag",
+    ] {
+        assert!(
+            limiter
+                .evidence
+                .iter()
+                .any(|e| e.starts_with(&format!("accounts for {symptom} p99 "))),
+            "{symptom}: {:?}",
+            limiter.evidence
+        );
+    }
+    assert!(
+        !r.hotspots
+            .iter()
+            .any(|h| h.category == "workers" || h.category == "visibility"),
+        "{:#?}",
+        categories(&r)
+    );
+    // what it leaves to other hotspots points at it as holding tasks back: it rejects no calls
+    for h in &r.hotspots {
+        assert!(!h.detail.contains("rejected calls"), "{h:#?}");
+    }
+    let throughput = r
+        .hotspots
+        .iter()
+        .find(|h| h.category == "throughput")
+        .unwrap_or_else(|| panic!("{:#?}", categories(&r)));
+    assert!(
+        throughput.detail.starts_with(
+            "Partly caused by tasks held back (history.taskSchedulerGlobalNamespaceMaxQPS: "
+        ),
+        "{}",
+        throughput.detail
+    );
+}
+
+#[test]
+fn a_limiter_that_held_the_tasks_little_is_not_blamed_for_busy_workers() {
+    // Twenty activity slots per worker against one-second activities: activities queue in
+    // matching. The limiter holds low-priority timeouts back for seconds, which makes its own
+    // hotspot critical, but not the activities' tasks, so the workers' symptoms don't point at
+    // it.
+    let text = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scenarios/baseline.yaml"),
+    )
+    .expect("baseline reads");
+    let sc = Scenario::parse_str(
+        &text
+            .replace("activity_slots: 200", "activity_slots: 20")
+            .replace(
+                "duration: { p50: 30ms, p99: 250ms }",
+                "duration: { p50: 1s, p99: 2s }",
+            ),
+    )
+    .expect("scenario parses");
+    let r = simulate_scenario(
+        &sc,
+        scheduler_limit("history.taskSchedulerGlobalNamespaceMaxQPS", 1800, false),
+    );
+    assert!(r.history.task_scheduler.throttled_per_s > 0.0);
+    let activities = r
+        .history
+        .tasks
+        .iter()
+        .find(|t| t.task_type == "TransferActiveTaskActivityTask")
+        .expect("activity tasks");
+    assert!(activities.held_back.p99_ms < 1000.0, "{activities:?}");
+    let s2s = r
+        .hotspots
+        .iter()
+        .find(|h| h.category == "workers" && h.title.contains("activity schedule-to-start"))
+        .unwrap_or_else(|| panic!("{:#?}", categories(&r)));
+    assert!(
+        s2s.detail.starts_with("Activity tasks start late."),
+        "{}",
+        s2s.detail
+    );
+    for h in r.hotspots.iter().filter(|h| h.category != "rate-limit") {
+        assert!(!h.detail.contains("taskScheduler"), "{h:#?}");
+    }
+}
+
+#[test]
+fn schedule_actions_the_limiter_delays_point_at_it() {
+    // The limiter holds the scheduler workflows' timers and workflow tasks back, so actions come
+    // due late and in bunches, which the start-rate limit then delays further: the schedules
+    // hotspot names the hold-back first.
+    let mut ov = Overrides {
+        warmup_s: Some(5.0),
+        duration_s: Some(130.0),
+        ..Default::default()
+    };
+    for (key, value) in [
+        (
+            "history.taskSchedulerEnableRateLimiter",
+            DcValue::Bool(true),
+        ),
+        (
+            "history.taskSchedulerEnableRateLimiterShadowMode",
+            DcValue::Bool(false),
+        ),
+        (
+            "history.taskSchedulerGlobalNamespaceMaxQPS",
+            DcValue::Int(200),
+        ),
+    ] {
+        ov = with_dc(ov, key, value);
+    }
+    let r = simulate("schedules.yaml", ov);
+    let schedules = r
+        .hotspots
+        .iter()
+        .find(|h| h.category == "schedules")
+        .unwrap_or_else(|| panic!("{:#?}", categories(&r)));
+    assert!(
+        schedules.detail.starts_with(
+            "Partly caused by tasks held back (history.taskSchedulerGlobalNamespaceMaxQPS: "
+        ),
+        "{}",
+        schedules.detail
+    );
+}
+
+#[test]
 fn execution_queue_waits_are_not_put_down_to_scheduler_workers() {
     // Busy-workflow retries moved to a workflow's execution queue wait for that queue's one
     // worker, not the shared pool's, which stays free.

@@ -623,6 +623,14 @@ knobs.
   * The history task scheduler's limiter, enforced, is rated by how long it holds tasks back:
     a p99 over 1 s for any task type or any namespace is a warning, and over 5 s critical. In
     shadow mode it is reported for information.
+  * A symptom its hold-back accounts for is listed in its hotspot, which takes on the symptom's
+    severity, rather than reported apart: workflow task and activity schedule-to-start, the
+    visibility lag, and schedule actions' delay when the start-rate limit delayed none. The
+    hold-back accounts for one when, without the hold-back of the history tasks behind it, its
+    p99 would be under the threshold that raises it. For each namespace the hold-back is no
+    longer than its own tasks'. Symptoms it accounts for only in part, workflow task timeouts
+    and *not keeping up* name it at the start of their detail, once the hold-back of their own
+    tasks reaches their threshold.
   * A `history-queue` hotspot for a scheduler worker is rated by the runs' wait for a worker of
     the pool, per task type, so it means the workers were busy. It leaves out the limiter's
     hold-back, and the waits of runs on workflows' execution queues.
@@ -663,6 +671,10 @@ knobs.
     schedule-to-start latency, backlog, timeouts, throttled queue tasks and API symptoms that
     its retries cause. Limiters raised together keep their own order, so the one rejecting
     more calls comes first;
+  * the history task scheduler's limiter outranks the same symptoms, the visibility lag and
+    delayed schedule actions when its hold-back rates a warning or worse. It holds tasks back
+    rather than rejecting calls, and before matching, so a matching backlog isn't put down to
+    it;
   * database saturation outranks the shard, lock, connection-pool and dispatch symptoms it
     causes;
   * the shard rule attributes a hot shard to the one workflow whose lock drives it.
